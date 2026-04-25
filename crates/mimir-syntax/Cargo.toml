@@ -1,0 +1,24 @@
+[package]
+name         = "mimir-syntax"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+authors      = { workspace = true }
+description  = "tree-sitter-based SystemVerilog parsing and diagnostic extraction for Mimir."
+
+[lints.rust]
+missing_docs = "warn"
+
+[dependencies]
+mimir-core          = { workspace = true }
+tree-sitter         = { workspace = true }
+tree-sitter-verilog = { workspace = true }
+tracing             = { workspace = true }
+thiserror           = { workspace = true }
+ropey               = { workspace = true }
+
+[dev-dependencies]
+mimir-core         = { workspace = true, features = ["serde"] }
+pretty_assertions  = "1"

@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# VS Code extension build output
+editors/vscode/node_modules/
+editors/vscode/out/
+editors/vscode/*.vsix
+
+# Editor / OS junk
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Claude Code per-user state (settings.local.json is machine-specific)
+.claude/settings.local.json

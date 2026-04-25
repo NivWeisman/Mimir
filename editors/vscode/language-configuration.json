@@ -1,0 +1,33 @@
+{
+  "//": "Bracket pairs, comment markers, and auto-closing rules. The Rust server doesn't care about any of these — they're pure editor UX. Tweak freely.",
+  "comments": {
+    "lineComment": "//",
+    "blockComment": ["/*", "*/"]
+  },
+  "brackets": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"],
+    ["begin", "end"],
+    ["module", "endmodule"],
+    ["class", "endclass"],
+    ["function", "endfunction"],
+    ["task", "endtask"],
+    ["package", "endpackage"],
+    ["interface", "endinterface"]
+  ],
+  "autoClosingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "[", "close": "]" },
+    { "open": "(", "close": ")" },
+    { "open": "\"", "close": "\"" },
+    { "open": "'", "close": "'" }
+  ],
+  "surroundingPairs": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"],
+    ["\"", "\""],
+    ["'", "'"]
+  ]
+}

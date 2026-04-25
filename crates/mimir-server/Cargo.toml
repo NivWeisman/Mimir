@@ -1,0 +1,32 @@
+[package]
+name         = "mimir-server"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+authors      = { workspace = true }
+description  = "tower-lsp Backend and binary for the Mimir SystemVerilog language server."
+
+[lints.rust]
+missing_docs = "warn"
+
+[[bin]]
+name = "mimir-server"
+path = "src/main.rs"
+
+[dependencies]
+mimir-core   = { workspace = true }
+mimir-syntax = { workspace = true }
+
+tower-lsp          = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+ropey              = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "sync", "test-util"] }

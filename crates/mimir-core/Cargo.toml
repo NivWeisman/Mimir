@@ -1,0 +1,32 @@
+[package]
+name         = "mimir-core"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+authors      = { workspace = true }
+description  = "Core types for the Mimir SystemVerilog language server: documents, positions, logging."
+
+[lints.rust]
+# Force documentation on every public item. The user requested a heavily
+# documented codebase and this is the easiest way to keep that promise from
+# rotting away.
+missing_docs = "warn"
+
+[dependencies]
+ropey              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true, optional = true }
+
+[features]
+default = []
+# Opt-in serde derives on the public types. Useful for snapshot tests and for
+# crates that want to round-trip our types through JSON.
+serde = ["dep:serde"]
+
+[dev-dependencies]
+# Used in unit tests for floating-point-free position assertions.
+pretty_assertions = "1"

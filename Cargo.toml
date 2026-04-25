@@ -1,0 +1,80 @@
+## Workspace manifest for `mimir`, the SystemVerilog Language Server.
+##
+## We split the project into multiple crates so each layer can be tested in
+## isolation and so heavy dependencies (tree-sitter native code, tower-lsp's
+## tokio runtime) only land in the crates that actually need them.
+##
+##   * `mimir-core`    — pure-data types: text documents, positions, logging.
+##   * `mimir-syntax`  — tree-sitter wrapper, parse-error diagnostics.
+##   * `mimir-server`  — tower-lsp `Backend` impl plus the `mimir-server` binary.
+##
+## Workspace-level dependency versions are declared once under
+## `[workspace.dependencies]` so every crate pulls the same version. Each crate
+## then opts in with `dep.workspace = true` in its own `Cargo.toml`.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/mimir-core",
+    "crates/mimir-syntax",
+    "crates/mimir-server",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.75"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/your-org/mimir"
+authors      = ["Mimir contributors"]
+
+[workspace.dependencies]
+# --- Async runtime + LSP framework ----------------------------------------
+# `tower-lsp` is the de-facto async LSP server crate in Rust. It builds on
+# `tower` + `tokio` and gives us a `LanguageServer` trait we just implement.
+tower-lsp = "0.20"
+tokio     = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+
+# --- Text storage ----------------------------------------------------------
+# `ropey` is a UTF-8 rope. Critical for incremental edits: applying an LSP
+# `didChange` range edit to a `String` is O(n) per keystroke, while a rope
+# is O(log n). Also gives us cheap line-index <-> byte-offset conversion.
+ropey = "1.6"
+
+# --- Parser ----------------------------------------------------------------
+# tree-sitter gives us incremental reparsing and error recovery. The grammar
+# crate `tree-sitter-verilog` exposes a `language()` function that returns the
+# compiled grammar; we feed it into `tree_sitter::Parser`.
+tree-sitter         = "0.24"
+tree-sitter-verilog = "1.0"
+
+# --- Observability ---------------------------------------------------------
+# `tracing` is the structured-logging standard. `tracing-subscriber` is the
+# sink (stderr formatter); the LSP spec requires servers to keep stdout clean
+# for JSON-RPC, so all logs MUST go to stderr.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- Errors / serialization ------------------------------------------------
+thiserror   = "1"
+anyhow      = "1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# --- Internal crates (used by other workspace members) --------------------
+mimir-core   = { path = "crates/mimir-core",   version = "0.1.0" }
+mimir-syntax = { path = "crates/mimir-syntax", version = "0.1.0" }
+
+[profile.release]
+# LTO + a single codegen unit shrinks the LSP binary and squeezes a bit more
+# perf out of the parser hot path. Trades compile time for runtime — fine for
+# a tool that's installed once and run for hours.
+lto              = "thin"
+codegen-units    = 1
+strip            = "symbols"
+opt-level        = 3
+
+[profile.dev]
+# Speed up iteration: avoid debug info bloat, keep incremental builds snappy.
+opt-level = 0
+debug     = 1

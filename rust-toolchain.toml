@@ -1,0 +1,6 @@
+# Pin the toolchain so every contributor builds with the same rustc.
+# `stable` is fine: we don't use any nightly features. We pin `1.75` as the
+# minimum because that's our `rust-version` in the workspace manifest.
+[toolchain]
+channel    = "stable"
+components = ["rustfmt", "clippy"]

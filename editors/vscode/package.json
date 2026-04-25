@@ -1,0 +1,71 @@
+{
+  "//": "VS Code extension manifest. Declares the extension, the languages we activate for, and where to find the LSP binary. The extension is intentionally a thin shim — all real logic lives in the Rust server.",
+  "name": "mimir-vscode",
+  "displayName": "Mimir SystemVerilog",
+  "description": "SystemVerilog language server (verification-focused) — VS Code client.",
+  "version": "0.1.0",
+  "publisher": "mimir",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "activationEvents": [
+    "onLanguage:systemverilog",
+    "onLanguage:verilog"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "systemverilog",
+        "aliases": ["SystemVerilog", "systemverilog"],
+        "extensions": [".sv", ".svh"],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "verilog",
+        "aliases": ["Verilog", "verilog"],
+        "extensions": [".v", ".vh"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "Mimir",
+      "properties": {
+        "mimir.server.path": {
+          "type": "string",
+          "default": "mimir-server",
+          "description": "Path to the mimir-server binary. If unset, looks for `mimir-server` on $PATH."
+        },
+        "mimir.server.env": {
+          "type": "object",
+          "default": {},
+          "description": "Extra env vars to pass to mimir-server. Common: { \"RUST_LOG\": \"mimir=debug\" }."
+        },
+        "mimir.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace LSP messages between VS Code and mimir-server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
