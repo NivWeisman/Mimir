@@ -80,6 +80,7 @@ Per-crate test entry points:
   formatted strings. Never `println!` / `eprintln!`.
 - New LSP feature → flip its checklist item in [README.md](./README.md) in
   the same commit.
+- Ask me questions to clarify the product requirements, technical requirements, engineering principles, and hard constraints.
 
 ## Additional documentation
 
