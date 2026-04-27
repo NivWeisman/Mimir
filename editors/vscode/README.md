@@ -3,6 +3,12 @@
 Thin client that launches the `mimir-server` Rust binary and pipes LSP
 traffic over stdio. All real features are implemented server-side.
 
+The extension also bundles a static TextMate grammar
+(`syntaxes/systemverilog.tmLanguage.json`) so files get colored before
+the server has any opinion. It's a stopgap until the server implements
+`textDocument/semanticTokens`; once that ships, semantic tokens will
+take over for anything the grammar gets wrong.
+
 ## Build
 
 ```bash

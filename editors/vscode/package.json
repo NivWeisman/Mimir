@@ -33,6 +33,18 @@
         "configuration": "./language-configuration.json"
       }
     ],
+    "grammars": [
+      {
+        "language": "systemverilog",
+        "scopeName": "source.systemverilog",
+        "path": "./syntaxes/systemverilog.tmLanguage.json"
+      },
+      {
+        "language": "verilog",
+        "scopeName": "source.systemverilog",
+        "path": "./syntaxes/systemverilog.tmLanguage.json"
+      }
+    ],
     "configuration": {
       "title": "Mimir",
       "properties": {

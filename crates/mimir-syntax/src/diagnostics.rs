@@ -69,14 +69,27 @@ pub fn collect(tree: &SyntaxTree, rope: &Rope) -> Vec<Diagnostic> {
 /// Iteration uses `walk()` cursors instead of `node.child(i)` because
 /// cursors are a single allocation amortized over the whole walk.
 fn walk(node: Node<'_>, rope: &Rope, source: &str, out: &mut Vec<Diagnostic>) {
-    if node.is_error() {
-        out.push(make_error_diagnostic(node, rope, source));
-        // Don't recurse into ERROR — its children are usually noisy and
-        // would produce duplicate messages for the same span.
-        return;
-    }
     if node.is_missing() {
         out.push(make_missing_diagnostic(node, rope));
+        return;
+    }
+
+    if node.is_error() {
+        // Prefer narrower nested ERROR/MISSING descendants when they exist:
+        // a parser unwind can produce one ERROR that swallows an entire
+        // class or module, but the inner ERRORs sit much closer to where
+        // parsing actually went off the rails. Fall back to the outer span
+        // (capped) only if there's nothing narrower to point at.
+        let before = out.len();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.is_error() || child.is_missing() || child.has_error() {
+                walk(child, rope, source, out);
+            }
+        }
+        if out.len() == before {
+            out.push(make_error_diagnostic(node, rope, source));
+        }
         return;
     }
 
@@ -93,8 +106,12 @@ fn walk(node: Node<'_>, rope: &Rope, source: &str, out: &mut Vec<Diagnostic>) {
 /// Build a diagnostic for an `ERROR` node. We include a snippet of the
 /// offending text in the message because "syntax error" with no context is
 /// a bad UX.
+///
+/// The visible range is capped to the start line: tree-sitter ERROR spans
+/// can swallow an entire class or module after one bad token, and a
+/// diagnostic that paints the whole file red is worse than useless.
 fn make_error_diagnostic(node: Node<'_>, rope: &Rope, source: &str) -> Diagnostic {
-    let range = node_range(node, rope);
+    let range = cap_range_to_start_line(node_range(node, rope), rope);
     let snippet = source
         .get(node.byte_range())
         .map(truncate_for_message)
@@ -106,6 +123,24 @@ fn make_error_diagnostic(node: Node<'_>, rope: &Rope, source: &str) -> Diagnosti
         severity: DiagnosticSeverity::Error,
         code: "syntax",
     }
+}
+
+/// Clamp a multi-line range down to its starting line so a single confused
+/// parse doesn't paint dozens of lines red. Single-line ranges are returned
+/// unchanged.
+fn cap_range_to_start_line(range: Range, rope: &Rope) -> Range {
+    if range.end.line == range.start.line {
+        return range;
+    }
+    let line_idx = range.start.line as usize;
+    if line_idx >= rope.len_lines() {
+        return range;
+    }
+    let line = rope.line(line_idx);
+    let line_str: String = line.into();
+    let trimmed = line_str.trim_end_matches('\n').trim_end_matches('\r');
+    let utf16_cols = trimmed.encode_utf16().count() as u32;
+    Range::new(range.start, Position::new(range.start.line, utf16_cols))
 }
 
 /// Build a zero-width diagnostic for a `MISSING` node — a token the grammar
@@ -186,6 +221,38 @@ mod tests {
             d.iter().any(|x| x.message.starts_with("syntax error")),
             "diagnostics: {d:#?}",
         );
+    }
+
+    /// A parser unwind that would otherwise produce one ERROR spanning many
+    /// lines must instead surface narrower nested ERRORs. Regression for
+    /// the case where a UVM file's parse failure painted the whole file
+    /// red, with the snippet starting at the leading comment.
+    #[test]
+    fn nested_errors_are_preferred_over_outer_span() {
+        let src = "\
+// header comment
+class c extends base;
+   function void f();
+      x::type_id::create(\"y\", this);
+   endfunction
+endclass
+";
+        let d = diags(src);
+        assert!(!d.is_empty(), "expected at least one diagnostic");
+        // No diagnostic should start on the comment line — that was the bug.
+        for diag in &d {
+            assert!(
+                diag.range.start.line > 0,
+                "diagnostic anchored to header comment: {diag:?}",
+            );
+        }
+        // No diagnostic should span more than its starting line.
+        for diag in &d {
+            assert_eq!(
+                diag.range.start.line, diag.range.end.line,
+                "diagnostic spans multiple lines: {diag:?}",
+            );
+        }
     }
 
     /// Diagnostic ranges must point inside the source — line/character must
