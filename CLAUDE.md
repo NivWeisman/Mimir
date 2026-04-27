@@ -74,7 +74,7 @@ Per-crate test entry points:
 
 ## When making changes
 
-- Update current-plan.md (Can overwrite it)
+- Update current-plan.md before the changes (Can overwrite it)
 - New public function → add a `#[cfg(test)] mod tests` test in the same file.
 - New fallible op → extend the crate's existing `*Error` enum (`thiserror`).
 - Logging → `tracing::{debug, info, warn, error}` with structured fields, not
@@ -82,8 +82,8 @@ Per-crate test entry points:
 - New LSP feature → flip its checklist item in [README.md](./README.md) in
   the same commit.
 - Ask me questions to clarify the product requirements, technical requirements, engineering principles, and hard constraints.
+- Update [README.md](./README.md) after all changes done.
 - Create a commit.
-- Update [README.md](./README.md)
 
 ## Additional documentation
 
