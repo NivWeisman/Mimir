@@ -6,6 +6,7 @@
 ##
 ##   * `mimir-core`    — pure-data types: text documents, positions, logging.
 ##   * `mimir-syntax`  — tree-sitter wrapper, parse-error diagnostics.
+##   * `mimir-slang`   — async client for the C++ slang sidecar (preprocessor + elaborator).
 ##   * `mimir-server`  — tower-lsp `Backend` impl plus the `mimir-server` binary.
 ##
 ## Workspace-level dependency versions are declared once under
@@ -17,6 +18,7 @@ resolver = "2"
 members = [
     "crates/mimir-core",
     "crates/mimir-syntax",
+    "crates/mimir-slang",
     "crates/mimir-server",
 ]
 
@@ -33,7 +35,7 @@ authors      = ["Mimir contributors"]
 # `tower-lsp` is the de-facto async LSP server crate in Rust. It builds on
 # `tower` + `tokio` and gives us a `LanguageServer` trait we just implement.
 tower-lsp = "0.20"
-tokio     = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+tokio     = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync", "time"] }
 
 # --- Text storage ----------------------------------------------------------
 # `ropey` is a UTF-8 rope. Critical for incremental edits: applying an LSP
@@ -60,10 +62,14 @@ thiserror   = "1"
 anyhow      = "1"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
+# `toml` reads `.mimir.toml`. Pinned at 0.8 (current series; 0.5 had a very
+# different API). Used by `mimir-server::project`.
+toml        = "0.8"
 
 # --- Internal crates (used by other workspace members) --------------------
 mimir-core   = { path = "crates/mimir-core",   version = "0.1.0" }
 mimir-syntax = { path = "crates/mimir-syntax", version = "0.1.0" }
+mimir-slang  = { path = "crates/mimir-slang",  version = "0.1.0" }
 
 [profile.release]
 # LTO + a single codegen unit shrinks the LSP binary and squeezes a bit more

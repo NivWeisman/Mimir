@@ -18,15 +18,21 @@ path = "src/main.rs"
 [dependencies]
 mimir-core   = { workspace = true }
 mimir-syntax = { workspace = true }
+mimir-slang  = { workspace = true }
 
 tower-lsp          = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde              = { workspace = true }
 serde_json         = { workspace = true }
+toml               = { workspace = true }
+thiserror          = { workspace = true }
 anyhow             = { workspace = true }
 ropey              = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
+# Used by `project::tests` to create scratch `.mimir.toml` / `.f` trees.
+tempfile          = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "sync", "test-util"] }

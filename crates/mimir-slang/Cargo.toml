@@ -1,0 +1,32 @@
+[package]
+name         = "mimir-slang"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+authors      = { workspace = true }
+description  = "Async client for the Mimir slang sidecar — speaks NDJSON to a C++ libslang-backed elaborator over stdio."
+
+[lints.rust]
+missing_docs = "warn"
+
+[dependencies]
+mimir-core = { workspace = true, features = ["serde"] }
+
+# `process` lets us spawn the sidecar; `io-util` brings in `AsyncBufReadExt`
+# (`read_line`) and `AsyncWriteExt` (`write_all`). The other features come
+# from the workspace baseline and we don't need to repeat them here.
+tokio      = { workspace = true, features = ["process", "io-util"] }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
+# `test-util` is needed for any tokio-based unit test that wants to advance
+# time or run on the current-thread runtime; we don't use it yet but keep
+# the door open without changing the workspace baseline.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

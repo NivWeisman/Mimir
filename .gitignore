@@ -3,6 +3,10 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# C++ slang sidecar build output (out-of-source CMake build)
+slang-sidecar/build/
+slang-sidecar/build.log
+
 # VS Code extension build output
 editors/vscode/node_modules/
 editors/vscode/out/

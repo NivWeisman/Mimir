@@ -246,7 +246,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 - ✅ Syntax / parse-error diagnostics from tree-sitter (`ERROR` & `MISSING` nodes)
 - ⬜ Lint diagnostics (style, naming, dead code)
-- ⬜ Semantic diagnostics (type mismatches, undeclared identifiers)
+- 🚧 Semantic diagnostics (type mismatches, undeclared identifiers) — via the slang sidecar; opt-in with `MIMIR_SLANG_PATH` + `.mimir.toml`
 - ⬜ UVM-aware diagnostics (missing `super.build_phase`, factory misuse)
 - ⬜ SVA diagnostics (malformed property/sequence)
 
@@ -294,9 +294,9 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Project / build integration
 
-- ⬜ Filelist (`.f` / `-f`) parsing for compilation units
-- ⬜ `+define+` / `+incdir+` macro & include path config
-- ⬜ Multi-file elaboration & cross-file symbol resolution
+- ✅ Filelist (`.f` / `-f`) parsing for compilation units (via `.mimir.toml`'s `slang.filelist`)
+- ✅ `+define+` / `+incdir+` macro & include path config
+- 🚧 Multi-file elaboration & cross-file symbol resolution (slang elaborates the whole compilation unit; cross-file *navigation* is not yet wired)
 - ⬜ Integration with simulator-specific build files (Verilator, Xcelium, VCS, Questa)
 
 ---
