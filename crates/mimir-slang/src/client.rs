@@ -427,6 +427,7 @@ mod tests {
             files: vec![SourceFile {
                 path: "a.sv".into(),
                 text: "module m endmodule".into(),
+                is_compilation_unit: true,
             }],
             include_dirs: vec![],
             defines: vec![],

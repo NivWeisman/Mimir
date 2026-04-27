@@ -531,16 +531,25 @@ fn assemble_elaborate_params(
         files.push(SourceFile {
             path: project_file.display().to_string(),
             text,
+            is_compilation_unit: true,
         });
         files_in_request.push(url);
     }
 
-    // Open documents not yet covered by the project filelist.
+    // Open documents not yet covered by the project filelist. We send
+    // them so unsaved edits to includee files still affect elaboration,
+    // but mark them `is_compilation_unit = false` — the sidecar will
+    // seed its `SourceManager` with the buffer and let `` `include ``
+    // resolution find it, instead of wrapping it in a standalone
+    // `SyntaxTree` (which would be wrong: an includee out of its
+    // `package` context produces spurious errors, and the buffer
+    // collides with the one the preprocessor pulled in via include).
     for (path, (url, text)) in open_text {
         if seen.insert(path.clone()) {
             files.push(SourceFile {
                 path: path.display().to_string(),
                 text: text.clone(),
+                is_compilation_unit: false,
             });
             files_in_request.push(url.clone());
         }
@@ -1020,8 +1029,10 @@ mod tests {
         assert_eq!(params.files.len(), 2);
         assert_eq!(params.files[0].path, "/proj/a.sv");
         assert_eq!(params.files[0].text, "module a; endmodule");
+        assert!(params.files[0].is_compilation_unit);
         assert_eq!(params.files[1].path, "/proj/b.sv");
         assert_eq!(params.files[1].text, "module b; endmodule");
+        assert!(params.files[1].is_compilation_unit);
         assert_eq!(params.include_dirs, vec!["/proj/inc"]);
         assert_eq!(params.top.as_deref(), Some("tb_top"));
         assert_eq!(files_in_request.len(), 2);
@@ -1047,7 +1058,13 @@ mod tests {
 
         assert_eq!(params.files.len(), 2);
         assert_eq!(params.files[0].path, "/proj/a.sv");
+        assert!(params.files[0].is_compilation_unit);
+        // Open-but-not-in-filelist files are seeded into the source
+        // manager but not parsed as their own compilation unit — so
+        // unsaved buffers participate via include resolution without
+        // colliding with the preprocessor's own load of the file.
         assert_eq!(params.files[1].path, "/tmp/scratch.sv");
+        assert!(!params.files[1].is_compilation_unit);
         assert_eq!(files_in_request.len(), 2);
         assert!(files_in_request.contains(&scratch_url));
     }

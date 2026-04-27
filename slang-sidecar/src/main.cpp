@@ -23,6 +23,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -170,11 +172,48 @@ static json handle_elaborate(const json& params) {
 
     Compilation compilation;
     if (params.contains("files") && params["files"].is_array()) {
+        // Two passes. The first seeds every supplied buffer into the
+        // SourceManager so the preprocessor resolves `\`include` against
+        // the user's in-memory text (with unsaved edits) instead of
+        // going to disk. The second wraps the *compilation-unit* files
+        // in their own SyntaxTree — files marked `is_compilation_unit:
+        // false` ride along only as include sources, because parsing
+        // them standalone (e.g. an UVM agent file meant to live inside
+        // `package … endpackage`) produces spurious diagnostics.
+        struct PendingUnit {
+            std::string path;
+            slang::SourceBuffer buffer;
+        };
+        std::vector<PendingUnit> units;
+        units.reserve(params["files"].size());
+
         for (const auto& f : params["files"]) {
             auto path = f.value("path", std::string{"<unknown>"});
             auto text = f.value("text", std::string{});
-            auto buffer = sm->assignText(path, text);
-            auto tree = SyntaxTree::fromBuffer(buffer, *sm, options);
+            // `is_compilation_unit` defaults to true — that matches the
+            // pre-flag wire format and keeps single-file requests working.
+            bool is_cu = f.value("is_compilation_unit", true);
+
+            slang::SourceBuffer buffer;
+            try {
+                buffer = sm->assignText(path, text);
+            } catch (const std::exception& e) {
+                // Slang refuses duplicate paths. Most often this means
+                // the preprocessor already pulled the file in via
+                // `\`include` while parsing an earlier unit; the
+                // existing buffer is fine, so skip and move on.
+                std::cerr << "[mimir-slang-sidecar] skipping duplicate buffer for "
+                          << path << ": " << e.what() << '\n';
+                continue;
+            }
+
+            if (is_cu) {
+                units.push_back({std::move(path), buffer});
+            }
+        }
+
+        for (auto& u : units) {
+            auto tree = SyntaxTree::fromBuffer(u.buffer, *sm, options);
             compilation.addSyntaxTree(tree);
         }
     }

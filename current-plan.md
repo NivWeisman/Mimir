@@ -219,6 +219,69 @@ replace them across all affected files; an idle session uses ~0% CPU.
 
 ---
 
+## Stage 3.1 — distinguish compilation units from includee buffers (current)
+
+### What we hit
+
+First end-to-end run on the UVM `apb` example surfaced a real bug. The
+elaborate request carried two files — `apb.sv` (the project's only
+filelist entry, which `` `include ``s every agent file via `+incdir+`)
+and `apb_agent.sv` (the file the user had open). The sidecar
+unconditionally called `SourceManager::assignText` for both and wrapped
+each in its own `SyntaxTree`. Slang threw:
+
+> sidecar exception: Buffer with the given path has already been
+> assigned to the source manager
+
+Two distinct problems:
+
+1. **Duplicate-buffer error.** While parsing `apb.sv`, the preprocessor
+   resolves `` `include "apb_agent.sv" `` from `+incdir+`, loads the
+   file from disk, and registers the buffer under that path. The
+   subsequent `assignText("apb_agent.sv", …)` for the open document
+   collides.
+2. **Unsaved edits silently ignored.** Even if the dedup were tolerated,
+   the include path would have used the on-disk text, not the user's
+   in-memory buffer. Editing `apb_agent.sv` would not affect
+   elaboration.
+
+There's also a modelling issue: `apb_agent.sv` is meant to be included
+inside `package apb_pkg; … endpackage`. Wrapping it in its own
+top-level `SyntaxTree` (today's behaviour) is wrong even when paths
+don't collide — it produces spurious "class outside package" diagnostics.
+
+### Fix
+
+- **Protocol.** Extend `protocol::SourceFile` with
+  `is_compilation_unit: bool` (default `true`, serde-skipped when true
+  so the wire stays compact and old requests still decode).
+- **Backend.** `assemble_elaborate_params` marks project-filelist files
+  as `is_compilation_unit = true` and open-but-not-in-filelist files as
+  `false`. The latter still ride along so unsaved buffers participate,
+  but only via include resolution.
+- **Sidecar.** `handle_elaborate` does two passes:
+  1. `sm->assignText(path, text)` for every file in the request — seeds
+     the `SourceManager` so the preprocessor finds our in-memory
+     buffer instead of going to disk for `` `include ``s. Catch slang's
+     "already assigned" exception and skip — duplicates are
+     non-critical here.
+  2. `SyntaxTree::fromBuffer(...)` + `compilation.addSyntaxTree(...)`
+     only for files with `is_compilation_unit == true`. Includee buffers
+     are seeded but not parsed standalone.
+
+### Tests
+
+- `protocol`: round-trip for both default-true (skipped on serialise)
+  and explicit-false; old-request decoding still gets `true`.
+- `assemble_elaborate_params`: project files are flagged `true`, open
+  files outside the filelist are flagged `false`.
+
+**Exit criteria.** Opening `apb_agent.sv` against the apb `.mimir.toml`
+no longer triggers `Buffer with the given path has already been
+assigned`; semantic diagnostics for that file reflect unsaved edits.
+
+---
+
 ## Follow-ups (not in scope for this slice)
 
 These were called out in Stage 3's design but deferred to keep the
@@ -242,3 +305,7 @@ slice tight; track them here so they don't fall on the floor.
 - **README install-the-sidecar section.** The C++ build is documented
   in `slang-sidecar/CMakeLists.txt` but not in the user-facing README.
   Should land before anyone outside the team tries to use slang.
+- **Surface env-var-not-set in the trace.** `spawn_slang_if_configured`
+  silently returns `None` when `MIMIR_SLANG_PATH` is unset. Logging a
+  one-time `debug!("MIMIR_SLANG_PATH not set; tree-sitter only")`
+  makes "why isn't slang on?" answerable from the trace alone.

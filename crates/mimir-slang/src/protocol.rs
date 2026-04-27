@@ -133,6 +133,31 @@ pub struct SourceFile {
     /// Source text. Must be valid UTF-8. Slang internally re-encodes for
     /// its own buffers; we don't pass any encoding hints.
     pub text: String,
+    /// Whether the sidecar should treat this file as its own top-level
+    /// compilation unit (i.e. wrap it in a `SyntaxTree` and add it to the
+    /// `Compilation`).
+    ///
+    /// `true` for files listed in the project filelist — those are the
+    /// roots slang elaborates from.
+    ///
+    /// `false` for files we send only so their unsaved buffer is visible
+    /// to the preprocessor when some compilation unit `` `include ``s
+    /// them. Parsing an includee standalone produces spurious errors
+    /// (e.g. class definitions outside their `package` context) and, if
+    /// the path collides with what the preprocessor already loaded via
+    /// `` `include ``, slang's `SourceManager::assignText` rejects the
+    /// duplicate buffer outright.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub is_compilation_unit: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 /// One `+define+` macro.
@@ -279,6 +304,41 @@ mod tests {
         assert!(p.include_dirs.is_empty());
         assert!(p.defines.is_empty());
         assert!(p.top.is_none());
+        // Older requests without the field decode as compilation units —
+        // that's the sidecar's previous behavior, preserved.
+        assert!(p.files[0].is_compilation_unit);
+    }
+
+    /// A `SourceFile` with the default flag round-trips and the encoded
+    /// JSON omits the field, keeping the wire compact.
+    #[test]
+    fn source_file_compilation_unit_default_omitted_on_serialise() {
+        let f = SourceFile {
+            path: "a.sv".into(),
+            text: "".into(),
+            is_compilation_unit: true,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(
+            !s.contains("is_compilation_unit"),
+            "expected default-true field to be skipped: {s}",
+        );
+    }
+
+    /// `is_compilation_unit: false` survives a round-trip — this is the
+    /// signal the sidecar uses to seed the SourceManager without parsing
+    /// the file as its own translation unit.
+    #[test]
+    fn source_file_includee_roundtrip() {
+        let f = SourceFile {
+            path: "agent.sv".into(),
+            text: "class c; endclass".into(),
+            is_compilation_unit: false,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("is_compilation_unit"));
+        let back: SourceFile = serde_json::from_str(&s).unwrap();
+        assert!(!back.is_compilation_unit);
     }
 
     /// `Diagnostic` round-trips with a realistic-looking range.
