@@ -83,6 +83,7 @@ Per-crate test entry points:
   the same commit.
 - Ask me questions to clarify the product requirements, technical requirements, engineering principles, and hard constraints.
 - Update [README.md](./README.md) after all changes done.
+- Update crates versions or sub-versions.
 - Create a commit.
 
 ## Additional documentation
