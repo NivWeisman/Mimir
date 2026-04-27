@@ -148,6 +148,103 @@ to inspect the server's stderr.
 
 ---
 
+## Project configuration
+
+For single-file syntax-error checking nothing needs configuring — drop a
+`.sv` file anywhere and tree-sitter diagnostics flow.
+
+For real UVM / RTL projects you'll want **slang elaboration**, and slang
+needs to know your file set, include directories, and `+define+`s. That's
+what `.mimir.toml` is for. The server walks up from the file you opened
+(up to eight parent directories) looking for one.
+
+### `.mimir.toml`
+
+Minimal — point at a filelist and pick a top:
+
+```toml
+[slang]
+filelist = "sim/uvm.f"
+top      = "tb_top"
+```
+
+Full schema (every field is optional; the canonical types live in
+[`crates/mimir-server/src/project.rs`](./crates/mimir-server/src/project.rs)):
+
+```toml
+[slang]
+# Path to a .f filelist, relative to .mimir.toml.
+filelist     = "sim/uvm.f"
+
+# Extra include search paths, on top of anything the filelist contributes.
+# Relative entries resolve against .mimir.toml's directory.
+include_dirs = ["rtl", "verif/inc"]
+
+# Extra +define+s. "NAME" defines to empty; "NAME=VALUE" carries a value.
+defines      = ["UVM_NO_DPI", "BUS_WIDTH=32"]
+
+# Top module / program. Omit to elaborate every top slang finds
+# ("lint the whole project" mode).
+top          = "tb_top"
+
+# Quiet time (ms) before re-elaborating after the user stops typing.
+debounce_ms  = 350
+```
+
+Inline `include_dirs` and `defines` are merged with whatever the filelist
+pulls in — inline values come first, filelist values after. Unknown keys
+are an error, not silently ignored, so a typo (`includ_dirs`) fails loudly
+instead of disabling your config.
+
+### Filelists (`.f`)
+
+The verification industry's standard "what files belong together" format.
+Every commercial simulator (VCS, Xcelium, Questa) and Verilator reads it,
+so most projects already have one. Mimir parses the same dialect.
+
+Whitespace-separated tokens. `\` followed by newline continues a line.
+`//` and `#` start line comments. `${VAR}` interpolates from the process
+environment — unknown variables expand to empty (matches `make` / most
+simulators).
+
+| Token                            | Meaning                                                 |
+| -------------------------------- | ------------------------------------------------------- |
+| `path/to/file.sv`                | Source file. Relative paths resolve against the `.f`.   |
+| `+incdir+A` or `+incdir+A+B+...` | One or more include search paths.                       |
+| `+define+NAME` / `+define+N=V`   | Predefine a macro (multiple `+`-separated allowed).     |
+| `-f nested.f` or `-fnested.f`    | Recursively read another filelist.                      |
+
+Recursion is bounded at 16 levels and cycles are detected by canonical
+path, so a misconfigured `-f a.f` that points back at itself fails fast
+instead of looping.
+
+Example `sim/uvm.f`:
+
+```
+// UVM testbench, mirrors what `simv +UVM_TESTNAME=...` would compile
++incdir+${UVM_HOME}/src
++incdir+../verif/inc
++define+UVM_NO_DPI
+
+${UVM_HOME}/src/uvm_pkg.sv
+
+// DUT
+../rtl/dut_pkg.sv
+../rtl/dut.sv
+
+// Testbench + tests
+../verif/tb_top.sv
+../verif/sequences.sv
+-f ../verif/tests/all_tests.f
+```
+
+Slang elaboration is opt-in: set `MIMIR_SLANG_PATH` to a
+`slang-sidecar` binary and the server uses your `.mimir.toml` automatically.
+Without it, mimir falls back to tree-sitter-only diagnostics and the
+`.mimir.toml` is simply ignored.
+
+---
+
 ## Architecture
 
 A Cargo workspace with three crates, each independently testable:
