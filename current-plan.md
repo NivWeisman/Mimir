@@ -307,4 +307,5 @@ names work for free — slang already resolves them.
 | --------------------------------------- | -------- | ------------------------------------------------------ |
 | 1. Tree-sitter, single-file + docSymbol | done     | shipped in commit `def6099`; `documentSymbol` came along for the ride |
 | 2. Tree-sitter, workspace (filelist+open) | done     | `WorkspaceIndex` + eager hydration on `initialize`; same-file precedence preserved |
-| 3. Slang-backed semantic resolution     | done     | `definition` method + `Client::definition`; trust-slang-on-empty, syntax fallback only on transport error. Sidecar implementation tracked separately. |
+| 3. Slang-backed semantic resolution     | done     | `definition` method + `Client::definition`; trust-slang-on-empty, syntax fallback only on transport error. Sidecar handler ships the same change. |
+| 3-sidecar. C++ sidecar `definition` handler | done | `slang-sidecar/src/main.cpp` `handle_definition` — `ASTVisitor` over `NamedValue` / `HierarchicalValue` / `MemberAccess` expressions; declaration site via `Symbol::getSyntax()->sourceRange()`; path round-trip preserved by reverse-lookup against the request's `files`. Type-references and module-instantiations deferred. |

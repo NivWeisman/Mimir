@@ -5,9 +5,12 @@
 // (stdout is reserved for the protocol — same constraint as an LSP server).
 //
 // Wire shape mirrors `mimir-slang::protocol`. Methods today:
-//   * "elaborate" — preprocess + parse + elaborate the supplied files,
-//                   return diagnostics in LSP coordinates.
-//   * "shutdown"  — reply with null result, exit cleanly.
+//   * "elaborate"  — preprocess + parse + elaborate the supplied files,
+//                    return diagnostics in LSP coordinates.
+//   * "definition" — same compile front-end, plus a cursor (file + LSP
+//                    position); returns the declaration site of the
+//                    symbol referenced under the cursor.
+//   * "shutdown"   — reply with null result, exit cleanly.
 //
 // Anything else is replied to with `error.code = -32601` ("method not
 // found") and the loop continues so a misbehaving client doesn't take the
@@ -15,23 +18,30 @@
 //
 // The handler is intentionally a free function (not a class) — there's no
 // shared state between requests today. When that changes (e.g. caching a
-// `Compilation` across edits in Stage 3) we'll fold it into a Server class.
+// `Compilation` across edits) we'll fold it into a Server class.
 
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
+#include <slang/ast/Symbol.h>
+#include <slang/ast/expressions/MiscExpressions.h>
+#include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/Diagnostics.h>
 #include <slang/parsing/Preprocessor.h>
+#include <slang/syntax/SyntaxNode.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceLocation.h>
 #include <slang/text/SourceManager.h>
@@ -77,6 +87,42 @@ static uint32_t utf8_prefix_to_utf16_units(std::string_view prefix) {
     return units;
 }
 
+// Inverse of `utf8_prefix_to_utf16_units`. Given a single line of UTF-8
+// text and an LSP `character` (UTF-16 code unit count), return the byte
+// offset within `line`. A `utf16_char` past the line end clamps to
+// `line.size()` — matches the LSP spec where a position can sit one past
+// the last character of a line.
+//
+// Multi-byte sequence boundaries: LSP positions live *between* code
+// points, not bytes. A client never points at the middle of a UTF-8
+// sequence; if it did, we round forward to the start of the next
+// codepoint, which is the same boundary `utf8_prefix_to_utf16_units`
+// would treat as one code unit.
+static size_t utf16_to_byte_offset(std::string_view line, uint32_t utf16_char) {
+    uint32_t units = 0;
+    size_t i = 0;
+    while (i < line.size() && units < utf16_char) {
+        unsigned char b = static_cast<unsigned char>(line[i]);
+        if (b < 0x80) {
+            units += 1;
+            i += 1;
+        } else if ((b & 0xE0) == 0xC0) {
+            units += 1;
+            i += 2;
+        } else if ((b & 0xF0) == 0xE0) {
+            units += 1;
+            i += 3;
+        } else if ((b & 0xF8) == 0xF0) {
+            units += 2;
+            i += 4;
+        } else {
+            units += 1;
+            i += 1;
+        }
+    }
+    return i;
+}
+
 // --- LSP position from a slang SourceLocation ----------------------------
 
 struct LspPos {
@@ -120,6 +166,39 @@ static LspPos to_lsp_pos(const slang::SourceManager& sm, slang::SourceLocation l
     return {line_1based - 1, utf16};
 }
 
+// LSP `(line, character)` → byte offset within a slang `SourceBuffer`.
+//
+// Walks the buffer linewise to find the start of `lsp_line`, then
+// converts the UTF-16 `lsp_char` to a byte offset within that line.
+// Returns `nullopt` when the line index runs off the end of the buffer.
+static std::optional<size_t> lsp_position_to_byte_offset(
+    const slang::SourceManager& sm,
+    slang::BufferID buffer,
+    uint32_t lsp_line,
+    uint32_t lsp_char) {
+    auto text = sm.getSourceText(buffer);
+    size_t cursor = 0;
+    uint32_t cur_line = 0;
+    while (cur_line < lsp_line && cursor < text.size()) {
+        if (text[cursor] == '\n') {
+            ++cur_line;
+        }
+        ++cursor;
+    }
+    if (cur_line < lsp_line) {
+        return std::nullopt;  // line is past EOF
+    }
+
+    // Slice the line out (without trailing newline) so the UTF-16 walk
+    // doesn't run into the next line's bytes.
+    size_t line_end = cursor;
+    while (line_end < text.size() && text[line_end] != '\n') {
+        ++line_end;
+    }
+    auto line_view = text.substr(cursor, line_end - cursor);
+    return cursor + utf16_to_byte_offset(line_view, lsp_char);
+}
+
 // --- Severity mapping ----------------------------------------------------
 //
 // Slang's enum is { Ignored, Note, Warning, Error, Fatal }. The wire
@@ -137,15 +216,36 @@ static std::string_view severity_str(slang::DiagnosticSeverity s) {
     return "hint";
 }
 
-// --- elaborate handler ---------------------------------------------------
+// --- Compilation builder (shared by elaborate + definition) --------------
 
-static json handle_elaborate(const json& params) {
+// One-shot output of `build_compilation`. The `SourceManager` is shared
+// (slang's `SyntaxTree::fromBuffer` takes a reference and the AST holds
+// pointers into it), so we pin it behind a `shared_ptr`. The compilation
+// is unique to this request.
+struct BuildCompilationResult {
+    std::shared_ptr<slang::SourceManager> sm;
+    std::unique_ptr<slang::ast::Compilation> compilation;
+    // Path-as-sent → buffer id, so callers can locate a file's buffer
+    // by the same path string they put on the wire. Definition lookup
+    // needs this to translate `target_path` into a `SourceLocation`.
+    std::unordered_map<std::string, slang::BufferID> buffers_by_path;
+};
+
+// Parse the request's `files`, `include_dirs`, `defines`, `top` and
+// build a slang `Compilation`. The two-pass file seeding (every file
+// into `SourceManager`, then `is_compilation_unit: true` files into
+// `Compilation`) is the same pattern `elaborate` used pre-refactor; it
+// keeps unsaved buffer text reachable by `\`include` while not parsing
+// includee files standalone (which produces spurious diagnostics).
+static BuildCompilationResult build_compilation(const json& params) {
     using namespace slang;
     using namespace slang::ast;
     using namespace slang::parsing;
     using namespace slang::syntax;
 
-    auto sm = std::make_shared<SourceManager>();
+    BuildCompilationResult out;
+    out.sm = std::make_shared<SourceManager>();
+    out.compilation = std::make_unique<Compilation>();
 
     PreprocessorOptions pp_opts;
     if (params.contains("defines") && params["defines"].is_array()) {
@@ -170,18 +270,8 @@ static json handle_elaborate(const json& params) {
     Bag options;
     options.set(pp_opts);
 
-    Compilation compilation;
     if (params.contains("files") && params["files"].is_array()) {
-        // Two passes. The first seeds every supplied buffer into the
-        // SourceManager so the preprocessor resolves `\`include` against
-        // the user's in-memory text (with unsaved edits) instead of
-        // going to disk. The second wraps the *compilation-unit* files
-        // in their own SyntaxTree — files marked `is_compilation_unit:
-        // false` ride along only as include sources, because parsing
-        // them standalone (e.g. an UVM agent file meant to live inside
-        // `package … endpackage`) produces spurious diagnostics.
         struct PendingUnit {
-            std::string path;
             slang::SourceBuffer buffer;
         };
         std::vector<PendingUnit> units;
@@ -196,7 +286,7 @@ static json handle_elaborate(const json& params) {
 
             slang::SourceBuffer buffer;
             try {
-                buffer = sm->assignText(path, text);
+                buffer = out.sm->assignText(path, text);
             } catch (const std::exception& e) {
                 // Slang refuses duplicate paths. Most often this means
                 // the preprocessor already pulled the file in via
@@ -207,23 +297,41 @@ static json handle_elaborate(const json& params) {
                 continue;
             }
 
+            // Record path → buffer for the definition handler. We index
+            // by the exact string the client sent so a F12 request whose
+            // `target_path` matches one of the `files[].path` entries
+            // resolves cleanly without canonicalisation surprises.
+            out.buffers_by_path.emplace(path, buffer.id);
+
             if (is_cu) {
-                units.push_back({std::move(path), buffer});
+                units.push_back({buffer});
             }
         }
 
         for (auto& u : units) {
-            auto tree = SyntaxTree::fromBuffer(u.buffer, *sm, options);
-            compilation.addSyntaxTree(tree);
+            auto tree = SyntaxTree::fromBuffer(u.buffer, *out.sm, options);
+            out.compilation->addSyntaxTree(tree);
         }
     }
 
     // Force semantic elaboration so we get diagnostics beyond syntax.
     // This is what closes the gap with tree-sitter — slang now sees
     // through `` `include `` and macro expansion.
-    (void)compilation.getRoot();
+    (void)out.compilation->getRoot();
 
-    DiagnosticEngine engine(*sm);
+    return out;
+}
+
+// Walk the compilation's diagnostics and emit a JSON array in the same
+// shape `elaborate`'s response uses. Lifted out of `handle_elaborate` so
+// the same function services both the elaborate path and any future
+// "definition + diagnostics in one round trip" optimisation.
+static json diagnostics_for_compilation(const slang::SourceManager& sm,
+                                        slang::ast::Compilation& compilation) {
+    using namespace slang;
+    using namespace slang::ast;
+
+    DiagnosticEngine engine(sm);
 
     json diagnostics = json::array();
     for (const auto& diag : compilation.getAllDiagnostics()) {
@@ -235,20 +343,20 @@ static json handle_elaborate(const json& params) {
         // Default to a zero-width range at the diagnostic's primary
         // location; if slang attached one or more highlight ranges, use
         // the first as our (start, end).
-        LspPos start = to_lsp_pos(*sm, diag.location);
+        LspPos start = to_lsp_pos(sm, diag.location);
         LspPos end = start;
         if (!diag.ranges.empty()) {
             const auto& r = diag.ranges.front();
-            start = to_lsp_pos(*sm, r.start());
-            end = to_lsp_pos(*sm, r.end());
+            start = to_lsp_pos(sm, r.start());
+            end = to_lsp_pos(sm, r.end());
         }
 
         // The path we report is the file slang ultimately attributes the
         // diagnostic to (after macro/include unwinding). That matches the
         // path the client originally sent in via `files[].path` for any
         // diagnostic that lives in user source.
-        auto orig_loc = sm->getFullyOriginalLoc(diag.location);
-        std::string path{sm->getFileName(orig_loc)};
+        auto orig_loc = sm.getFullyOriginalLoc(diag.location);
+        std::string path{sm.getFileName(orig_loc)};
 
         json d;
         d["path"] = std::move(path);
@@ -261,9 +369,190 @@ static json handle_elaborate(const json& params) {
         d["message"] = engine.formatMessage(diag);
         diagnostics.push_back(std::move(d));
     }
+    return diagnostics;
+}
+
+// --- elaborate handler ---------------------------------------------------
+
+static json handle_elaborate(const json& params) {
+    auto built = build_compilation(params);
+    json result;
+    result["diagnostics"] = diagnostics_for_compilation(*built.sm, *built.compilation);
+    return result;
+}
+
+// --- definition handler --------------------------------------------------
+//
+// AST visitor that finds the `ValueExpressionBase` (i.e. an identifier
+// reference whose AST-resolution slang has already done) whose source
+// range covers the cursor. We record the deepest such expression — for
+// `pkg::sym` and `u_dut.fsm.state`, slang lowers the dotted path to a
+// `HierarchicalValueExpression` whose `symbol` is the final declaration,
+// which is exactly the F12 target.
+//
+// We don't try to handle every cross-reference shape in v1:
+// * type references (`my_class c;`) → the type binding lives in the
+//   variable's `type`, not in an expression. Defer.
+// * module instantiations (`apb_seq u_seq();`) → reference is on a
+//   syntax node, not an expression. Defer.
+// * subroutine calls (`f(x)`) → `CallExpression` would resolve these;
+//   added if/when needed.
+//
+// What we *do* cover: variable, parameter, port, class-field
+// references, hierarchical paths, and `obj.member` access. That's the
+// most common F12 case in verification code — UVM `m_seq.req` style.
+struct DefinitionFinder : public slang::ast::ASTVisitor<DefinitionFinder,
+                                                       /*VisitStatements=*/true,
+                                                       /*VisitExpressions=*/true> {
+    slang::SourceLocation target;
+    const slang::ast::Symbol* found = nullptr;
+    // Track the smallest containing range so an outer
+    // `MemberAccessExpression` wrapping a `NamedValueExpression`
+    // doesn't shadow the inner one when the cursor is on the inner.
+    uint32_t best_width = UINT32_MAX;
+
+    bool covers_target(slang::SourceRange r) const {
+        if (!r.start().valid() || !r.end().valid()) return false;
+        if (r.start().buffer() != target.buffer()) return false;
+        return r.start().offset() <= target.offset() && target.offset() < r.end().offset();
+    }
+
+    void record(slang::SourceRange r, const slang::ast::Symbol& sym) {
+        auto width = static_cast<uint32_t>(r.end().offset() - r.start().offset());
+        if (width <= best_width) {
+            best_width = width;
+            found = &sym;
+        }
+    }
+
+    void handle(const slang::ast::NamedValueExpression& e) {
+        if (covers_target(e.sourceRange)) record(e.sourceRange, e.symbol);
+        visitDefault(e);
+    }
+
+    void handle(const slang::ast::HierarchicalValueExpression& e) {
+        if (covers_target(e.sourceRange)) record(e.sourceRange, e.symbol);
+        visitDefault(e);
+    }
+
+    void handle(const slang::ast::MemberAccessExpression& e) {
+        // The member-access expression's `sourceRange` covers the whole
+        // `obj.member` span. Cursor on the *member* name resolves to
+        // the field; cursor on `obj` is caught by the inner
+        // NamedValueExpression visit (visitDefault below).
+        if (covers_target(e.sourceRange)) record(e.sourceRange, e.member);
+        visitDefault(e);
+    }
+};
+
+// Convert a found `Symbol`'s declaration site to a JSON
+// `DefinitionLocation`. Prefers `getSyntax()->sourceRange()` (the entire
+// declaration token, used as the highlight range) and falls back to
+// `Symbol::location` as a zero-width point when there's no syntax.
+//
+// `buffers_by_path` is the forward map the build step recorded; we
+// reverse-search it to recover the *exact path string* the client sent
+// so the response's `path` round-trips byte-for-byte. `sm.getFileName`
+// alone is not safe — slang relativises paths internally and the
+// returned string may not match what the client put on the wire.
+//
+// Returns `nullopt` when the symbol's location can't be resolved to a
+// file we sent (built-in symbols, synthesised library cells, etc.) —
+// caller turns that into an empty `locations` array.
+static std::optional<json> symbol_to_definition_location(
+    const slang::SourceManager& sm,
+    const slang::ast::Symbol& sym,
+    const std::unordered_map<std::string, slang::BufferID>& buffers_by_path) {
+    using namespace slang;
+
+    SourceLocation loc_start = sym.location;
+    SourceLocation loc_end = sym.location;
+
+    if (auto* syn = sym.getSyntax(); syn != nullptr) {
+        auto r = syn->sourceRange();
+        if (r.start().valid() && r.end().valid()) {
+            loc_start = r.start();
+            loc_end = r.end();
+        }
+    }
+
+    if (!loc_start.valid()) {
+        return std::nullopt;
+    }
+
+    // Resolve the declaration's buffer back to the path-as-sent. We
+    // walk the forward map because there are typically only a handful
+    // of compilation-unit files; a dedicated reverse map isn't worth
+    // the storage overhead.
+    auto orig_start = sm.getFullyOriginalLoc(loc_start);
+    auto target_buffer = orig_start.buffer();
+    std::string path_out;
+    for (const auto& [path, buf_id] : buffers_by_path) {
+        if (buf_id == target_buffer) {
+            path_out = path;
+            break;
+        }
+    }
+    if (path_out.empty()) {
+        // Slang knows about this file but the client didn't send it
+        // (e.g. an `\`include`'d header that wasn't in `files`). We'd
+        // rather return empty than send a path the client can't match.
+        return std::nullopt;
+    }
+
+    auto start = to_lsp_pos(sm, loc_start);
+    auto end = to_lsp_pos(sm, loc_end);
+
+    json out;
+    out["path"] = std::move(path_out);
+    out["range"] = {
+        {"start", {{"line", start.line}, {"character", start.character}}},
+        {"end",   {{"line", end.line},   {"character", end.character}}},
+    };
+    return out;
+}
+
+static json handle_definition(const json& params) {
+    auto built = build_compilation(params);
+    auto& sm = *built.sm;
+    auto& compilation = *built.compilation;
 
     json result;
-    result["diagnostics"] = std::move(diagnostics);
+    result["locations"] = json::array();
+
+    const auto target_path = params.value("target_path", std::string{});
+    auto buf_it = built.buffers_by_path.find(target_path);
+    if (buf_it == built.buffers_by_path.end()) {
+        // The cursor's file isn't part of this request. Nothing the
+        // sidecar can resolve; the server's trust-slang-on-empty rule
+        // means the editor sees no result.
+        std::cerr << "[mimir-slang-sidecar] definition: target_path not in request: "
+                  << target_path << '\n';
+        return result;
+    }
+
+    json pos = params.value("target_position", json::object());
+    uint32_t lsp_line = pos.value("line", 0u);
+    uint32_t lsp_char = pos.value("character", 0u);
+
+    auto byte_offset = lsp_position_to_byte_offset(sm, buf_it->second, lsp_line, lsp_char);
+    if (!byte_offset) {
+        return result;
+    }
+
+    slang::SourceLocation cursor(buf_it->second, *byte_offset);
+
+    DefinitionFinder finder;
+    finder.target = cursor;
+    compilation.getRoot().visit(finder);
+
+    if (finder.found == nullptr) {
+        return result;
+    }
+
+    if (auto loc = symbol_to_definition_location(sm, *finder.found, built.buffers_by_path)) {
+        result["locations"].push_back(std::move(*loc));
+    }
     return result;
 }
 
@@ -295,6 +584,8 @@ int main() {
         try {
             if (method == "elaborate") {
                 resp["result"] = handle_elaborate(req.value("params", json::object()));
+            } else if (method == "definition") {
+                resp["result"] = handle_definition(req.value("params", json::object()));
             } else if (method == "shutdown") {
                 // Acknowledge, flush, exit. Keeps the client from seeing
                 // a "Closed" before its shutdown response lands.
