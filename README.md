@@ -284,7 +284,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (95 today)
+cargo test   --workspace                    # run all unit tests (104 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
 ```
@@ -362,7 +362,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Navigation
 
-- ✅ `textDocument/definition` — tree-sitter index, same-file + workspace-wide (open docs and `.mimir.toml` filelist). Slang-backed semantic resolution still pending (Stage 3).
+- ✅ `textDocument/definition` — tree-sitter index, same-file + workspace-wide (open docs and `.mimir.toml` filelist). Routes through slang's semantic resolver (scope-aware, hierarchical-name-aware) when `MIMIR_SLANG_PATH` is configured; falls back to the syntax index on transport error.
 - ⬜ `textDocument/declaration`
 - ⬜ `textDocument/typeDefinition`
 - ⬜ `textDocument/implementation`

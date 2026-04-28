@@ -43,7 +43,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, instrument, warn};
 
 use crate::protocol::{
-    methods, ElaborateParams, ElaborateResult, Request, Response, ResponseError,
+    methods, DefinitionParams, DefinitionResult, ElaborateParams, ElaborateResult, Request,
+    Response, ResponseError,
 };
 
 // --------------------------------------------------------------------------
@@ -223,6 +224,14 @@ where
     ) -> Result<ElaborateResult, ConnectionError> {
         self.request(methods::ELABORATE, params).await
     }
+
+    /// Convenience wrapper for the [`methods::DEFINITION`] method.
+    pub async fn definition(
+        &mut self,
+        params: &DefinitionParams,
+    ) -> Result<DefinitionResult, ConnectionError> {
+        self.request(methods::DEFINITION, params).await
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -304,6 +313,21 @@ impl Client {
     ) -> Result<ElaborateResult, ClientError> {
         let mut conn = self.connection.lock().await;
         Ok(conn.elaborate(params).await?)
+    }
+
+    /// Run a `definition` request against the sidecar.
+    ///
+    /// Same locking discipline as `elaborate`: holds the `Connection`
+    /// mutex for the request/response cycle, so a `definition` arriving
+    /// during a pending `elaborate` will queue. Acceptable for v1 — the
+    /// editor's F12 is interactive but rare; pipelining is a separate
+    /// slice if measurements show contention.
+    pub async fn definition(
+        &self,
+        params: &DefinitionParams,
+    ) -> Result<DefinitionResult, ClientError> {
+        let mut conn = self.connection.lock().await;
+        Ok(conn.definition(params).await?)
     }
 
     /// Send the `shutdown` request, then wait for the child to exit.

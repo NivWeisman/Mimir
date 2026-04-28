@@ -307,4 +307,4 @@ names work for free — slang already resolves them.
 | --------------------------------------- | -------- | ------------------------------------------------------ |
 | 1. Tree-sitter, single-file + docSymbol | done     | shipped in commit `def6099`; `documentSymbol` came along for the ride |
 | 2. Tree-sitter, workspace (filelist+open) | done     | `WorkspaceIndex` + eager hydration on `initialize`; same-file precedence preserved |
-| 3. Slang-backed semantic resolution     | planned  | new `definition` method on the sidecar protocol        |
+| 3. Slang-backed semantic resolution     | done     | `definition` method + `Client::definition`; trust-slang-on-empty, syntax fallback only on transport error. Sidecar implementation tracked separately. |

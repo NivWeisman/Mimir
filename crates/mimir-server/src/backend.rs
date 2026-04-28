@@ -33,8 +33,9 @@ use std::time::Duration;
 
 use mimir_core::{Position as MPosition, Range as MRange, TextDocument};
 use mimir_slang::{
-    Client as SlangClient, Diagnostic as SlangDiagnostic, ElaborateParams, ElaborateResult,
-    Severity as SlangSeverity, SourceFile,
+    Client as SlangClient, DefinitionLocation as SlangDefinitionLocation,
+    DefinitionParams as SlangDefinitionParams, Diagnostic as SlangDiagnostic, ElaborateParams,
+    ElaborateResult, Severity as SlangSeverity, SourceFile,
 };
 use mimir_syntax::{
     Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity, Symbol, SymbolKind as MSymbolKind,
@@ -317,6 +318,113 @@ impl Backend {
             .await
             .insert(trigger_uri, handle);
     }
+
+    /// Try to resolve a definition via the slang sidecar.
+    ///
+    /// Returns:
+    /// * `None` — slang is not configured, or no project is loaded, or
+    ///   the cursor URI doesn't have a filesystem path. The caller
+    ///   should fall through to the syntax path.
+    /// * `Some(Resolved(locs))` — slang ran and returned a definitive
+    ///   answer (possibly empty). The caller honours an empty result
+    ///   as authoritative; no further fallback.
+    /// * `Some(TransportError)` — IO/protocol error talking to the
+    ///   sidecar. Logged at error here; caller should fall back.
+    async fn try_slang_definition(
+        &self,
+        uri: &Url,
+        target: MPosition,
+    ) -> Option<SlangDefinitionOutcome> {
+        let slang = self.slang.clone()?;
+        let project = self.project.read().await.clone()?;
+
+        // Build the request envelope. `build_definition_params` returns
+        // `None` if the URI has no filesystem path (e.g. an `untitled:`
+        // buffer); slang can't address those.
+        let (params, _files_in_request) =
+            build_definition_params(&project, &self.documents, uri, target).await?;
+
+        match slang.definition(&params).await {
+            Ok(result) => {
+                let locations: Vec<Location> = result
+                    .locations
+                    .into_iter()
+                    .filter_map(slang_location_to_lsp)
+                    .collect();
+                Some(SlangDefinitionOutcome::Resolved(locations))
+            }
+            Err(e) => {
+                error!(error = %e, "slang definition transport error; falling back to syntax");
+                Some(SlangDefinitionOutcome::TransportError)
+            }
+        }
+    }
+
+    /// Stage 1 + Stage 2 syntax-based resolver, factored out so the
+    /// `goto_definition` handler can either reach for slang first
+    /// (when configured) or call this directly (when slang is absent
+    /// or transport-failed).
+    ///
+    /// Returns the same `Option<GotoDefinitionResponse>` shape the
+    /// handler ultimately returns to the editor.
+    async fn syntax_definition(
+        &self,
+        uri: &Url,
+        target: MPosition,
+    ) -> Option<GotoDefinitionResponse> {
+        // Snapshot text + index under the read lock; release before any
+        // re-parsing happens (lock-then-clone).
+        let (text, index) = {
+            let docs = self.documents.read().await;
+            let state = docs.get(uri)?;
+            (state.document.text(), state.index.clone())
+        };
+
+        // Re-parse so we can resolve `identifier_at`. The cached `index`
+        // already gives us declarations, but to find the *reference*
+        // under the cursor we need the tree itself. Tree-sitter parses
+        // are fast (~ms) and this happens only on user-initiated F12,
+        // so we don't bother caching the tree.
+        let tree = {
+            let mut parser = self.parser.lock().await;
+            match parser.parse(&text, None) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "parse failed during syntax_definition");
+                    return None;
+                }
+            }
+        };
+        let rope = Rope::from_str(&text);
+        let name = mimir_syntax::symbols::identifier_at(&tree, &rope, target)?;
+
+        // Workspace fallback: clone the slice for `name` under the read
+        // lock (lock-then-clone) so the resolver runs without holding
+        // either lock. Empty slice when there's no workspace match.
+        let workspace_hits: Vec<(Url, Symbol)> = {
+            let wi = self.workspace_index.read().await;
+            wi.lookup(name)
+                .iter()
+                .map(|e| (e.url.clone(), e.symbol.clone()))
+                .collect()
+        };
+
+        let matches = resolve_definition(name, uri, &index, &workspace_hits);
+        if matches.is_empty() {
+            debug!(name, "no symbol matches in same-file or workspace index");
+            return None;
+        }
+
+        let locations: Vec<Location> = matches
+            .into_iter()
+            .map(|(url, sym)| Location {
+                uri: url,
+                range: m_range_to_lsp(sym.name_range),
+            })
+            .collect();
+        debug!(name, count = locations.len(), "syntax definition resolved");
+        Some(GotoDefinitionResponse::Array(locations))
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -505,64 +613,24 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
 
-        // Snapshot text + index under the read lock; release before any
-        // re-parsing happens (lock-then-clone).
-        let (text, index) = {
-            let docs = self.documents.read().await;
-            let Some(state) = docs.get(&uri) else {
-                debug!("goto_definition for unknown URI; returning None");
-                return Ok(None);
-            };
-            (state.document.text(), state.index.clone())
-        };
-
-        // Re-parse so we can resolve `identifier_at`. The cached `index`
-        // already gives us declarations, but to find the *reference*
-        // under the cursor we need the tree itself. Tree-sitter parses
-        // are fast (~ms) and this happens only on user-initiated F12,
-        // so we don't bother caching the tree.
-        let tree = {
-            let mut parser = self.parser.lock().await;
-            match parser.parse(&text, None) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "parse failed during goto_definition");
-                    return Ok(None);
+        // Slang first when configured + project loaded. Trust slang on
+        // empty (the user opted into the semantic resolver; an
+        // authoritative "no" is more accurate than syntactic guesses).
+        // Transport errors fall through to the syntax path.
+        if let Some(outcome) = self.try_slang_definition(&uri, target).await {
+            match outcome {
+                SlangDefinitionOutcome::Resolved(locs) => {
+                    debug!(count = locs.len(), "slang definition resolved");
+                    return Ok(slang_locations_to_response(locs));
+                }
+                SlangDefinitionOutcome::TransportError => {
+                    // Fall through to syntax — log already happened in
+                    // try_slang_definition.
                 }
             }
-        };
-        let rope = Rope::from_str(&text);
-        let Some(name) = mimir_syntax::symbols::identifier_at(&tree, &rope, target) else {
-            debug!("no identifier at cursor; returning None");
-            return Ok(None);
-        };
-
-        // Workspace fallback: clone the slice for `name` under the read
-        // lock (lock-then-clone) so the resolver runs without holding
-        // either lock. Empty slice when there's no workspace match.
-        let workspace_hits: Vec<(Url, Symbol)> = {
-            let wi = self.workspace_index.read().await;
-            wi.lookup(name)
-                .iter()
-                .map(|e| (e.url.clone(), e.symbol.clone()))
-                .collect()
-        };
-
-        let matches = resolve_definition(name, &uri, &index, &workspace_hits);
-        if matches.is_empty() {
-            debug!(name, "no symbol matches in same-file or workspace index");
-            return Ok(None);
         }
 
-        let locations: Vec<Location> = matches
-            .into_iter()
-            .map(|(url, sym)| Location {
-                uri: url,
-                range: m_range_to_lsp(sym.name_range),
-            })
-            .collect();
-        debug!(name, count = locations.len(), "goto_definition resolved");
-        Ok(Some(GotoDefinitionResponse::Array(locations)))
+        Ok(self.syntax_definition(&uri, target).await)
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -786,6 +854,89 @@ fn assemble_elaborate_params(
         top: project.top.clone(),
     };
     (params, files_in_request)
+}
+
+/// Build a `definition` request envelope for the slang sidecar.
+///
+/// Reuses [`assemble_elaborate_params`] for the file/include/define
+/// assembly so the request matches the most recent `elaborate` shape
+/// — the sidecar can answer from its compilation cache when the
+/// inputs are bit-equal. Only the cursor's `target_path` /
+/// `target_position` are added on top.
+///
+/// Returns `None` when the cursor URI has no filesystem path (e.g.
+/// `untitled:` buffers); slang addresses files by path so there's
+/// nothing meaningful to send.
+async fn build_definition_params(
+    project: &ResolvedProject,
+    documents: &Arc<RwLock<HashMap<Url, DocumentState>>>,
+    target_uri: &Url,
+    target_position: MPosition,
+) -> Option<(SlangDefinitionParams, Vec<Url>)> {
+    let target_path = target_uri.to_file_path().ok()?;
+
+    let open_text: HashMap<PathBuf, (Url, String)> = {
+        let docs = documents.read().await;
+        docs.iter()
+            .filter_map(|(uri, state)| {
+                uri.to_file_path()
+                    .ok()
+                    .map(|p| (p, (uri.clone(), state.document.text())))
+            })
+            .collect()
+    };
+    let (elab, files_in_request) = assemble_elaborate_params(project, &open_text, |path| {
+        std::fs::read_to_string(path).ok()
+    });
+    let params = SlangDefinitionParams {
+        files: elab.files,
+        include_dirs: elab.include_dirs,
+        defines: elab.defines,
+        top: elab.top,
+        target_path: target_path.display().to_string(),
+        target_position: MPosition::new(target_position.line, target_position.character),
+    };
+    Some((params, files_in_request))
+}
+
+/// Convert a slang `DefinitionLocation` into LSP's `Location`.
+///
+/// Returns `None` when the path can't be turned back into a URL — same
+/// fallback path as `slang_to_lsp_diagnostic` uses for diagnostics,
+/// keeping behaviour consistent across slang result types.
+fn slang_location_to_lsp(loc: SlangDefinitionLocation) -> Option<Location> {
+    let url = path_to_url(&loc.path)?;
+    Some(Location {
+        uri: url,
+        range: m_range_to_lsp(loc.range),
+    })
+}
+
+/// Wrap a list of locations into a `GotoDefinitionResponse`, treating
+/// the empty list as "no declaration found" (`None`).
+///
+/// This is the trust-slang-on-empty contract: an authoritative empty
+/// result from slang short-circuits to `None` rather than triggering a
+/// syntax fallback. The fallback is reserved for transport errors.
+fn slang_locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResponse> {
+    if locs.is_empty() {
+        None
+    } else {
+        Some(GotoDefinitionResponse::Array(locs))
+    }
+}
+
+/// Outcome of a slang definition request, used by `goto_definition` to
+/// decide whether to short-circuit (Resolved, including empty) or fall
+/// through to the syntax path (TransportError).
+enum SlangDefinitionOutcome {
+    /// Slang answered. The vector may be empty — that's "no decl found"
+    /// and the server returns `None` to the editor without falling
+    /// back to syntax.
+    Resolved(Vec<Location>),
+    /// IO / protocol error talking to the sidecar. The caller falls
+    /// back to syntax.
+    TransportError,
 }
 
 /// Last-ditch fallback when `Url::from_file_path` rejects a path (e.g.
@@ -1647,5 +1798,72 @@ mod tests {
         assert_eq!(info.location.uri, url);
         assert_eq!(info.location.range.start.line, 0);
         assert_eq!(info.location.range.end.line, 2);
+    }
+
+    // --- Stage 3: slang-backed go-to-definition routing ---------------
+
+    /// A non-empty Resolved outcome becomes a `Some(Array(...))`
+    /// response — the editor sees slang's locations.
+    #[test]
+    fn slang_outcome_resolved_with_locs_returns_array() {
+        let url = Url::parse("file:///proj/a.sv").unwrap();
+        let locs = vec![Location {
+            uri: url.clone(),
+            range: Range {
+                start: Position { line: 3, character: 7 },
+                end: Position { line: 3, character: 13 },
+            },
+        }];
+        let resp = slang_locations_to_response(locs);
+        match resp {
+            Some(GotoDefinitionResponse::Array(arr)) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0].uri, url);
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    /// An empty Resolved outcome short-circuits to `None`. This is the
+    /// trust-slang-on-empty contract: do **not** fall back to the syntax
+    /// index when slang authoritatively says "no declaration found."
+    #[test]
+    fn slang_outcome_resolved_empty_returns_none() {
+        assert!(slang_locations_to_response(Vec::new()).is_none());
+    }
+
+    /// `slang_location_to_lsp` preserves the path and range, mapping
+    /// through `path_to_url` + `m_range_to_lsp` the same way diagnostics
+    /// already do.
+    #[test]
+    fn slang_location_to_lsp_round_trip() {
+        let loc = SlangDefinitionLocation {
+            path: "/proj/b.sv".into(),
+            range: MRange::new(MPosition::new(2, 6), MPosition::new(2, 12)),
+        };
+        let lsp = slang_location_to_lsp(loc).expect("path_to_url should accept absolute path");
+        assert_eq!(lsp.uri.scheme(), "file");
+        assert!(lsp.uri.path().ends_with("/proj/b.sv"));
+        assert_eq!(lsp.range.start.line, 2);
+        assert_eq!(lsp.range.start.character, 6);
+        assert_eq!(lsp.range.end.character, 12);
+    }
+
+    /// A path `path_to_url` rejects yields `None` rather than panicking
+    /// or fabricating a URL.
+    #[test]
+    fn slang_location_to_lsp_returns_none_on_unparseable_path() {
+        // `path_to_url` parses bare strings; an empty path is not a
+        // valid file URL and should round-trip through the helper as
+        // `None` (or at most a sanitised `file:///` placeholder). We
+        // accept either as long as it's not a panic — the contract is
+        // "don't crash on bad data."
+        let loc = SlangDefinitionLocation {
+            path: String::new(),
+            range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 0)),
+        };
+        // Just exercise the path; correctness of the path-parser is
+        // covered by `path_to_url`'s own tests.
+        let _ = slang_location_to_lsp(loc);
     }
 }

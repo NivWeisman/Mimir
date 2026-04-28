@@ -22,7 +22,7 @@
 //! side — keeping the two ends loosely coupled means a slang upgrade that
 //! adds a new diagnostic code doesn't require a coordinated Rust release.
 
-use mimir_core::Range;
+use mimir_core::{Position, Range};
 use serde::{Deserialize, Serialize};
 
 // --------------------------------------------------------------------------
@@ -36,6 +36,12 @@ pub mod methods {
     /// Elaborate a set of source files and return any diagnostics.
     /// Params: [`super::ElaborateParams`]; result: [`super::ElaborateResult`].
     pub const ELABORATE: &str = "elaborate";
+
+    /// Resolve the declaration site of an identifier reference. Used to
+    /// power LSP `textDocument/definition` with slang's semantic
+    /// resolver (scope-aware, hierarchical-name-aware).
+    /// Params: [`super::DefinitionParams`]; result: [`super::DefinitionResult`].
+    pub const DEFINITION: &str = "definition";
 
     /// Politely ask the sidecar to exit. No params, no result.
     /// The client should still wait on the child after sending this.
@@ -178,6 +184,73 @@ pub struct ElaborateResult {
     /// elaboration, flattened across every file in the request. Empty
     /// vector means "elaboration succeeded with no warnings or errors."
     pub diagnostics: Vec<Diagnostic>,
+}
+
+// --------------------------------------------------------------------------
+// `definition` method
+// --------------------------------------------------------------------------
+
+/// Params for [`methods::DEFINITION`].
+///
+/// The first four fields mirror [`ElaborateParams`] so the sidecar can
+/// reuse its compilation cache when the inputs match — answering
+/// definition queries without re-elaborating. `target_path` and
+/// `target_position` pin the cursor in that compilation unit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefinitionParams {
+    /// Same shape as [`ElaborateParams::files`]: every source file the
+    /// sidecar should see, with in-memory text overriding disk.
+    pub files: Vec<SourceFile>,
+
+    /// `+incdir+` paths, in slang's search order.
+    #[serde(default)]
+    pub include_dirs: Vec<String>,
+
+    /// `+define+` macros to seed the preprocessor with.
+    #[serde(default)]
+    pub defines: Vec<MacroDefine>,
+
+    /// Optional top module/program. When `None`, slang elaborates every
+    /// top-level — same convention as `elaborate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<String>,
+
+    /// Filesystem path of the file the cursor is in. Must match the
+    /// `path` of one of the [`SourceFile`]s in `files` — the sidecar
+    /// resolves the cursor to a `SourceLocation` by exact path match.
+    pub target_path: String,
+
+    /// LSP-coordinate position of the reference under the cursor
+    /// (zero-based line, UTF-16 character).
+    pub target_position: Position,
+}
+
+/// Result for [`methods::DEFINITION`].
+///
+/// An empty `locations` vector is the sidecar's authoritative "no
+/// declaration found" — the server does not fall back to syntax in that
+/// case, because slang's empty answer is more accurate than syntactic
+/// fuzzy-match. Transport errors *do* fall back to syntax; that's
+/// handled at the server boundary, not on the wire.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DefinitionResult {
+    /// Zero, one, or many declaration sites. Multiple sites are valid
+    /// (e.g. `extern` declarations + their definition); the editor
+    /// shows them as a peek list.
+    #[serde(default)]
+    pub locations: Vec<DefinitionLocation>,
+}
+
+/// One declaration site returned by [`DefinitionResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefinitionLocation {
+    /// Filesystem path of the file the declaration lives in. Format
+    /// matches [`Diagnostic::path`] / [`SourceFile::path`] — the same
+    /// string the sidecar received in the request.
+    pub path: String,
+    /// LSP-coordinate range of the declaration's identifier token. The
+    /// server hands this to the editor verbatim as `Location.range`.
+    pub range: Range,
 }
 
 // --------------------------------------------------------------------------
@@ -339,6 +412,101 @@ mod tests {
         assert!(s.contains("is_compilation_unit"));
         let back: SourceFile = serde_json::from_str(&s).unwrap();
         assert!(!back.is_compilation_unit);
+    }
+
+    /// `DefinitionParams` round-trips, including the target fields.
+    #[test]
+    fn definition_params_roundtrip() {
+        let p = DefinitionParams {
+            files: vec![SourceFile {
+                path: "/proj/a.sv".into(),
+                text: "module a; endmodule".into(),
+                is_compilation_unit: true,
+            }],
+            include_dirs: vec!["/proj/inc".into()],
+            defines: vec![MacroDefine {
+                name: "BUS_W".into(),
+                value: Some("32".into()),
+            }],
+            top: Some("a".into()),
+            target_path: "/proj/a.sv".into(),
+            target_position: Position::new(0, 7),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: DefinitionParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.files.len(), 1);
+        assert_eq!(back.target_path, "/proj/a.sv");
+        assert_eq!(back.target_position.line, 0);
+        assert_eq!(back.target_position.character, 7);
+        assert_eq!(back.top.as_deref(), Some("a"));
+    }
+
+    /// `DefinitionParams` defaults: omitting `include_dirs`, `defines`,
+    /// `top` decodes successfully — the sidecar can rely on the
+    /// defaults exactly as it does for `elaborate`.
+    #[test]
+    fn definition_params_defaults_on_missing_fields() {
+        let json = r#"{
+            "files": [{"path": "a.sv", "text": "module m; endmodule"}],
+            "target_path": "a.sv",
+            "target_position": {"line": 0, "character": 7}
+        }"#;
+        let p: DefinitionParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.files.len(), 1);
+        assert!(p.include_dirs.is_empty());
+        assert!(p.defines.is_empty());
+        assert!(p.top.is_none());
+        assert_eq!(p.target_path, "a.sv");
+    }
+
+    /// `DefinitionResult` with `locations: []` — the "no declaration
+    /// found" wire shape — round-trips and decodes cleanly.
+    #[test]
+    fn definition_result_empty_locations_roundtrip() {
+        let r = DefinitionResult { locations: vec![] };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: DefinitionResult = serde_json::from_str(&s).unwrap();
+        assert!(back.locations.is_empty());
+        // Also: an entirely missing field decodes to empty by `#[serde(default)]`.
+        let from_minimal: DefinitionResult = serde_json::from_str("{}").unwrap();
+        assert!(from_minimal.locations.is_empty());
+    }
+
+    /// `DefinitionLocation` round-trips — same shape as a diagnostic
+    /// minus severity/code/message.
+    #[test]
+    fn definition_location_roundtrip() {
+        let loc = DefinitionLocation {
+            path: "/proj/b.sv".into(),
+            range: Range::new(Position::new(2, 6), Position::new(2, 12)),
+        };
+        let s = serde_json::to_string(&loc).unwrap();
+        let back: DefinitionLocation = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, loc);
+    }
+
+    /// A `Request` envelope carrying `DefinitionParams` round-trips.
+    /// Smoke-tests that the per-method param shape composes with the
+    /// generic envelope, the way the client actually sends it.
+    #[test]
+    fn definition_request_envelope() {
+        let req = Request {
+            id: 42,
+            method: methods::DEFINITION.to_string(),
+            params: serde_json::json!({
+                "files": [],
+                "target_path": "x.sv",
+                "target_position": {"line": 1, "character": 4},
+            }),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.id, 42);
+        assert_eq!(back.method, "definition");
+        // Decoding the generic params back into the typed shape works.
+        let typed: DefinitionParams = serde_json::from_value(back.params).unwrap();
+        assert_eq!(typed.target_path, "x.sv");
+        assert_eq!(typed.target_position.character, 4);
     }
 
     /// `Diagnostic` round-trips with a realistic-looking range.
