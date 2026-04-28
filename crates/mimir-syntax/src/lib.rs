@@ -11,6 +11,10 @@
 //! 3. **Extract parse-error diagnostics.** [`diagnostics::collect`] walks
 //!    the syntax tree and produces one [`Diagnostic`] per `ERROR` or
 //!    `MISSING` node.
+//! 4. **Extract a symbol index.** [`symbols::index`] walks the tree and
+//!    emits one [`Symbol`] per declaration; [`symbols::identifier_at`]
+//!    looks up the identifier under an LSP position. Powers
+//!    `documentSymbol` and same-file go-to-definition in `mimir-server`.
 //!
 //! ## Why tree-sitter?
 //!
@@ -31,6 +35,8 @@
 
 pub mod diagnostics;
 pub mod parser;
+pub mod symbols;
 
 pub use diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use parser::{SyntaxParser, SyntaxParserError, SyntaxTree};
+pub use symbols::{Symbol, SymbolKind};

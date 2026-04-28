@@ -36,7 +36,10 @@ use mimir_slang::{
     Client as SlangClient, Diagnostic as SlangDiagnostic, ElaborateParams, ElaborateResult,
     Severity as SlangSeverity, SourceFile,
 };
-use mimir_syntax::{Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity, SyntaxParser};
+use mimir_syntax::{
+    Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity, Symbol, SymbolKind as MSymbolKind,
+    SyntaxParser,
+};
 use ropey::Rope;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -62,6 +65,15 @@ struct DocumentState {
     /// — though for now both go through the same parser).
     #[allow(dead_code)]
     language_id: String,
+    /// Symbol index from the most recent successful parse. Empty when
+    /// the document hasn't been parsed yet or the last parse failed.
+    /// Powers same-file `goto_definition` and `documentSymbol`.
+    index: Vec<Symbol>,
+    /// Document version the `index` was built from. Used to detect a
+    /// stale write — `reparse_and_publish` may finish after a fresh
+    /// `did_change` has bumped the version, in which case we must not
+    /// overwrite the live `index` with the stale parse's results.
+    index_version: i32,
 }
 
 /// The tower-lsp [`LanguageServer`] implementation.
@@ -157,16 +169,31 @@ impl Backend {
             parser.parse(&text, None)
         };
 
-        let diags = match parse_result {
+        let (diags, new_index) = match parse_result {
             Ok(tree) => {
                 let rope = Rope::from_str(&text);
-                mimir_syntax::diagnostics::collect(&tree, &rope)
+                let diags = mimir_syntax::diagnostics::collect(&tree, &rope);
+                let index = mimir_syntax::symbols::index(&tree, &rope);
+                (diags, Some(index))
             }
             Err(e) => {
                 error!(error = %e, "parser returned error; publishing empty diagnostics");
-                Vec::new()
+                (Vec::new(), None)
             }
         };
+
+        // Write the fresh index back into the doc store, but only if the
+        // version we parsed is still the live one — otherwise a `did_change`
+        // landed mid-parse and our index is already stale.
+        if let Some(index) = new_index {
+            let mut docs = self.documents.write().await;
+            if let Some(state) = docs.get_mut(&uri) {
+                if state.document.version() == version {
+                    state.index = index;
+                    state.index_version = version;
+                }
+            }
+        }
 
         // Tree-sitter publishes immediately so the editor has prompt
         // feedback (~ms after a keystroke). The deeper slang elaborate
@@ -313,6 +340,15 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
+                // Stage 1 of go-to-definition: same-file lookup against the
+                // tree-sitter symbol index cached on each `DocumentState`.
+                // Stage 2 will broaden this to the workspace; Stage 3 will
+                // route to slang when the sidecar is configured.
+                definition_provider: Some(OneOf::Left(true)),
+                // `documentSymbol` reuses the same cached index — same data,
+                // free checkbox. The editor uses it to render the outline
+                // view and to drive symbol-aware navigation shortcuts.
+                document_symbol_provider: Some(OneOf::Left(true)),
                 // We publish diagnostics as a *push* (via the `Client`) on
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
@@ -352,6 +388,8 @@ impl LanguageServer for Backend {
                 DocumentState {
                     document: TextDocument::new(&text, version),
                     language_id,
+                    index: Vec::new(),
+                    index_version: i32::MIN,
                 },
             );
         }
@@ -416,6 +454,99 @@ impl LanguageServer for Backend {
         }
         // LSP spec: clear diagnostics for closed docs by publishing empty.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
+    }
+
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> LspResult<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        // Snapshot text + index under the read lock; release before any
+        // re-parsing happens (lock-then-clone).
+        let (text, index) = {
+            let docs = self.documents.read().await;
+            let Some(state) = docs.get(&uri) else {
+                debug!("goto_definition for unknown URI; returning None");
+                return Ok(None);
+            };
+            (state.document.text(), state.index.clone())
+        };
+
+        // Re-parse so we can resolve `identifier_at`. The cached `index`
+        // already gives us declarations, but to find the *reference*
+        // under the cursor we need the tree itself. Tree-sitter parses
+        // are fast (~ms) and this happens only on user-initiated F12,
+        // so we don't bother caching the tree.
+        let tree = {
+            let mut parser = self.parser.lock().await;
+            match parser.parse(&text, None) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "parse failed during goto_definition");
+                    return Ok(None);
+                }
+            }
+        };
+        let rope = Rope::from_str(&text);
+        let Some(name) = mimir_syntax::symbols::identifier_at(&tree, &rope, target) else {
+            debug!("no identifier at cursor; returning None");
+            return Ok(None);
+        };
+
+        let matches = resolve_in_index(name, &index);
+        if matches.is_empty() {
+            debug!(name, "no symbol matches in same-file index");
+            return Ok(None);
+        }
+
+        let locations: Vec<Location> = matches
+            .into_iter()
+            .map(|sym| Location {
+                uri: uri.clone(),
+                range: m_range_to_lsp(sym.name_range),
+            })
+            .collect();
+        debug!(name, count = locations.len(), "goto_definition resolved");
+        Ok(Some(GotoDefinitionResponse::Array(locations)))
+    }
+
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> LspResult<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let index = {
+            let docs = self.documents.read().await;
+            match docs.get(&uri) {
+                Some(state) => state.index.clone(),
+                None => {
+                    debug!("document_symbol for unknown URI; returning None");
+                    return Ok(None);
+                }
+            }
+        };
+
+        let symbols: Vec<SymbolInformation> = index
+            .iter()
+            .map(|sym| symbol_to_lsp_information(sym, &uri))
+            .collect();
+        debug!(count = symbols.len(), "document_symbol returned");
+        // We use the flat `SymbolInformation` form rather than the nested
+        // `DocumentSymbol` tree because Stage 1 doesn't model the
+        // declaration hierarchy (a class's methods aren't children of the
+        // class symbol). VS Code renders both fine; nesting is a Stage 2
+        // follow-up if it matters.
+        #[allow(deprecated)]
+        Ok(Some(DocumentSymbolResponse::Flat(symbols)))
     }
 }
 
@@ -706,6 +837,78 @@ fn plan_slang_publishes(
     SlangPublishPlan {
         publishes,
         new_published,
+    }
+}
+
+/// Find every symbol in `index` whose name matches `name` exactly.
+///
+/// Returned in source order (the index is built that way). Same-file
+/// only — `mimir-server` is the only caller and it controls which index
+/// it passes; Stage 2 will add a workspace-wide variant alongside.
+fn resolve_in_index<'a>(name: &str, index: &'a [Symbol]) -> Vec<&'a Symbol> {
+    index.iter().filter(|s| s.name == name).collect()
+}
+
+/// Convert our internal `Range` into the `lsp_types` shape.
+fn m_range_to_lsp(r: MRange) -> Range {
+    Range {
+        start: Position {
+            line: r.start.line,
+            character: r.start.character,
+        },
+        end: Position {
+            line: r.end.line,
+            character: r.end.character,
+        },
+    }
+}
+
+/// Map our internal `SymbolKind` onto the LSP wire enum.
+///
+/// The LSP set is closed (numeric on the wire), so we map each variant
+/// to the closest LSP equivalent. SystemVerilog-specific concepts
+/// (`Property`, `Sequence`, `Covergroup`) don't have dedicated LSP
+/// kinds; we fall back to `OBJECT` for those — VS Code renders them
+/// with a neutral icon.
+fn symbol_kind_to_lsp(kind: MSymbolKind) -> SymbolKind {
+    match kind {
+        MSymbolKind::Module => SymbolKind::MODULE,
+        MSymbolKind::Interface => SymbolKind::INTERFACE,
+        MSymbolKind::Program => SymbolKind::MODULE,
+        MSymbolKind::Package => SymbolKind::PACKAGE,
+        MSymbolKind::Class => SymbolKind::CLASS,
+        MSymbolKind::Task => SymbolKind::FUNCTION,
+        MSymbolKind::Function => SymbolKind::FUNCTION,
+        MSymbolKind::Typedef => SymbolKind::TYPE_PARAMETER,
+        MSymbolKind::Parameter => SymbolKind::CONSTANT,
+        MSymbolKind::Variable => SymbolKind::VARIABLE,
+        MSymbolKind::Port => SymbolKind::FIELD,
+        MSymbolKind::Property | MSymbolKind::Sequence | MSymbolKind::Covergroup => {
+            SymbolKind::OBJECT
+        }
+    }
+}
+
+/// Convert a `mimir-syntax::Symbol` to the flat LSP `SymbolInformation`
+/// the editor consumes.
+///
+/// `SymbolInformation` is technically deprecated in favour of the
+/// hierarchical `DocumentSymbol`, but every editor we care about still
+/// supports it and Stage 1 doesn't model the declaration tree. Stage 2
+/// will switch to `DocumentSymbol` once we model `class { method }`
+/// nesting.
+#[allow(deprecated)]
+fn symbol_to_lsp_information(sym: &Symbol, uri: &Url) -> SymbolInformation {
+    SymbolInformation {
+        name: sym.name.clone(),
+        kind: symbol_kind_to_lsp(sym.kind),
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri: uri.clone(),
+            range: m_range_to_lsp(sym.full_range),
+        },
+        container_name: None,
     }
 }
 
@@ -1159,5 +1362,123 @@ mod tests {
         let inc_url = Url::parse("file:///proj/inc/uvm.svh").unwrap();
         assert!(plan.publishes.iter().any(|(u, d)| u == &inc_url && d.len() == 1));
         assert!(plan.new_published.contains(&inc_url));
+    }
+
+    // --- Stage 1: go-to-definition resolver ---------------------------
+
+    /// Helper: build a `Symbol` of the given name + kind. Range values
+    /// are arbitrary — the tests only care about identity/order.
+    fn sym(name: &str, kind: MSymbolKind, line: u32) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind,
+            name_range: MRange::new(MPosition::new(line, 0), MPosition::new(line, 1)),
+            full_range: MRange::new(MPosition::new(line, 0), MPosition::new(line, 10)),
+        }
+    }
+
+    /// Empty index: nothing matches.
+    #[test]
+    fn resolve_in_index_empty_returns_no_match() {
+        assert!(resolve_in_index("foo", &[]).is_empty());
+    }
+
+    /// Single match comes back exactly once.
+    #[test]
+    fn resolve_in_index_single_match() {
+        let idx = vec![
+            sym("foo", MSymbolKind::Module, 0),
+            sym("bar", MSymbolKind::Class, 1),
+        ];
+        let hits = resolve_in_index("foo", &idx);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "foo");
+        assert_eq!(hits[0].kind, MSymbolKind::Module);
+    }
+
+    /// Multiple symbols sharing a name (e.g. a `var x` and a class field
+    /// `x` in the same file) all come back, in source order. The
+    /// editor's peek list shows them and lets the user pick — that's
+    /// the v1 UX for ambiguous syntactic resolution.
+    #[test]
+    fn resolve_in_index_multiple_matches_in_order() {
+        let idx = vec![
+            sym("x", MSymbolKind::Variable, 1),
+            sym("y", MSymbolKind::Variable, 2),
+            sym("x", MSymbolKind::Parameter, 5),
+        ];
+        let hits = resolve_in_index("x", &idx);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].kind, MSymbolKind::Variable);
+        assert_eq!(hits[0].name_range.start.line, 1);
+        assert_eq!(hits[1].kind, MSymbolKind::Parameter);
+        assert_eq!(hits[1].name_range.start.line, 5);
+    }
+
+    /// Names that don't appear in the index resolve to nothing.
+    #[test]
+    fn resolve_in_index_miss_returns_no_match() {
+        let idx = vec![sym("foo", MSymbolKind::Module, 0)];
+        assert!(resolve_in_index("bar", &idx).is_empty());
+    }
+
+    /// Every internal `SymbolKind` variant maps to *some* LSP kind.
+    /// Guards against a future refactor that adds a variant but forgets
+    /// the match arm — we'd rather see a missed-test failure than
+    /// silently fall through.
+    #[test]
+    fn symbol_kind_to_lsp_covers_every_variant() {
+        let cases = [
+            (MSymbolKind::Module, SymbolKind::MODULE),
+            (MSymbolKind::Interface, SymbolKind::INTERFACE),
+            (MSymbolKind::Program, SymbolKind::MODULE),
+            (MSymbolKind::Package, SymbolKind::PACKAGE),
+            (MSymbolKind::Class, SymbolKind::CLASS),
+            (MSymbolKind::Task, SymbolKind::FUNCTION),
+            (MSymbolKind::Function, SymbolKind::FUNCTION),
+            (MSymbolKind::Typedef, SymbolKind::TYPE_PARAMETER),
+            (MSymbolKind::Parameter, SymbolKind::CONSTANT),
+            (MSymbolKind::Variable, SymbolKind::VARIABLE),
+            (MSymbolKind::Port, SymbolKind::FIELD),
+            (MSymbolKind::Property, SymbolKind::OBJECT),
+            (MSymbolKind::Sequence, SymbolKind::OBJECT),
+            (MSymbolKind::Covergroup, SymbolKind::OBJECT),
+        ];
+        for (mine, theirs) in cases {
+            assert_eq!(symbol_kind_to_lsp(mine), theirs, "{mine:?}");
+        }
+    }
+
+    /// `Range` round-trips through `m_range_to_lsp` losslessly.
+    #[test]
+    fn m_range_to_lsp_preserves_endpoints() {
+        let r = MRange::new(MPosition::new(3, 7), MPosition::new(4, 12));
+        let lsp = m_range_to_lsp(r);
+        assert_eq!(lsp.start.line, 3);
+        assert_eq!(lsp.start.character, 7);
+        assert_eq!(lsp.end.line, 4);
+        assert_eq!(lsp.end.character, 12);
+    }
+
+    /// `symbol_to_lsp_information` carries name, kind, and the URL
+    /// through to the wire shape. The location range is the symbol's
+    /// `full_range` (the whole declaration), matching what VS Code
+    /// expects for outline view selection.
+    #[test]
+    #[allow(deprecated)]
+    fn symbol_to_lsp_information_round_trip() {
+        let s = Symbol {
+            name: "my_mod".into(),
+            kind: MSymbolKind::Module,
+            name_range: MRange::new(MPosition::new(0, 7), MPosition::new(0, 13)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 9)),
+        };
+        let url = Url::parse("file:///proj/m.sv").unwrap();
+        let info = symbol_to_lsp_information(&s, &url);
+        assert_eq!(info.name, "my_mod");
+        assert_eq!(info.kind, SymbolKind::MODULE);
+        assert_eq!(info.location.uri, url);
+        assert_eq!(info.location.range.start.line, 0);
+        assert_eq!(info.location.range.end.line, 2);
     }
 }

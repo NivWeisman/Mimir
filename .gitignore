@@ -20,3 +20,4 @@ editors/vscode/*.vsix
 
 # Claude Code per-user state (settings.local.json is machine-specific)
 .claude/settings.local.json
+current-plan.md

@@ -1,311 +1,310 @@
-# current-plan.md — slang sidecar integration
+# current-plan.md — `textDocument/definition` (go to definition)
 
 Live working plan. Updated as stages land. The README feature checklist
 remains canonical for shipped status; this file tracks the multi-stage
 work the checklist boxes don't surface yet.
 
----
-
-## Where we stopped
-
-- Stage 0 (Rust client + protocol): **done** — `mimir-slang` crate exists with
-  `protocol.rs`, `client.rs` (`Connection` framing layer + `Client` process
-  layer), full unit tests. `cargo check --workspace` passes.
-- Stage 0 (server seam): **done** — `Backend` accepts
-  `Option<Arc<SlangClient>>`, `merge_diagnostics(syntax, slang, slang_active)`
-  is in place with the conflict policy ("when slang elaborates, syntax errors
-  are dropped"), `slang_to_lsp_diagnostic` exists, the `MIMIR_SLANG_PATH`
-  env var spawns the sidecar in `main.rs`. The flag is hard-wired to
-  `false` today so behaviour is identical to tree-sitter-only mode.
-- Stage 1 (build the C++ sidecar): **in progress, interrupted**.
-  - `slang-sidecar/CMakeLists.txt` and `src/main.cpp` exist.
-  - `cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release` ran fine.
-  - `cmake --build build` reached ~step 25/152 before being killed
-    (slang's own sources just started compiling; mimalloc + fmt linked).
-  - No `mimir-slang-sidecar` binary on disk yet.
+Previous slice (slang sidecar Stages 0–3.1) is shipped and lives in git
+history. This plan replaces that file in scope.
 
 ---
 
-## Stage 1 — finish the C++ build (immediate)
+## Goal
 
-1. Resume the build in background:
-   `cmake --build slang-sidecar/build -j$(nproc)` until completion.
-   First fresh build of slang on this machine; expect ~15–25 min on
-   release, then link.
-2. On success, verify `slang-sidecar/build/mimir-slang-sidecar` exists and
-   `--help`-style probing isn't needed (the binary speaks NDJSON only).
-3. Smoke-test by hand:
-   - Send `{"id":1,"method":"elaborate","params":{"files":[{"path":"a.sv","text":"module m; endmodule"}]}}\n` on stdin, expect `{"id":1,"result":{"diagnostics":[]}}`.
-   - Send `{"id":2,"method":"elaborate","params":{"files":[{"path":"a.sv","text":"module m endmodule"}]}}\n` (missing `;`), expect at least one diagnostic.
-   - Send `{"id":3,"method":"shutdown"}\n`, expect `{"id":3,"result":null}` and a clean exit.
-4. End-to-end smoke against the Rust server:
-   `MIMIR_SLANG_PATH=…/mimir-slang-sidecar cargo run -p mimir-server` and
-   confirm the `slang sidecar spawned` log line appears (no behavioural
-   change yet — `slang_active = false` is still hard-wired).
-5. Don't commit `slang-sidecar/build/`. `.gitignore` already excludes
-   `target/`; add `slang-sidecar/build/` and `slang-sidecar/build.log`.
+Wire the LSP `textDocument/definition` request so an editor's
+"Go to definition" jumps from a SystemVerilog identifier reference to its
+declaration. Honour the existing two-backend model: tree-sitter is
+always-on, slang is the authoritative resolver when the sidecar is
+configured.
 
-**Exit criteria.** Binary runs, three hand-fed JSON-RPC requests round-trip,
-server log shows "slang sidecar spawned" on a real `MIMIR_SLANG_PATH`.
+Free side-effect: the symbol index built for navigation also satisfies
+`textDocument/documentSymbol`, so Stage 1 ships that too.
 
 ---
 
-## Stage 2 — project support (planned, not yet started)
+## What "definition" means here
 
-Slang needs the **whole compilation unit** to do anything useful for UVM
-verification code: a single `.sv` file alone won't elaborate because UVM
-classes pull `uvm_pkg`, the testbench pulls `+incdir+` paths, and macros
-need `+define+`s. Without project context, calling slang on the open file
-is no better than tree-sitter.
+In priority order (covers ~90% of real verification code):
 
-### Minimum viable config: `.mimir.toml`
+1. Module / interface / program instance → declaration
+2. Class type reference → `class` declaration
+3. Task / function call → `task` / `function` declaration
+4. Typedef use → `typedef` declaration
+5. Package-qualified `pkg::sym` → package + member declaration
+6. Variable / parameter / port reference → declaration
+7. SVA `property` / `sequence` reference → declaration
+8. Macro reference (`` `MY_MACRO ``) → `` `define `` site (slang only)
 
-A per-project file at the LSP root. First cut, fields:
+**Out of scope for v1**: hierarchical references (`u_dut.fsm.state`),
+virtual interface chasing, generate-block scoping nuances. Stage 3
+inherits these from slang.
 
-```toml
-# .mimir.toml
-[slang]
-filelist     = "sim/uvm.f"        # path (relative to .mimir.toml) to a .f filelist
-include_dirs = ["rtl", "verif/inc"] # extra +incdir+ values
-defines      = [                   # extra +define+s, name or name=value
-    "UVM_NO_DPI",
-    "BUS_WIDTH=32",
-]
-top          = "tb_top"            # optional top module name
+---
+
+## Architecture
+
+Two resolution paths, picked at request time:
+
+```
+goto_definition(uri, pos)
+    ├── slang configured + project loaded?  →  slang.definition(uri, pos)
+    └── otherwise                           →  syntax index (per-doc + workspace)
 ```
 
-- Discovery: walk up from `initialize.params.root_uri` looking for
-  `.mimir.toml`. If absent, slang stays inactive (tree-sitter only) and we
-  log at `info` ("no .mimir.toml; slang disabled for this project").
-- Loading: pure Rust, `serde + toml` parsing into a `ProjectConfig` struct.
-- Where the code lives: new module `crates/mimir-server/src/project.rs`. A
-  full crate is overkill until we have multiple consumers.
-
-### Filelist (`.f`) parsing
-
-Verification standard. Each line is one of:
-
-- A source file path (`./rtl/foo.sv`), possibly with a glob.
-- `+incdir+PATH[+PATH...]` — colon/`+`-separated additional include dirs.
-- `+define+NAME[=VALUE][+NAME[=VALUE]...]` — preprocessor defines.
-- `-f OTHER.f` / `-F OTHER.f` — recursive include of another filelist.
-- `//` or `#` line comment.
-- Backslash line continuation, env-var expansion (`${VAR}`).
-
-Parser lives in `project.rs` next to `ProjectConfig`. The output is a
-fully-resolved `ElaborateParams` (paths absolutised, dedup'd, defines
-flattened). Watch the recursion depth — guard against `-f a.f -f a.f`
-cycles.
-
-### Tests for Stage 2
-
-- `.mimir.toml` round-trip + missing-file → `Default::default()`.
-- `.f` parser: covers each directive, comments, `-f` recursion, cycle guard.
-- Discovery walks up at most N parents (cap at 8 to bound an editor that
-  opened a single file from `/`).
-
-**Exit criteria.** `Backend::new` (or an `initialize` hook) loads project
-config, resolves it to an `ElaborateParams` template (files filled in at
-elaborate time from the document store + disk), and logs the resolved
-input counts at `info`. Slang still not called from the diagnostic path —
-that's Stage 3.
+Tree-sitter path is the floor — always works, single-file precision, no
+scope rules. Slang path is the ceiling — full semantic resolution,
+cross-file, scope-aware.
 
 ---
 
-## Stage 3 — wire slang into diagnostics with debounce (planned)
+## Stage 1 — tree-sitter, single-file (confidence check)
 
-### Why debounce
+Smallest useful slice. Ships go-to-def for any declaration in the same
+file as the cursor, plus `documentSymbol` as a freebie.
 
-| Source        | Cost per run     | Run on every keystroke?                                     |
-| ------------- | ---------------- | ----------------------------------------------------------- |
-| tree-sitter   | ~1–10 ms         | Yes. Already does this, gives the responsive squiggles.     |
-| slang elaborate | ~100 ms – seconds | **No.** Full preprocess + parse + elaborate over the whole compilation unit. Running on every keystroke wedges the editor's diagnostics. |
+### `mimir-syntax`: new module `symbols.rs`
 
-So the diagnostic pipeline becomes two-tier:
+- `Symbol { name, kind, name_range, full_range }`. Mirrors LSP shapes
+  but lives in this crate (pattern #5 in
+  [`.claude/docs/architectural_patterns.md`](./.claude/docs/architectural_patterns.md)
+  — don't leak `lsp_types` into `mimir-syntax`).
+- `SymbolKind` enum: `Module`, `Interface`, `Program`, `Package`,
+  `Class`, `Task`, `Function`, `Typedef`, `Parameter`, `Variable`,
+  `Port`, `Property`, `Sequence`, `Covergroup`.
+- `pub fn index(tree: &SyntaxTree, rope: &Rope) -> Vec<Symbol>` — walk
+  the tree-sitter tree and pull declarations using node kinds
+  (`module_declaration`, `class_declaration`, `function_declaration`,
+  `task_declaration`, `parameter_declaration`, `data_declaration`,
+  `type_declaration`, `package_declaration`, …). Find the name child
+  via `child_by_field_name("name")` or kind-specific lookup; the LSP
+  range is the *name token*, not the whole decl.
+- `pub fn identifier_at(tree, rope, pos) -> Option<&str>` — find the
+  leaf `simple_identifier` (or `system_tf_identifier`) covering a byte
+  offset. Returns the identifier text borrowed from `tree.source()`.
+- Re-export `Symbol`, `SymbolKind` from `lib.rs` (pattern #6).
+- Co-located tests (pattern #2): per-kind extraction, identifier-at
+  boundaries (start/middle/end of a token, between tokens, in
+  whitespace), `pkg::sym` qualifier handling.
 
-1. On every `did_change`: parse with tree-sitter, publish syntax diagnostics
-   immediately (today's behaviour, unchanged).
-2. **Schedule** a debounced slang run for that URI (cancelling any pending
-   one). When the timer fires, call `slang.elaborate(project_params + open
-   buffers)`, partition the result by file, and re-publish per-URL.
+### `mimir-server`: cache + handler
 
-### Debounce design
+- Add `index: Vec<Symbol>` field to `DocumentState` in
+  [`crates/mimir-server/src/backend.rs`](./crates/mimir-server/src/backend.rs).
+  Populate it inside `reparse_and_publish` right after `parser.parse`
+  succeeds. No extra tree walk — the tree is already in hand and
+  `mimir_syntax::diagnostics::collect` is already walking it.
+- `async fn goto_definition(&self, params: GotoDefinitionParams) -> LspResult<Option<GotoDefinitionResponse>>`
+  on `Backend`. Flow:
+  1. Read-lock the document store, clone the indexed `Vec<Symbol>` and
+     the rope (lock-then-clone, pattern #8).
+  2. `mimir_syntax::symbols::identifier_at(tree, rope, pos)` to get the
+     name under the cursor.
+  3. Linear scan the doc's `Vec<Symbol>` for matches by name (Stage 1
+     is single-file; multiple matches all returned).
+  4. Convert each `Symbol::name_range` to `lsp_types::Location` via the
+     existing `Position` shape — pattern #7 says go through
+     `Position::from_byte_offset` once at the boundary.
+- `#[instrument(level = "debug", skip_all, fields(uri = %...))]` on the
+  handler (pattern #9).
+- `async fn document_symbol(&self, params: DocumentSymbolParams) -> LspResult<Option<DocumentSymbolResponse>>`
+  using the same cached index. Two-for-one.
+- `ServerCapabilities` advertises:
+  - `definition_provider: Some(OneOf::Left(true))`
+  - `document_symbol_provider: Some(OneOf::Left(true))`
 
-- Per-URI timer with a default of **350 ms** quiet time. Configurable via
-  `[slang] debounce_ms = 350` in `.mimir.toml`.
-- Implementation: `documents` already lives behind an `RwLock<HashMap>`.
-  Add a sibling `RwLock<HashMap<Url, JoinHandle<()>>>` (name:
-  `pending_elaborations`). On `did_change`:
-  1. Run tree-sitter and publish (synchronous, fast).
-  2. Take the write lock on `pending_elaborations`, `.abort()` any prior
-     handle for this URI (idempotent if the task already finished),
-     `tokio::spawn` a new task that:
-     - `tokio::time::sleep(debounce)`,
-     - re-reads the document store snapshot under a read lock,
-     - calls `slang.elaborate()` with the current snapshot,
-     - publishes per-URL diagnostics (with `slang_active = true`),
-     - clears its own entry from `pending_elaborations`.
-- Cancellation safety: aborting between the sleep and the `elaborate` call
-  is fine — the new task just runs again. Aborting *during* `elaborate`
-  drops the response on the floor; the wire `id` mismatches will go to
-  `ConnectionError::IdMismatch` for the next caller. Mitigation: only abort
-  the *timer phase*; once we've sent the request, let it complete and
-  discard the result if a newer one is already pending. Track a
-  per-document monotonic "edit generation" and tag each elaborate with it.
+### Tests
 
-### Per-file fan-out
+- `mimir-syntax/src/symbols.rs`:
+  - One test per `SymbolKind` (module, class, task, function, typedef,
+    parameter, package, property, sequence, covergroup).
+  - `identifier_at`: hits at column 0, last column of identifier, just
+    past the identifier (returns `None`), inside whitespace
+    (`None`), inside a comment (`None`).
+  - Multi-symbol files: returned in source order.
+- `mimir-server/src/backend.rs`:
+  - Pure helper `resolve_in_index(name, &[Symbol]) -> Vec<Symbol>` so we
+    can unit-test without spinning up `tower-lsp`. Cover: no match,
+    single match, multiple matches, empty index.
+  - `goto_definition` happy path via the same helper plus a constructed
+    `GotoDefinitionParams`.
 
-`ElaborateResult.diagnostics` covers every file slang saw — possibly
-hundreds. We:
+### Stage 1 exit criteria
 
-1. Group by `path`.
-2. Convert each path back to a `Url` (use the editor-supplied URI for any
-   open document; for other files, build `file://<absolute-path>`).
-3. Call `client.publish_diagnostics(url, diags, version)` per group.
-4. **Crucially**, also publish empty for any URL that previously had
-   slang diagnostics but no longer does — otherwise stale errors stick
-   around. Track "URLs with non-empty slang diagnostics last cycle" in
-   the backend and diff.
+- `cargo test --workspace` green; ~10–12 new unit tests.
+- `cargo clippy --workspace -- -D warnings` clean.
+- Manual smoke against the VS Code extension: F12 on a class name in
+  the same file jumps to the class declaration's name token.
+- README feature checklist: `textDocument/definition` ⬜ → 🚧,
+  `textDocument/documentSymbol` ⬜ → ✅.
+- `current-plan.md` updated with Stage 1 done; commit lands per
+  CLAUDE.md.
 
-### Failure / fallback
+---
 
-- `ClientError::Connection(ConnectionError::is_terminal)` → drop the slang
-  `Arc<Client>`, log at warn, fall back to tree-sitter (`slang_active =
-  false`). No automatic respawn yet — user restarts the server. (Respawn
-  with backoff is a follow-up if this turns out to be common.)
-- `ConnectionError::Sidecar` (slang reported a structured error for *our*
-  request, e.g. bad params) → log at error with the message, leave the
-  client running, fall back to tree-sitter for *this* publish only.
+## Stage 2 — tree-sitter, workspace-wide (filelist + open docs)
 
-### Tests for Stage 3
+Builds on Stage 1's per-doc symbol index by aggregating across files.
+Resolution order: same-file index first, then workspace index. Multiple
+matches return all `Location`s — VS Code's peek list is the right UX
+for a syntactic resolver.
 
-- Debounce: rapid edits coalesce — 5 edits in 100 ms produce exactly one
-  elaborate call after the timer fires. Use `tokio::test(start_paused = true)`
-  + `time::advance` so the test doesn't actually wait.
-- Edit-generation tag: a stale slang response (older generation) is
-  discarded.
-- Per-file fan-out: a result with 3 paths produces 3 publish calls; on
-  the next cycle one of those paths is gone → that URL gets an empty
-  publish.
-- Sidecar terminal failure: client dropped, subsequent edits use
-  tree-sitter only.
+### `mimir-server`: workspace index
 
-**Exit criteria.** `did_change` produces tree-sitter diagnostics
-immediately; ~350 ms after the user stops typing, slang diagnostics
-replace them across all affected files; an idle session uses ~0% CPU.
+- New struct `WorkspaceIndex { by_name: HashMap<String, Vec<(Url, Symbol)>> }`
+  on `Backend`, behind `Arc<RwLock<WorkspaceIndex>>`.
+- Two population sources, **both used together** (per the user's
+  decision):
+  1. **Open documents.** Already indexed in Stage 1 — re-aggregate into
+     the workspace index whenever `reparse_and_publish` updates a
+     `DocumentState`.
+  2. **Project filelist files** when `.mimir.toml` is present. Read the
+     file from disk on first need, parse with `SyntaxParser`, run
+     `mimir_syntax::symbols::index`, cache. Files that are also open
+     in-memory take precedence (the open buffer is fresher than disk).
+- New module `crates/mimir-server/src/workspace_index.rs` for the
+  index struct + population logic. Keeps `backend.rs` from growing
+  another responsibility.
+
+### Cache invalidation
+
+- On `did_change` / `did_save` for an open file: re-index that file,
+  replace its entries in the workspace index.
+- On `did_close`: keep the index entry but mark it as
+  "back to disk-sourced" — the on-disk version reappears.
+- `workspace/didChangeWatchedFiles`: not implemented yet (it's a
+  separate checklist item). Until it is, filelist files that change on
+  disk while not open don't refresh until the server restarts. Document
+  this limitation explicitly in the rustdoc.
+
+### Resolution
+
+- `goto_definition` flow becomes:
+  1. Try same-file index (Stage 1 path).
+  2. If no match, query the workspace index.
+  3. Return all matching `Location`s, deduplicated by URL+range.
+- Pure helper `resolve_definition(name, &doc_index, &workspace_index) -> Vec<(Url, Symbol)>`
+  for unit testing.
+
+### Tests
+
+- `workspace_index.rs`:
+  - Building from a list of `(Url, Vec<Symbol>)` produces the right
+    `by_name` map.
+  - Replace-on-update: re-indexing a URL drops its old entries.
+  - On-disk fallback: a path not in open docs reads disk via an
+    injectable `FnMut(&Path) -> Option<String>` (same seam pattern as
+    `assemble_elaborate_params`).
+- `backend.rs`:
+  - `resolve_definition`: same-file beats workspace; workspace match
+    when same-file empty; both empty → `None`.
+  - Multi-file case: a `class` declared in one open doc is found from a
+    reference in another open doc.
+
+### Stage 2 exit criteria
+
+- F12 on a UVM class name in the apb example resolves across files.
+- Workspace index hydrates from `.mimir.toml`'s filelist on `initialize`
+  and grows as the user opens additional files.
+- README feature checklist: `textDocument/definition` 🚧 → ✅
+  (tree-sitter coverage; semantic via slang stays 🚧 pending Stage 3).
+
+---
+
+## Stage 3 — slang-backed, semantic (after Stage 2 ships)
+
+Slang is the authoritative resolver when configured. Falls back to the
+syntax index on transport error or empty result.
+
+### `mimir-slang`: extend protocol
+
+In [`crates/mimir-slang/src/protocol.rs`](./crates/mimir-slang/src/protocol.rs):
+
+- New constant `methods::DEFINITION = "definition"`.
+- `DefinitionParams { files, include_dirs, defines, top, target_path, target_position }`.
+  First four mirror `ElaborateParams` so the sidecar can reuse its
+  compilation cache (or recompile, same code path).
+- `DefinitionResult { locations: Vec<DefinitionLocation> }` where
+  `DefinitionLocation { path: String, range: Range }`.
+- `Client::definition(&self, params: &DefinitionParams) -> Result<DefinitionResult>`
+  on the Rust side, parallel to `Client::elaborate`.
+- Round-trip + defaults tests, identical pattern to `ElaborateParams` /
+  `ElaborateResult`.
+
+### Sidecar (C++)
+
+Tracked separately from this repo's tree, but the protocol shape and
+the sidecar binary are co-owned. Implementation uses slang's symbol
+lookup at a `SourceLocation` to find the declaration. Hierarchical
+names work for free — slang already resolves them.
+
+### `mimir-server`: routing
+
+- `goto_definition` flow becomes:
+  1. If `slang.is_some()` and project loaded: call
+     `slang.definition(...)` with the same `ElaborateParams` shape used
+     for diagnostics, plus `target_path` + `target_position`.
+  2. On success with non-empty result: return those locations.
+  3. On transport error or empty result: fall back to the syntax index
+     (Stage 1 + Stage 2 path).
+- Lock-then-clone for the document snapshot, identical to
+  `schedule_elaborate`.
+- No debounce — `definition` is request/response, not a push.
+
+### Tests
+
+- Routing logic in a pure helper:
+  `select_definition_backend(slang_active, project_loaded) -> Backend`.
+- Fallback path: simulated `Err(...)` from the slang client returns the
+  syntax index's locations.
+- Empty-result path: `Ok(DefinitionResult { locations: vec![] })` →
+  fall back, not return empty.
+
+### Stage 3 exit criteria
+
+- F12 on a hierarchical reference (`u_dut.fsm.state`) in the apb
+  example lands on the right register declaration.
+- F12 inside a generate block respects scope (a same-named symbol in a
+  different generate doesn't show as a candidate).
+- README feature checklist: `textDocument/definition` ✅ stays ✅; note
+  in the surrounding text that semantic resolution is now active when
+  slang is configured.
+
+---
+
+## Open questions (resolved)
+
+1. **Land Stage 1 first as confidence check, then Stage 2 in the same
+   week. Stage 3 is a follow-up after the C++ sidecar protocol grows
+   the new method.**
+2. **Workspace index pulls from filelist files *plus* all open
+   documents.** Open buffers take precedence over disk for files in
+   both sets.
+3. **`documentSymbol` ships in Stage 1** — same data, free checkbox.
 
 ---
 
 ## Out of scope (deliberately, for this slice)
 
-- Sidecar respawn on terminal failure.
-- Pull-based diagnostics (`textDocument/diagnostic`).
-- Pipelined / out-of-order request dispatch on the wire.
-- Caching `Compilation` across requests in the sidecar (would need a
-  `Server` class on the C++ side; today each elaborate is from scratch).
-- Cross-platform sidecar shipping (Linux build is what we exercise; macOS
-  / Windows binaries are CI's job, not this branch's).
+- `textDocument/declaration`, `textDocument/typeDefinition`,
+  `textDocument/implementation`. Same machinery, separate slices once
+  go-to-def proves the architecture.
+- `textDocument/references` (find-usages). Reverse direction; needs a
+  second index keyed by reference-site, not by declaration name.
+- `workspace/symbol`. Same symbol index as `documentSymbol` but
+  cross-file with fuzzy matching; defer until Stage 2 lands the
+  workspace index.
+- `workspace/didChangeWatchedFiles` integration. Filelist files that
+  change while not open don't refresh until restart; live with this for
+  now.
+- Macro definitions (`` `define ``) — preprocessor-level, slang-only,
+  picked up "for free" once Stage 3 routes to slang.
 
 ---
 
 ## Status table
 
-| Stage                            | State        | Notes                                                  |
-| -------------------------------- | ------------ | ------------------------------------------------------ |
-| 0. Rust protocol + client + seam | done         | `mimir-slang` crate, server holds `Option<Client>`     |
-| 1. Build the C++ sidecar         | done         | `slang-sidecar/build/mimir-slang-sidecar` runs; 3-request smoke test green; server logs "slang sidecar spawned" with `MIMIR_SLANG_PATH` set |
-| 2. Project config (`.mimir.toml`, `.f`) | done         | `crates/mimir-server/src/project.rs`; 12 unit tests; end-to-end: `.mimir.toml` with `filelist = "sim.f"` resolves to "files=1 include_dirs=2 defines=3 top=Some(...) debounce_ms=350" on initialize |
-| 3. Wire elaborate + debounce     | done         | `Backend::schedule_elaborate` per-URI debounced task; `assemble_elaborate_params` + `plan_slang_publishes` are pure helpers with 7 unit tests; end-to-end shows tree-sitter "syntax error" on didOpen instantly and slang's `ExpectedToken: expected ';'` after the configured `debounce_ms` |
-
----
-
-## Stage 3.1 — distinguish compilation units from includee buffers (current)
-
-### What we hit
-
-First end-to-end run on the UVM `apb` example surfaced a real bug. The
-elaborate request carried two files — `apb.sv` (the project's only
-filelist entry, which `` `include ``s every agent file via `+incdir+`)
-and `apb_agent.sv` (the file the user had open). The sidecar
-unconditionally called `SourceManager::assignText` for both and wrapped
-each in its own `SyntaxTree`. Slang threw:
-
-> sidecar exception: Buffer with the given path has already been
-> assigned to the source manager
-
-Two distinct problems:
-
-1. **Duplicate-buffer error.** While parsing `apb.sv`, the preprocessor
-   resolves `` `include "apb_agent.sv" `` from `+incdir+`, loads the
-   file from disk, and registers the buffer under that path. The
-   subsequent `assignText("apb_agent.sv", …)` for the open document
-   collides.
-2. **Unsaved edits silently ignored.** Even if the dedup were tolerated,
-   the include path would have used the on-disk text, not the user's
-   in-memory buffer. Editing `apb_agent.sv` would not affect
-   elaboration.
-
-There's also a modelling issue: `apb_agent.sv` is meant to be included
-inside `package apb_pkg; … endpackage`. Wrapping it in its own
-top-level `SyntaxTree` (today's behaviour) is wrong even when paths
-don't collide — it produces spurious "class outside package" diagnostics.
-
-### Fix
-
-- **Protocol.** Extend `protocol::SourceFile` with
-  `is_compilation_unit: bool` (default `true`, serde-skipped when true
-  so the wire stays compact and old requests still decode).
-- **Backend.** `assemble_elaborate_params` marks project-filelist files
-  as `is_compilation_unit = true` and open-but-not-in-filelist files as
-  `false`. The latter still ride along so unsaved buffers participate,
-  but only via include resolution.
-- **Sidecar.** `handle_elaborate` does two passes:
-  1. `sm->assignText(path, text)` for every file in the request — seeds
-     the `SourceManager` so the preprocessor finds our in-memory
-     buffer instead of going to disk for `` `include ``s. Catch slang's
-     "already assigned" exception and skip — duplicates are
-     non-critical here.
-  2. `SyntaxTree::fromBuffer(...)` + `compilation.addSyntaxTree(...)`
-     only for files with `is_compilation_unit == true`. Includee buffers
-     are seeded but not parsed standalone.
-
-### Tests
-
-- `protocol`: round-trip for both default-true (skipped on serialise)
-  and explicit-false; old-request decoding still gets `true`.
-- `assemble_elaborate_params`: project files are flagged `true`, open
-  files outside the filelist are flagged `false`.
-
-**Exit criteria.** Opening `apb_agent.sv` against the apb `.mimir.toml`
-no longer triggers `Buffer with the given path has already been
-assigned`; semantic diagnostics for that file reflect unsaved edits.
-
----
-
-## Follow-ups (not in scope for this slice)
-
-These were called out in Stage 3's design but deferred to keep the
-slice tight; track them here so they don't fall on the floor.
-
-- **Edit-generation tagging.** Today, if a slang request is in flight
-  and a new edit lands, the new edit's task waits for the connection
-  Mutex; the old request's response is published anyway, then the new
-  one supersedes it ~ms later. That's a brief flicker, not a
-  correctness bug. Tagging each request with a per-document monotonic
-  generation and discarding stale results would eliminate the flicker.
-- **Sidecar terminal-failure handling.** `ConnectionError::is_terminal`
-  exists; the backend currently logs `error` and keeps the
-  `Arc<SlangClient>`. The next edit will fail the same way and log
-  again. Right move is: drop the `Arc`, log a one-time warn, and let
-  the user restart the server. Even better: respawn with backoff.
-- **`is_terminal`-driven fall-back to tree-sitter only.** Tied to the
-  above — once slang dies, `slang_published` should be cleared so the
-  next tree-sitter publish for those files isn't immediately
-  overwritten by stale slang state.
-- **README install-the-sidecar section.** The C++ build is documented
-  in `slang-sidecar/CMakeLists.txt` but not in the user-facing README.
-  Should land before anyone outside the team tries to use slang.
-- **Surface env-var-not-set in the trace.** `spawn_slang_if_configured`
-  silently returns `None` when `MIMIR_SLANG_PATH` is unset. Logging a
-  one-time `debug!("MIMIR_SLANG_PATH not set; tree-sitter only")`
-  makes "why isn't slang on?" answerable from the trace alone.
+| Stage                                   | State    | Notes                                                  |
+| --------------------------------------- | -------- | ------------------------------------------------------ |
+| 1. Tree-sitter, single-file + docSymbol | planned  | smallest useful slice; lands `documentSymbol` too     |
+| 2. Tree-sitter, workspace (filelist+open) | planned  | aggregates across open docs and `.mimir.toml` filelist |
+| 3. Slang-backed semantic resolution     | planned  | new `definition` method on the sidecar protocol        |

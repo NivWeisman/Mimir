@@ -284,7 +284,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (19 today)
+cargo test   --workspace                    # run all unit tests (88 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
 ```
@@ -353,7 +353,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 - ⬜ `textDocument/hover`
 - ⬜ `textDocument/completion`
 - ⬜ `textDocument/signatureHelp`
-- ⬜ `textDocument/documentSymbol`
+- ✅ `textDocument/documentSymbol` (flat, from the tree-sitter symbol index)
 - ⬜ `workspace/symbol`
 - ⬜ `textDocument/foldingRange`
 - ⬜ `textDocument/documentHighlight`
@@ -362,7 +362,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Navigation
 
-- ⬜ `textDocument/definition`
+- 🚧 `textDocument/definition` — Stage 1 (same-file, tree-sitter index) shipped; workspace-wide and slang-backed stages pending
 - ⬜ `textDocument/declaration`
 - ⬜ `textDocument/typeDefinition`
 - ⬜ `textDocument/implementation`
