@@ -284,7 +284,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (88 today)
+cargo test   --workspace                    # run all unit tests (95 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
 ```
@@ -362,7 +362,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Navigation
 
-- 🚧 `textDocument/definition` — Stage 1 (same-file, tree-sitter index) shipped; workspace-wide and slang-backed stages pending
+- ✅ `textDocument/definition` — tree-sitter index, same-file + workspace-wide (open docs and `.mimir.toml` filelist). Slang-backed semantic resolution still pending (Stage 3).
 - ⬜ `textDocument/declaration`
 - ⬜ `textDocument/typeDefinition`
 - ⬜ `textDocument/implementation`

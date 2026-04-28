@@ -20,6 +20,7 @@ use tower_lsp::{LspService, Server};
 
 mod backend;
 mod project;
+mod workspace_index;
 
 /// Environment variable: filesystem path to the slang sidecar binary. When
 /// set and the spawn succeeds, `mimir-server` consults the sidecar for

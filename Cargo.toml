@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.2.0"
+version      = "0.3.0"
 edition      = "2021"
 rust-version = "1.75"
 license      = "MIT OR Apache-2.0"
@@ -67,9 +67,9 @@ serde_json  = "1"
 toml        = "0.8"
 
 # --- Internal crates (used by other workspace members) --------------------
-mimir-core   = { path = "crates/mimir-core",   version = "0.2.0" }
-mimir-syntax = { path = "crates/mimir-syntax", version = "0.2.0" }
-mimir-slang  = { path = "crates/mimir-slang",  version = "0.2.0" }
+mimir-core   = { path = "crates/mimir-core",   version = "0.3.0" }
+mimir-syntax = { path = "crates/mimir-syntax", version = "0.3.0" }
+mimir-slang  = { path = "crates/mimir-slang",  version = "0.3.0" }
 
 [profile.release]
 # LTO + a single codegen unit shrinks the LSP binary and squeezes a bit more

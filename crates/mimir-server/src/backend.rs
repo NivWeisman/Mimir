@@ -49,6 +49,7 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::project::ResolvedProject;
+use crate::workspace_index::{self, WorkspaceIndex};
 
 /// Per-document state held inside the store.
 ///
@@ -121,6 +122,15 @@ pub(crate) struct Backend {
     /// — otherwise the editor keeps showing stale red squiggles after the
     /// user fixes the root-cause error.
     slang_published: Arc<RwLock<HashSet<Url>>>,
+
+    /// Workspace-wide tree-sitter symbol index. Populated from two sources:
+    /// every `reparse_and_publish` for an open document folds that doc's
+    /// fresh `Vec<Symbol>` in, and `initialize` spawns a one-shot
+    /// hydration over `ResolvedProject.files` so cross-file F12 works
+    /// against the filelist before the user opens those files. See
+    /// [`workspace_index`] for the data structure and the open-vs-disk
+    /// precedence rules.
+    workspace_index: Arc<RwLock<WorkspaceIndex>>,
 }
 
 impl Backend {
@@ -140,6 +150,7 @@ impl Backend {
             project: Arc::new(RwLock::new(None)),
             pending_elaborations: Arc::new(RwLock::new(HashMap::new())),
             slang_published: Arc::new(RwLock::new(HashSet::new())),
+            workspace_index: Arc::new(RwLock::new(WorkspaceIndex::new())),
         }
     }
 
@@ -184,14 +195,27 @@ impl Backend {
 
         // Write the fresh index back into the doc store, but only if the
         // version we parsed is still the live one — otherwise a `did_change`
-        // landed mid-parse and our index is already stale.
+        // landed mid-parse and our index is already stale. When the write
+        // does happen, also fold the new symbols into the workspace index
+        // so cross-file F12 sees them.
         if let Some(index) = new_index {
-            let mut docs = self.documents.write().await;
-            if let Some(state) = docs.get_mut(&uri) {
-                if state.document.version() == version {
-                    state.index = index;
-                    state.index_version = version;
+            let updated = {
+                let mut docs = self.documents.write().await;
+                match docs.get_mut(&uri) {
+                    Some(state) if state.document.version() == version => {
+                        state.index = index.clone();
+                        state.index_version = version;
+                        true
+                    }
+                    _ => false,
                 }
+            };
+            if updated {
+                // Workspace lock acquired *after* the doc-store lock is
+                // dropped — no nested locks, no risk of an ordering
+                // deadlock with the hydration task.
+                let mut wi = self.workspace_index.write().await;
+                wi.update(uri.clone(), &index);
             }
         }
 
@@ -316,6 +340,18 @@ impl LanguageServer for Backend {
         if let Some(start) = workspace_root_path(&params) {
             match ResolvedProject::discover(&start) {
                 Ok(Some(resolved)) => {
+                    // Spawn the workspace-index hydration *before* moving
+                    // `resolved` into the project lock so we don't have to
+                    // re-read it. The task is fire-and-forget — the index
+                    // is best-effort cross-file resolution; if it never
+                    // lands (e.g. server shuts down first), F12 just
+                    // degrades to same-file resolution, which is fine.
+                    let paths = resolved.files.clone();
+                    let parser = self.parser.clone();
+                    let workspace_index = self.workspace_index.clone();
+                    tokio::spawn(async move {
+                        hydrate_workspace_index(paths, parser, workspace_index).await;
+                    });
                     *self.project.write().await = Some(resolved);
                 }
                 Ok(None) => {
@@ -340,10 +376,10 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
-                // Stage 1 of go-to-definition: same-file lookup against the
-                // tree-sitter symbol index cached on each `DocumentState`.
-                // Stage 2 will broaden this to the workspace; Stage 3 will
-                // route to slang when the sidecar is configured.
+                // Tree-sitter go-to-definition. Stage 2: same-file index
+                // first, workspace-wide index (open docs + filelist) on
+                // miss. Stage 3 will route to slang when the sidecar is
+                // configured.
                 definition_provider: Some(OneOf::Left(true)),
                 // `documentSymbol` reuses the same cached index — same data,
                 // free checkbox. The editor uses it to render the outline
@@ -501,16 +537,27 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let matches = resolve_in_index(name, &index);
+        // Workspace fallback: clone the slice for `name` under the read
+        // lock (lock-then-clone) so the resolver runs without holding
+        // either lock. Empty slice when there's no workspace match.
+        let workspace_hits: Vec<(Url, Symbol)> = {
+            let wi = self.workspace_index.read().await;
+            wi.lookup(name)
+                .iter()
+                .map(|e| (e.url.clone(), e.symbol.clone()))
+                .collect()
+        };
+
+        let matches = resolve_definition(name, &uri, &index, &workspace_hits);
         if matches.is_empty() {
-            debug!(name, "no symbol matches in same-file index");
+            debug!(name, "no symbol matches in same-file or workspace index");
             return Ok(None);
         }
 
         let locations: Vec<Location> = matches
             .into_iter()
-            .map(|sym| Location {
-                uri: uri.clone(),
+            .map(|(url, sym)| Location {
+                uri: url,
                 range: m_range_to_lsp(sym.name_range),
             })
             .collect();
@@ -602,6 +649,46 @@ fn workspace_root_path(params: &InitializeParams) -> Option<PathBuf> {
 /// listed in the project filelist are also included — the user might be
 /// editing a file the `.f` doesn't list yet, and we still want
 /// diagnostics for it.
+/// Eager-hydrate the workspace index from a project filelist.
+///
+/// Spawned from `initialize` once `.mimir.toml` has resolved. Reads each
+/// file from disk, parses it with the shared `SyntaxParser`, and folds
+/// the resulting symbols into the workspace index under one write-lock
+/// transaction at the end. Marks the index hydrated regardless of how
+/// many files actually parsed — a partial result still beats a cold
+/// index, and `is_hydrated` is just a "did we attempt this once" flag.
+///
+/// The function is `async` so it can `await` the parser Mutex; the
+/// per-file parses themselves are CPU-bound but ms-scale per file, so we
+/// don't bother with `spawn_blocking`. If a project ships hundreds of
+/// large generated headers we may revisit.
+async fn hydrate_workspace_index(
+    paths: Vec<PathBuf>,
+    parser: Arc<Mutex<SyntaxParser>>,
+    workspace_index: Arc<RwLock<WorkspaceIndex>>,
+) {
+    let count_requested = paths.len();
+    let entries = {
+        let mut p = parser.lock().await;
+        workspace_index::hydrate_from_paths(&paths, &mut p, |path| {
+            std::fs::read_to_string(path).ok()
+        })
+    };
+
+    let parsed = entries.len();
+    {
+        let mut wi = workspace_index.write().await;
+        for (url, syms) in entries {
+            wi.update(url, &syms);
+        }
+    }
+    info!(
+        files = parsed,
+        requested = count_requested,
+        "workspace index hydrated",
+    );
+}
+
 async fn build_elaborate_params(
     project: &ResolvedProject,
     documents: &Arc<RwLock<HashMap<Url, DocumentState>>>,
@@ -840,13 +927,51 @@ fn plan_slang_publishes(
     }
 }
 
-/// Find every symbol in `index` whose name matches `name` exactly.
+/// Resolve a name to its declaration sites, same-file first, workspace
+/// second.
 ///
-/// Returned in source order (the index is built that way). Same-file
-/// only — `mimir-server` is the only caller and it controls which index
-/// it passes; Stage 2 will add a workspace-wide variant alongside.
-fn resolve_in_index<'a>(name: &str, index: &'a [Symbol]) -> Vec<&'a Symbol> {
-    index.iter().filter(|s| s.name == name).collect()
+/// Stage-2 precedence rule: if the same file declares the name, those
+/// declarations are the answer — workspace hits with the same name in
+/// other files are *not* added. That matches the behaviour a user
+/// expects when the resolver is syntactic: a local declaration shadows
+/// anything in another file. Only when same-file comes up empty do we
+/// fall through to the workspace.
+///
+/// Workspace hits already arrive as a per-name slice from
+/// [`WorkspaceIndex::lookup`]. We only need to dedup by `(url,
+/// name_range)` so that a file open in the editor *and* listed in the
+/// project filelist (which would have folded in twice via
+/// `reparse_and_publish` plus eager hydration) doesn't return two
+/// identical locations.
+///
+/// Pure function so it can be unit-tested without spinning up
+/// `tower-lsp`.
+fn resolve_definition(
+    name: &str,
+    source_uri: &Url,
+    doc_index: &[Symbol],
+    workspace_hits: &[(Url, Symbol)],
+) -> Vec<(Url, Symbol)> {
+    let same_file: Vec<(Url, Symbol)> = doc_index
+        .iter()
+        .filter(|s| s.name == name)
+        .map(|s| (source_uri.clone(), s.clone()))
+        .collect();
+
+    if !same_file.is_empty() {
+        return same_file;
+    }
+
+    let mut out: Vec<(Url, Symbol)> = workspace_hits.to_vec();
+    out.sort_by(|a, b| {
+        (a.0.as_str(), a.1.name_range.start.line, a.1.name_range.start.character).cmp(&(
+            b.0.as_str(),
+            b.1.name_range.start.line,
+            b.1.name_range.start.character,
+        ))
+    });
+    out.dedup_by(|a, b| a.0 == b.0 && a.1.name_range == b.1.name_range);
+    out
 }
 
 /// Convert our internal `Range` into the `lsp_types` shape.
@@ -1364,7 +1489,7 @@ mod tests {
         assert!(plan.new_published.contains(&inc_url));
     }
 
-    // --- Stage 1: go-to-definition resolver ---------------------------
+    // --- Stage 2: go-to-definition resolver ---------------------------
 
     /// Helper: build a `Symbol` of the given name + kind. Range values
     /// are arbitrary — the tests only care about identity/order.
@@ -1377,49 +1502,91 @@ mod tests {
         }
     }
 
-    /// Empty index: nothing matches.
-    #[test]
-    fn resolve_in_index_empty_returns_no_match() {
-        assert!(resolve_in_index("foo", &[]).is_empty());
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
     }
 
-    /// Single match comes back exactly once.
+    /// Empty doc index *and* empty workspace: the resolver returns
+    /// nothing (and the caller turns that into a `None` LSP response).
     #[test]
-    fn resolve_in_index_single_match() {
-        let idx = vec![
-            sym("foo", MSymbolKind::Module, 0),
-            sym("bar", MSymbolKind::Class, 1),
-        ];
-        let hits = resolve_in_index("foo", &idx);
+    fn resolve_definition_both_empty_returns_no_match() {
+        let here = url("file:///a.sv");
+        assert!(resolve_definition("foo", &here, &[], &[]).is_empty());
+    }
+
+    /// Same-file precedence: when the doc index has the name, the
+    /// workspace is ignored entirely. This is the Stage-2 shadowing
+    /// rule — a syntactic resolver can't reason about scope, so we
+    /// conservatively treat any same-file declaration as authoritative
+    /// and don't dilute the editor's peek list with every cross-file
+    /// homonym.
+    #[test]
+    fn resolve_definition_same_file_beats_workspace() {
+        let here = url("file:///a.sv");
+        let other = url("file:///b.sv");
+        let doc_idx = vec![sym("foo", MSymbolKind::Module, 0)];
+        let ws = vec![(other.clone(), sym("foo", MSymbolKind::Class, 9))];
+
+        let hits = resolve_definition("foo", &here, &doc_idx, &ws);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].name, "foo");
-        assert_eq!(hits[0].kind, MSymbolKind::Module);
+        assert_eq!(hits[0].0, here);
+        assert_eq!(hits[0].1.kind, MSymbolKind::Module);
     }
 
-    /// Multiple symbols sharing a name (e.g. a `var x` and a class field
-    /// `x` in the same file) all come back, in source order. The
-    /// editor's peek list shows them and lets the user pick — that's
-    /// the v1 UX for ambiguous syntactic resolution.
+    /// Multiple same-file declarations (e.g. a `var x` plus a class
+    /// field `x`) all come back. The editor's peek list lets the user
+    /// pick — that's the v1 UX for ambiguous syntactic resolution.
     #[test]
-    fn resolve_in_index_multiple_matches_in_order() {
-        let idx = vec![
+    fn resolve_definition_multiple_same_file_returned_in_order() {
+        let here = url("file:///a.sv");
+        let doc_idx = vec![
             sym("x", MSymbolKind::Variable, 1),
             sym("y", MSymbolKind::Variable, 2),
             sym("x", MSymbolKind::Parameter, 5),
         ];
-        let hits = resolve_in_index("x", &idx);
+        let hits = resolve_definition("x", &here, &doc_idx, &[]);
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].kind, MSymbolKind::Variable);
-        assert_eq!(hits[0].name_range.start.line, 1);
-        assert_eq!(hits[1].kind, MSymbolKind::Parameter);
-        assert_eq!(hits[1].name_range.start.line, 5);
+        assert_eq!(hits[0].1.kind, MSymbolKind::Variable);
+        assert_eq!(hits[0].1.name_range.start.line, 1);
+        assert_eq!(hits[1].1.kind, MSymbolKind::Parameter);
+        assert_eq!(hits[1].1.name_range.start.line, 5);
     }
 
-    /// Names that don't appear in the index resolve to nothing.
+    /// Same-file empty, workspace single match: that match is returned.
     #[test]
-    fn resolve_in_index_miss_returns_no_match() {
-        let idx = vec![sym("foo", MSymbolKind::Module, 0)];
-        assert!(resolve_in_index("bar", &idx).is_empty());
+    fn resolve_definition_workspace_fallback_single() {
+        let here = url("file:///a.sv");
+        let other = url("file:///b.sv");
+        let ws = vec![(other.clone(), sym("my_class", MSymbolKind::Class, 3))];
+
+        let hits = resolve_definition("my_class", &here, &[], &ws);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, other);
+        assert_eq!(hits[0].1.kind, MSymbolKind::Class);
+    }
+
+    /// Same-file empty, multiple workspace matches across URLs: all
+    /// returned, deduped on `(url, name_range)`. The duplicate here
+    /// simulates a file that's both open (folded in via
+    /// `reparse_and_publish`) and listed in the project filelist
+    /// (folded in via eager hydration).
+    #[test]
+    fn resolve_definition_workspace_dedups_identical_locations() {
+        let here = url("file:///a.sv");
+        let b = url("file:///b.sv");
+        let c = url("file:///c.sv");
+        let dup = sym("shared", MSymbolKind::Class, 4);
+        let ws = vec![
+            (b.clone(), dup.clone()),
+            (b.clone(), dup),
+            (c.clone(), sym("shared", MSymbolKind::Class, 7)),
+        ];
+
+        let hits = resolve_definition("shared", &here, &[], &ws);
+        assert_eq!(hits.len(), 2, "duplicate (url, range) collapsed to one");
+        let urls: Vec<&Url> = hits.iter().map(|(u, _)| u).collect();
+        assert!(urls.contains(&&b));
+        assert!(urls.contains(&&c));
     }
 
     /// Every internal `SymbolKind` variant maps to *some* LSP kind.
