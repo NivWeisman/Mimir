@@ -108,10 +108,7 @@ impl WorkspaceIndex {
     /// not load-bearing for correctness.
     #[must_use]
     pub fn lookup(&self, name: &str) -> &[Entry] {
-        self.by_name
-            .get(name)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
@@ -162,7 +159,11 @@ pub fn hydrate_from_paths(
             }
         }
     }
-    debug!(parsed = out.len(), requested = paths.len(), "hydrate_from_paths done");
+    debug!(
+        parsed = out.len(),
+        requested = paths.len(),
+        "hydrate_from_paths done"
+    );
     out
 }
 
@@ -263,11 +264,15 @@ mod tests {
         // a.sv -> module 'a'
         let (u_a, syms_a) = &result[0];
         assert_eq!(u_a, &Url::from_file_path(&p1).unwrap());
-        assert!(syms_a.iter().any(|s| s.name == "a" && s.kind == SymbolKind::Module));
+        assert!(syms_a
+            .iter()
+            .any(|s| s.name == "a" && s.kind == SymbolKind::Module));
         // b.sv -> class 'b'
         let (u_b, syms_b) = &result[1];
         assert_eq!(u_b, &Url::from_file_path(&p2).unwrap());
-        assert!(syms_b.iter().any(|s| s.name == "b" && s.kind == SymbolKind::Class));
+        assert!(syms_b
+            .iter()
+            .any(|s| s.name == "b" && s.kind == SymbolKind::Class));
     }
 
     /// Paths the reader can't satisfy are skipped (no panic, no entry).
@@ -279,8 +284,9 @@ mod tests {
         let texts: HashMap<PathBuf, String> =
             HashMap::from([(ok.clone(), "module ok; endmodule\n".to_string())]);
 
-        let result =
-            hydrate_from_paths(&[ok.clone(), missing], &mut parser, |p| texts.get(p).cloned());
+        let result = hydrate_from_paths(&[ok.clone(), missing], &mut parser, |p| {
+            texts.get(p).cloned()
+        });
 
         assert_eq!(result.len(), 1, "missing path should be dropped silently");
         assert_eq!(result[0].0, Url::from_file_path(&ok).unwrap());

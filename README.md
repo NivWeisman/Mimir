@@ -284,7 +284,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (104 today)
+cargo test   --workspace                    # run all unit tests (116 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
 ```
@@ -362,7 +362,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Navigation
 
-- ✅ `textDocument/definition` — tree-sitter index, same-file + workspace-wide (open docs and `.mimir.toml` filelist). Routes through slang's semantic resolver (scope-aware, hierarchical-name-aware) when `MIMIR_SLANG_PATH` is configured; falls back to the syntax index on transport error.
+- ✅ `textDocument/definition` — tree-sitter index, same-file + workspace-wide (open docs and `.mimir.toml` filelist). Routes through slang's semantic resolver (scope-aware, hierarchical-name-aware) when `MIMIR_SLANG_PATH` is configured; falls back to the syntax index on transport error. Slang resolves variable / port / parameter / class-field references, hierarchical paths (`u_dut.fsm.state`), `obj.member`, subroutine calls (`f(x)`, `obj.method()`), type references in declarations (`my_t x;` → typedef/class), and module/interface instantiations (`apb_master u_dut(...)` → the module). Macro `` `define `` resolution still deferred.
 - ⬜ `textDocument/declaration`
 - ⬜ `textDocument/typeDefinition`
 - ⬜ `textDocument/implementation`

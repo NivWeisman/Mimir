@@ -250,11 +250,10 @@ impl ResolvedProject {
             path: path.to_path_buf(),
             source,
         })?;
-        let cfg: ProjectConfig =
-            toml::from_str(&text).map_err(|source| ProjectError::Toml {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let cfg: ProjectConfig = toml::from_str(&text).map_err(|source| ProjectError::Toml {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let root = path
             .parent()
             .unwrap_or_else(|| Path::new("."))

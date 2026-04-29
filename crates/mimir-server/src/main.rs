@@ -58,8 +58,7 @@ async fn main() {
     // returns our `Backend`. The `Client` is how we send notifications back
     // to the editor (e.g. `publishDiagnostics`). We move the optional
     // slang client into the closure so it ends up owned by the `Backend`.
-    let (service, socket) =
-        LspService::new(move |client| backend::Backend::new(client, slang));
+    let (service, socket) = LspService::new(move |client| backend::Backend::new(client, slang));
     Server::new(stdin, stdout, socket).serve(service).await;
 
     tracing::info!("mimir-server shutting down");

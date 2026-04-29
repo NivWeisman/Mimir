@@ -226,7 +226,10 @@ impl Backend {
         // *overwrites* this publish for files in its compilation unit.
         let lsp_diags = merge_diagnostics(diags, Vec::new(), /* slang_active */ false);
 
-        debug!(count = lsp_diags.len(), "publishing tree-sitter diagnostics");
+        debug!(
+            count = lsp_diags.len(),
+            "publishing tree-sitter diagnostics"
+        );
         self.client
             .publish_diagnostics(uri, lsp_diags, Some(version))
             .await;
@@ -282,8 +285,7 @@ impl Backend {
             // Build the elaborate request from project config + the
             // currently-open documents (their in-memory text overrides
             // anything on disk so unsaved changes participate).
-            let (params, files_in_request) =
-                build_elaborate_params(&project, &documents).await;
+            let (params, files_in_request) = build_elaborate_params(&project, &documents).await;
             debug!(
                 files = params.files.len(),
                 include_dirs = params.include_dirs.len(),
@@ -291,13 +293,8 @@ impl Backend {
             );
             match slang.elaborate(&params).await {
                 Ok(result) => {
-                    publish_slang_result(
-                        &lsp_client,
-                        &files_in_request,
-                        result,
-                        &slang_published,
-                    )
-                    .await;
+                    publish_slang_result(&lsp_client, &files_in_request, result, &slang_published)
+                        .await;
                 }
                 Err(e) => {
                     // We deliberately don't drop the slang client here
@@ -571,9 +568,11 @@ impl LanguageServer for Backend {
                             MPosition::new(range.start.line, range.start.character),
                             MPosition::new(range.end.line, range.end.character),
                         );
-                        if let Err(e) =
-                            state.document.apply_incremental_edit(m_range, &change.text, new_version)
-                        {
+                        if let Err(e) = state.document.apply_incremental_edit(
+                            m_range,
+                            &change.text,
+                            new_version,
+                        ) {
                             // A bad edit means the editor and us disagree
                             // about document state. Log loudly; the
                             // diagnostics for this version will be wrong
@@ -617,20 +616,14 @@ impl LanguageServer for Backend {
         // empty (the user opted into the semantic resolver; an
         // authoritative "no" is more accurate than syntactic guesses).
         // Transport errors fall through to the syntax path.
-        if let Some(outcome) = self.try_slang_definition(&uri, target).await {
-            match outcome {
-                SlangDefinitionOutcome::Resolved(locs) => {
-                    debug!(count = locs.len(), "slang definition resolved");
-                    return Ok(slang_locations_to_response(locs));
-                }
-                SlangDefinitionOutcome::TransportError => {
-                    // Fall through to syntax — log already happened in
-                    // try_slang_definition.
-                }
+        let outcome = self.try_slang_definition(&uri, target).await;
+        match route_definition(outcome) {
+            DefinitionRoute::UseSlangResult(locs) => {
+                debug!(count = locs.len(), "slang definition resolved");
+                Ok(slang_locations_to_response(locs))
             }
+            DefinitionRoute::UseSyntaxFallback => Ok(self.syntax_definition(&uri, target).await),
         }
-
-        Ok(self.syntax_definition(&uri, target).await)
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -650,18 +643,10 @@ impl LanguageServer for Backend {
             }
         };
 
-        let symbols: Vec<SymbolInformation> = index
-            .iter()
-            .map(|sym| symbol_to_lsp_information(sym, &uri))
-            .collect();
+        let _ = &uri; // URI is implicit in the response — DocumentSymbol carries no Location.
+        let symbols = nest_symbols(&index);
         debug!(count = symbols.len(), "document_symbol returned");
-        // We use the flat `SymbolInformation` form rather than the nested
-        // `DocumentSymbol` tree because Stage 1 doesn't model the
-        // declaration hierarchy (a class's methods aren't children of the
-        // class symbol). VS Code renders both fine; nesting is a Stage 2
-        // follow-up if it matters.
-        #[allow(deprecated)]
-        Ok(Some(DocumentSymbolResponse::Flat(symbols)))
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 }
 
@@ -929,6 +914,7 @@ fn slang_locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResp
 /// Outcome of a slang definition request, used by `goto_definition` to
 /// decide whether to short-circuit (Resolved, including empty) or fall
 /// through to the syntax path (TransportError).
+#[derive(Debug)]
 enum SlangDefinitionOutcome {
     /// Slang answered. The vector may be empty — that's "no decl found"
     /// and the server returns `None` to the editor without falling
@@ -937,6 +923,31 @@ enum SlangDefinitionOutcome {
     /// IO / protocol error talking to the sidecar. The caller falls
     /// back to syntax.
     TransportError,
+}
+
+/// Routing decision for `goto_definition`: which backend's answer the
+/// handler should ultimately return. Pure (no I/O) so the slang-vs-syntax
+/// policy is unit-testable without spawning a sidecar.
+#[derive(Debug, PartialEq, Eq)]
+enum DefinitionRoute {
+    /// Use slang's locations (may be empty — trust-slang short-circuits
+    /// the empty case to `None` in the response, never the syntax index).
+    UseSlangResult(Vec<Location>),
+    /// Slang isn't configured, no project loaded, or the sidecar request
+    /// hit a transport error. The handler should consult the syntax
+    /// index instead.
+    UseSyntaxFallback,
+}
+
+/// Pure routing policy. `None` means the slang path didn't run (not
+/// configured, no project, untitled buffer); `Some(TransportError)`
+/// means it ran and failed; `Some(Resolved(_))` means it ran and
+/// answered.
+fn route_definition(outcome: Option<SlangDefinitionOutcome>) -> DefinitionRoute {
+    match outcome {
+        Some(SlangDefinitionOutcome::Resolved(locs)) => DefinitionRoute::UseSlangResult(locs),
+        Some(SlangDefinitionOutcome::TransportError) | None => DefinitionRoute::UseSyntaxFallback,
+    }
 }
 
 /// Last-ditch fallback when `Url::from_file_path` rejects a path (e.g.
@@ -1115,11 +1126,16 @@ fn resolve_definition(
 
     let mut out: Vec<(Url, Symbol)> = workspace_hits.to_vec();
     out.sort_by(|a, b| {
-        (a.0.as_str(), a.1.name_range.start.line, a.1.name_range.start.character).cmp(&(
-            b.0.as_str(),
-            b.1.name_range.start.line,
-            b.1.name_range.start.character,
-        ))
+        (
+            a.0.as_str(),
+            a.1.name_range.start.line,
+            a.1.name_range.start.character,
+        )
+            .cmp(&(
+                b.0.as_str(),
+                b.1.name_range.start.line,
+                b.1.name_range.start.character,
+            ))
     });
     out.dedup_by(|a, b| a.0 == b.0 && a.1.name_range == b.1.name_range);
     out
@@ -1155,37 +1171,88 @@ fn symbol_kind_to_lsp(kind: MSymbolKind) -> SymbolKind {
         MSymbolKind::Class => SymbolKind::CLASS,
         MSymbolKind::Task => SymbolKind::FUNCTION,
         MSymbolKind::Function => SymbolKind::FUNCTION,
+        MSymbolKind::Method => SymbolKind::METHOD,
         MSymbolKind::Typedef => SymbolKind::TYPE_PARAMETER,
         MSymbolKind::Parameter => SymbolKind::CONSTANT,
         MSymbolKind::Variable => SymbolKind::VARIABLE,
         MSymbolKind::Port => SymbolKind::FIELD,
-        MSymbolKind::Property | MSymbolKind::Sequence | MSymbolKind::Covergroup => {
-            SymbolKind::OBJECT
-        }
+        MSymbolKind::EnumMember => SymbolKind::ENUM_MEMBER,
+        // SV `constraint` blocks have no direct LSP kind; `OBJECT` is
+        // the same neutral fallback we use for SVA properties /
+        // covergroups.
+        MSymbolKind::Constraint
+        | MSymbolKind::Property
+        | MSymbolKind::Sequence
+        | MSymbolKind::Covergroup => SymbolKind::OBJECT,
     }
 }
 
-/// Convert a `mimir-syntax::Symbol` to the flat LSP `SymbolInformation`
-/// the editor consumes.
-///
-/// `SymbolInformation` is technically deprecated in favour of the
-/// hierarchical `DocumentSymbol`, but every editor we care about still
-/// supports it and Stage 1 doesn't model the declaration tree. Stage 2
-/// will switch to `DocumentSymbol` once we model `class { method }`
-/// nesting.
+/// Build a `DocumentSymbol` (no children attached yet).
 #[allow(deprecated)]
-fn symbol_to_lsp_information(sym: &Symbol, uri: &Url) -> SymbolInformation {
-    SymbolInformation {
+fn symbol_to_lsp_document_symbol(
+    sym: &Symbol,
+    children: Option<Vec<DocumentSymbol>>,
+) -> DocumentSymbol {
+    DocumentSymbol {
         name: sym.name.clone(),
+        detail: None,
         kind: symbol_kind_to_lsp(sym.kind),
         tags: None,
         deprecated: None,
-        location: Location {
-            uri: uri.clone(),
-            range: m_range_to_lsp(sym.full_range),
-        },
-        container_name: None,
+        range: m_range_to_lsp(sym.full_range),
+        selection_range: m_range_to_lsp(sym.name_range),
+        children,
     }
+}
+
+/// Turn the DFS-ordered flat symbol index into the nested
+/// `DocumentSymbol` tree the LSP wants. A class's methods become
+/// children of the class; a package's classes become children of the
+/// package; etc.
+///
+/// The `mimir-syntax::index` walker emits parents before their
+/// descendants, so we can nest in a single linear pass: each symbol's
+/// children are the contiguous run of subsequent symbols whose
+/// `full_range` is contained in this symbol's `full_range`.
+fn nest_symbols(symbols: &[Symbol]) -> Vec<DocumentSymbol> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < symbols.len() {
+        let (node, consumed) = nest_symbol_subtree(&symbols[i..]);
+        out.push(node);
+        i += consumed;
+    }
+    out
+}
+
+/// Build one subtree starting at `symbols[0]`; returns the node plus
+/// the number of slice entries it (and its descendants) consumed.
+fn nest_symbol_subtree(symbols: &[Symbol]) -> (DocumentSymbol, usize) {
+    let head = &symbols[0];
+    let mut children: Vec<DocumentSymbol> = Vec::new();
+    let mut i = 1;
+    while i < symbols.len() && range_contains(head.full_range, symbols[i].full_range) {
+        let (child, consumed) = nest_symbol_subtree(&symbols[i..]);
+        children.push(child);
+        i += consumed;
+    }
+    let node = symbol_to_lsp_document_symbol(
+        head,
+        if children.is_empty() {
+            None
+        } else {
+            Some(children)
+        },
+    );
+    (node, i)
+}
+
+/// True if `outer` fully encloses `inner` (touching endpoints count as
+/// containment — the syntactic ranges of an outer decl and its first
+/// inner decl don't perfectly nest in tree-sitter, so strict comparison
+/// would misclassify legitimate children as siblings).
+fn range_contains(outer: MRange, inner: MRange) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
 }
 
 /// Convert a path string from the slang sidecar back to a `file:` URL.
@@ -1366,7 +1433,10 @@ mod tests {
             (MSeverity::Hint, DiagnosticSeverity::HINT),
         ];
         for (ours, theirs) in cases {
-            assert_eq!(syntax_to_lsp_diagnostic(syntax_diag(ours)).severity, Some(theirs));
+            assert_eq!(
+                syntax_to_lsp_diagnostic(syntax_diag(ours)).severity,
+                Some(theirs)
+            );
         }
     }
 
@@ -1387,7 +1457,10 @@ mod tests {
         assert_eq!(lsp.range.end.character, 12);
         assert_eq!(lsp.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(lsp.source.as_deref(), Some("mimir"));
-        assert_eq!(lsp.code, Some(NumberOrString::String("UnknownModule".into())));
+        assert_eq!(
+            lsp.code,
+            Some(NumberOrString::String("UnknownModule".into()))
+        );
         assert_eq!(lsp.message, "module 'foo' not found");
     }
 
@@ -1401,7 +1474,10 @@ mod tests {
             (SlangSeverity::Hint, DiagnosticSeverity::HINT),
         ];
         for (ours, theirs) in cases {
-            assert_eq!(slang_to_lsp_diagnostic(slang_diag(ours, "x")).severity, Some(theirs));
+            assert_eq!(
+                slang_to_lsp_diagnostic(slang_diag(ours, "x")).severity,
+                Some(theirs)
+            );
         }
     }
 
@@ -1416,7 +1492,10 @@ mod tests {
             /* slang_active */ false,
         );
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].code, Some(NumberOrString::String("syntax".into())));
+        assert_eq!(
+            merged[0].code,
+            Some(NumberOrString::String("syntax".into()))
+        );
     }
 
     /// `slang_active = true` drops tree-sitter syntax errors and surfaces
@@ -1430,7 +1509,10 @@ mod tests {
             /* slang_active */ true,
         );
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].code, Some(NumberOrString::String("UnknownModule".into())));
+        assert_eq!(
+            merged[0].code,
+            Some(NumberOrString::String("UnknownModule".into()))
+        );
     }
 
     /// `slang_active = true` with an empty slang vec means "slang said this
@@ -1443,7 +1525,10 @@ mod tests {
             vec![],
             /* slang_active */ true,
         );
-        assert!(merged.is_empty(), "expected zero diagnostics, got {merged:?}");
+        assert!(
+            merged.is_empty(),
+            "expected zero diagnostics, got {merged:?}"
+        );
     }
 
     /// Pass-through with empty inputs returns empty — the trivial case,
@@ -1529,11 +1614,13 @@ mod tests {
         let scratch = PathBuf::from("/tmp/scratch.sv");
         let scratch_url = Url::from_file_path(&scratch).unwrap();
         let mut open_text = HashMap::new();
-        open_text.insert(scratch.clone(), (scratch_url.clone(), "module s; endmodule".into()));
+        open_text.insert(
+            scratch.clone(),
+            (scratch_url.clone(), "module s; endmodule".into()),
+        );
 
-        let (params, files_in_request) = assemble_elaborate_params(&project, &open_text, |_| {
-            Some(String::new())
-        });
+        let (params, files_in_request) =
+            assemble_elaborate_params(&project, &open_text, |_| Some(String::new()));
 
         assert_eq!(params.files.len(), 2);
         assert_eq!(params.files[0].path, "/proj/a.sv");
@@ -1572,11 +1659,7 @@ mod tests {
         let result = ElaborateResult {
             diagnostics: vec![slang_diag_at("/proj/a.sv", "X")],
         };
-        let plan = plan_slang_publishes(
-            &[url_a.clone(), url_b.clone()],
-            result,
-            &HashSet::new(),
-        );
+        let plan = plan_slang_publishes(&[url_a.clone(), url_b.clone()], result, &HashSet::new());
 
         assert_eq!(plan.publishes.len(), 2);
         let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
@@ -1593,7 +1676,9 @@ mod tests {
     fn plan_clears_url_that_dropped_off() {
         let url_dropped = Url::parse("file:///proj/old.sv").unwrap();
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let result = ElaborateResult { diagnostics: vec![] };
+        let result = ElaborateResult {
+            diagnostics: vec![],
+        };
         let prev = HashSet::from([url_dropped.clone()]);
 
         let plan = plan_slang_publishes(&[url_a.clone()], result, &prev);
@@ -1601,7 +1686,10 @@ mod tests {
         // Two publishes: empty for url_a (in request), empty for
         // url_dropped (stale-clear).
         assert_eq!(plan.publishes.len(), 2);
-        assert!(plan.publishes.iter().any(|(u, d)| u == &url_a && d.is_empty()));
+        assert!(plan
+            .publishes
+            .iter()
+            .any(|(u, d)| u == &url_a && d.is_empty()));
         assert!(plan
             .publishes
             .iter()
@@ -1614,7 +1702,9 @@ mod tests {
     #[test]
     fn plan_does_not_double_publish_stale_url_in_request() {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let result = ElaborateResult { diagnostics: vec![] };
+        let result = ElaborateResult {
+            diagnostics: vec![],
+        };
         let prev = HashSet::from([url_a.clone()]);
 
         let plan = plan_slang_publishes(&[url_a.clone()], result, &prev);
@@ -1636,7 +1726,10 @@ mod tests {
 
         assert_eq!(plan.publishes.len(), 2);
         let inc_url = Url::parse("file:///proj/inc/uvm.svh").unwrap();
-        assert!(plan.publishes.iter().any(|(u, d)| u == &inc_url && d.len() == 1));
+        assert!(plan
+            .publishes
+            .iter()
+            .any(|(u, d)| u == &inc_url && d.len() == 1));
         assert!(plan.new_published.contains(&inc_url));
     }
 
@@ -1754,13 +1847,16 @@ mod tests {
             (MSymbolKind::Class, SymbolKind::CLASS),
             (MSymbolKind::Task, SymbolKind::FUNCTION),
             (MSymbolKind::Function, SymbolKind::FUNCTION),
+            (MSymbolKind::Method, SymbolKind::METHOD),
             (MSymbolKind::Typedef, SymbolKind::TYPE_PARAMETER),
             (MSymbolKind::Parameter, SymbolKind::CONSTANT),
             (MSymbolKind::Variable, SymbolKind::VARIABLE),
             (MSymbolKind::Port, SymbolKind::FIELD),
+            (MSymbolKind::EnumMember, SymbolKind::ENUM_MEMBER),
             (MSymbolKind::Property, SymbolKind::OBJECT),
             (MSymbolKind::Sequence, SymbolKind::OBJECT),
             (MSymbolKind::Covergroup, SymbolKind::OBJECT),
+            (MSymbolKind::Constraint, SymbolKind::OBJECT),
         ];
         for (mine, theirs) in cases {
             assert_eq!(symbol_kind_to_lsp(mine), theirs, "{mine:?}");
@@ -1778,26 +1874,115 @@ mod tests {
         assert_eq!(lsp.end.character, 12);
     }
 
-    /// `symbol_to_lsp_information` carries name, kind, and the URL
-    /// through to the wire shape. The location range is the symbol's
-    /// `full_range` (the whole declaration), matching what VS Code
-    /// expects for outline view selection.
+    /// `nest_symbols` over an empty index returns no roots.
     #[test]
-    #[allow(deprecated)]
-    fn symbol_to_lsp_information_round_trip() {
+    fn nest_symbols_empty() {
+        assert!(nest_symbols(&[]).is_empty());
+    }
+
+    /// A single top-level symbol becomes a single root with no children.
+    #[test]
+    fn nest_symbols_single_top_level() {
         let s = Symbol {
             name: "my_mod".into(),
             kind: MSymbolKind::Module,
             name_range: MRange::new(MPosition::new(0, 7), MPosition::new(0, 13)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 9)),
         };
-        let url = Url::parse("file:///proj/m.sv").unwrap();
-        let info = symbol_to_lsp_information(&s, &url);
-        assert_eq!(info.name, "my_mod");
-        assert_eq!(info.kind, SymbolKind::MODULE);
-        assert_eq!(info.location.uri, url);
-        assert_eq!(info.location.range.start.line, 0);
-        assert_eq!(info.location.range.end.line, 2);
+        let out = nest_symbols(&[s]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "my_mod");
+        assert!(out[0].children.is_none());
+    }
+
+    /// A class with two methods produces one root with two children, in
+    /// source order.
+    #[test]
+    fn nest_symbols_class_with_methods() {
+        // class c spans lines 0..6; method f spans 1..2; method g spans 3..4.
+        let class = Symbol {
+            name: "c".into(),
+            kind: MSymbolKind::Class,
+            name_range: MRange::new(MPosition::new(0, 6), MPosition::new(0, 7)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(6, 8)),
+        };
+        let f = Symbol {
+            name: "f".into(),
+            kind: MSymbolKind::Method,
+            name_range: MRange::new(MPosition::new(1, 18), MPosition::new(1, 19)),
+            full_range: MRange::new(MPosition::new(1, 4), MPosition::new(2, 12)),
+        };
+        let g = Symbol {
+            name: "g".into(),
+            kind: MSymbolKind::Method,
+            name_range: MRange::new(MPosition::new(3, 9), MPosition::new(3, 10)),
+            full_range: MRange::new(MPosition::new(3, 4), MPosition::new(4, 8)),
+        };
+        let out = nest_symbols(&[class, f, g]);
+        assert_eq!(out.len(), 1);
+        let class_node = &out[0];
+        assert_eq!(class_node.name, "c");
+        let kids = class_node
+            .children
+            .as_ref()
+            .expect("class should have children");
+        let kid_names: Vec<&str> = kids.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(kid_names, vec!["f", "g"]);
+        assert!(kids[0].children.is_none());
+        assert!(kids[1].children.is_none());
+    }
+
+    /// Two unrelated top-level symbols stay siblings.
+    #[test]
+    fn nest_symbols_two_siblings() {
+        let a = Symbol {
+            name: "a".into(),
+            kind: MSymbolKind::Module,
+            name_range: MRange::new(MPosition::new(0, 7), MPosition::new(0, 8)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(1, 9)),
+        };
+        let b = Symbol {
+            name: "b".into(),
+            kind: MSymbolKind::Module,
+            name_range: MRange::new(MPosition::new(2, 7), MPosition::new(2, 8)),
+            full_range: MRange::new(MPosition::new(2, 0), MPosition::new(3, 9)),
+        };
+        let out = nest_symbols(&[a, b]);
+        let names: Vec<&str> = out.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    /// Three-deep nesting: package > class > method.
+    #[test]
+    fn nest_symbols_deeply_nested() {
+        let pkg = Symbol {
+            name: "p".into(),
+            kind: MSymbolKind::Package,
+            name_range: MRange::new(MPosition::new(0, 8), MPosition::new(0, 9)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(8, 10)),
+        };
+        let cls = Symbol {
+            name: "c".into(),
+            kind: MSymbolKind::Class,
+            name_range: MRange::new(MPosition::new(1, 6), MPosition::new(1, 7)),
+            full_range: MRange::new(MPosition::new(1, 0), MPosition::new(6, 8)),
+        };
+        let m = Symbol {
+            name: "f".into(),
+            kind: MSymbolKind::Method,
+            name_range: MRange::new(MPosition::new(2, 18), MPosition::new(2, 19)),
+            full_range: MRange::new(MPosition::new(2, 4), MPosition::new(3, 12)),
+        };
+        let out = nest_symbols(&[pkg, cls, m]);
+        assert_eq!(out.len(), 1);
+        let pkg_node = &out[0];
+        assert_eq!(pkg_node.name, "p");
+        let pkg_kids = pkg_node.children.as_ref().unwrap();
+        assert_eq!(pkg_kids.len(), 1);
+        assert_eq!(pkg_kids[0].name, "c");
+        let cls_kids = pkg_kids[0].children.as_ref().unwrap();
+        assert_eq!(cls_kids.len(), 1);
+        assert_eq!(cls_kids[0].name, "f");
     }
 
     // --- Stage 3: slang-backed go-to-definition routing ---------------
@@ -1810,8 +1995,14 @@ mod tests {
         let locs = vec![Location {
             uri: url.clone(),
             range: Range {
-                start: Position { line: 3, character: 7 },
-                end: Position { line: 3, character: 13 },
+                start: Position {
+                    line: 3,
+                    character: 7,
+                },
+                end: Position {
+                    line: 3,
+                    character: 13,
+                },
             },
         }];
         let resp = slang_locations_to_response(locs);
@@ -1847,6 +2038,51 @@ mod tests {
         assert_eq!(lsp.range.start.line, 2);
         assert_eq!(lsp.range.start.character, 6);
         assert_eq!(lsp.range.end.character, 12);
+    }
+
+    /// `route_definition` picks slang when slang resolved (any vec).
+    #[test]
+    fn route_definition_uses_slang_when_resolved_non_empty() {
+        let url = Url::parse("file:///proj/a.sv").unwrap();
+        let locs = vec![Location {
+            uri: url,
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+        }];
+        let route = route_definition(Some(SlangDefinitionOutcome::Resolved(locs.clone())));
+        assert_eq!(route, DefinitionRoute::UseSlangResult(locs));
+    }
+
+    /// `route_definition` still picks slang when its answer is empty —
+    /// trust-slang-on-empty means we don't fall back to syntax.
+    #[test]
+    fn route_definition_uses_slang_when_resolved_empty() {
+        let route = route_definition(Some(SlangDefinitionOutcome::Resolved(Vec::new())));
+        assert_eq!(route, DefinitionRoute::UseSlangResult(Vec::new()));
+    }
+
+    /// Transport errors fall back to the syntax index — the user still
+    /// gets *some* answer when the sidecar is misbehaving.
+    #[test]
+    fn route_definition_falls_back_on_transport_error() {
+        let route = route_definition(Some(SlangDefinitionOutcome::TransportError));
+        assert_eq!(route, DefinitionRoute::UseSyntaxFallback);
+    }
+
+    /// `None` (slang not configured, no project loaded, untitled buffer)
+    /// also falls back. The syntax index is the floor.
+    #[test]
+    fn route_definition_falls_back_when_slang_not_run() {
+        let route = route_definition(None);
+        assert_eq!(route, DefinitionRoute::UseSyntaxFallback);
     }
 
     /// A path `path_to_url` rejects yields `None` rather than panicking

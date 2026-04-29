@@ -36,11 +36,19 @@
 #include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
 #include <slang/ast/Symbol.h>
+#include <slang/ast/expressions/CallExpression.h>
 #include <slang/ast/expressions/MiscExpressions.h>
 #include <slang/ast/expressions/SelectExpressions.h>
+#include <slang/ast/symbols/InstanceSymbols.h>
+#include <slang/ast/symbols/SubroutineSymbols.h>
+#include <slang/ast/symbols/ValueSymbol.h>
+#include <slang/ast/types/DeclaredType.h>
+#include <slang/ast/types/Type.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/Diagnostics.h>
 #include <slang/parsing/Preprocessor.h>
+#include <slang/syntax/AllSyntax.h>
+#include <slang/syntax/SyntaxKind.h>
 #include <slang/syntax/SyntaxNode.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceLocation.h>
@@ -390,17 +398,25 @@ static json handle_elaborate(const json& params) {
 // `HierarchicalValueExpression` whose `symbol` is the final declaration,
 // which is exactly the F12 target.
 //
-// We don't try to handle every cross-reference shape in v1:
-// * type references (`my_class c;`) → the type binding lives in the
-//   variable's `type`, not in an expression. Defer.
-// * module instantiations (`apb_seq u_seq();`) → reference is on a
-//   syntax node, not an expression. Defer.
-// * subroutine calls (`f(x)`) → `CallExpression` would resolve these;
-//   added if/when needed.
+// What we cover today:
+// * variable / parameter / port / class-field references
+//   (`NamedValueExpression`)
+// * hierarchical paths like `u_dut.fsm.state`
+//   (`HierarchicalValueExpression`)
+// * `obj.member` access (`MemberAccessExpression`)
+// * subroutine calls — `f(x)`, `obj.method()` (`CallExpression`)
+// * type references in declarations — cursor on the type token of
+//   `my_class c;` resolves to `class my_class` (`ValueSymbol` + its
+//   declared type's syntax range)
+// * module / interface instantiations — cursor on the type token of
+//   `apb_master u_dut(...)` resolves to `module apb_master`
+//   (`InstanceSymbol`)
 //
-// What we *do* cover: variable, parameter, port, class-field
-// references, hierarchical paths, and `obj.member` access. That's the
-// most common F12 case in verification code — UVM `m_seq.req` style.
+// Still deferred (separate slices):
+// * macro expansions (`` `MY_MACRO ``) — the slang preprocessor's
+//   macro-definition map is exposed but stitching its locations back
+//   through `SourceManager::getOriginalLoc()` to a `` `define `` site
+//   needs more care than this slice spends.
 struct DefinitionFinder : public slang::ast::ASTVisitor<DefinitionFinder,
                                                        /*VisitStatements=*/true,
                                                        /*VisitExpressions=*/true> {
@@ -442,6 +458,66 @@ struct DefinitionFinder : public slang::ast::ASTVisitor<DefinitionFinder,
         // NamedValueExpression visit (visitDefault below).
         if (covers_target(e.sourceRange)) record(e.sourceRange, e.member);
         visitDefault(e);
+    }
+
+    // `f(x)` / `obj.method()`. For user-defined subroutines we record
+    // the resolved `SubroutineSymbol`. System calls (`$display`, ...)
+    // have no user declaration to jump to and are skipped.
+    void handle(const slang::ast::CallExpression& e) {
+        if (!e.isSystemCall() && covers_target(e.sourceRange)) {
+            // The variant holds `const SubroutineSymbol*`; `get_if`
+            // returns a `const SubroutineSymbol* const*`.
+            if (auto* sub_ptr = std::get_if<const slang::ast::SubroutineSymbol*>(&e.subroutine);
+                sub_ptr != nullptr && *sub_ptr != nullptr) {
+                record(e.sourceRange, **sub_ptr);
+            }
+        }
+        visitDefault(e);
+    }
+
+    // `apb_master u_dut(...)`. Each `InstanceSymbol` corresponds to one
+    // elaborated instance; an array `m u_arr [3:0] (...)` produces four
+    // sibling `InstanceSymbol`s sharing one `HierarchyInstantiationSyntax`
+    // parent. The cursor-on-type case fires on whichever sibling we
+    // visit first; the smallest-width tie-break keeps the result stable.
+    void handle(const slang::ast::InstanceSymbol& s) {
+        if (auto* inst_syn = s.getSyntax(); inst_syn != nullptr) {
+            auto* parent = inst_syn->parent;
+            if (parent != nullptr &&
+                parent->kind == slang::syntax::SyntaxKind::HierarchyInstantiation) {
+                auto& hi =
+                    *static_cast<const slang::syntax::HierarchyInstantiationSyntax*>(parent);
+                auto type_range = hi.type.range();
+                if (covers_target(type_range)) {
+                    record(type_range, s.getDefinition());
+                }
+            }
+        }
+        visitDefault(s);
+    }
+
+    // Type references in value declarations: `my_t x;`, `my_class c;`,
+    // `parameter T p = ...`, ANSI port `input my_t a`. The variable's
+    // `DeclaredType` carries the syntax range covering the type token;
+    // when the cursor is in that range we resolve to the type symbol
+    // (typedef alias, class type, struct type, …). Built-in scalars
+    // (`logic`, `bit`) have no `Type::getSyntax()` and produce no
+    // location — `symbol_to_definition_location` already filters those.
+    //
+    // Constrained-auto template so the visitor's static dispatch picks
+    // up every concrete `ValueSymbol` subclass (VariableSymbol,
+    // ParameterSymbol, NetSymbol, FieldSymbol, FormalArgumentSymbol,
+    // PortSymbol, …) without us listing each one. The slang
+    // `visitDefault` static-asserts non-final classes, so we must
+    // accept the most-derived type, not the base.
+    void handle(std::derived_from<slang::ast::ValueSymbol> auto& v) {
+        if (auto* type_syn = v.getDeclaredType()->getTypeSyntax(); type_syn != nullptr) {
+            auto range = type_syn->sourceRange();
+            if (covers_target(range)) {
+                record(range, v.getDeclaredType()->getType());
+            }
+        }
+        visitDefault(v);
     }
 };
 

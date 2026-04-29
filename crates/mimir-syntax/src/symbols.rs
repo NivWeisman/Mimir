@@ -52,12 +52,21 @@ pub enum SymbolKind {
     Package,
     /// `class foo; … endclass`.
     Class,
-    /// `task foo(); … endtask`.
+    /// `task foo(); … endtask` declared at file/module/package scope.
     Task,
-    /// `function … foo(); … endfunction`.
+    /// `function … foo(); … endfunction` declared at file/module/package scope.
     Function,
+    /// `function`/`task` declared inside a `class` body. Distinguished
+    /// from [`Function`]/[`Task`] so the editor's outline view (and
+    /// future call-hierarchy work) can present class members as methods.
+    Method,
     /// `typedef … foo;` (struct, enum, alias).
     Typedef,
+    /// One name in `enum { A, B }` — the enumerator constants, not the
+    /// surrounding `typedef enum`.
+    EnumMember,
+    /// `constraint c { … }` inside a class.
+    Constraint,
     /// `parameter int W = 8;` or `param_assignment` inside a port list.
     Parameter,
     /// `logic [7:0] x;`, `bit b;`, etc. — entries in a
@@ -102,7 +111,13 @@ pub struct Symbol {
 #[must_use]
 pub fn index(tree: &SyntaxTree, rope: &Rope) -> Vec<Symbol> {
     let mut out = Vec::new();
-    walk_for_symbols(tree.tree.root_node(), tree.source(), rope, &mut out);
+    walk_for_symbols(
+        tree.tree.root_node(),
+        tree.source(),
+        rope,
+        /*inside_class=*/ false,
+        &mut out,
+    );
     trace!(count = out.len(), "indexed symbols");
     out
 }
@@ -110,19 +125,40 @@ pub fn index(tree: &SyntaxTree, rope: &Rope) -> Vec<Symbol> {
 /// Recursive walker. We always descend, even after emitting a symbol —
 /// a `class` contains methods, a `module` contains parameters and
 /// instances, etc.
-fn walk_for_symbols(node: Node<'_>, source: &str, rope: &Rope, out: &mut Vec<Symbol>) {
-    if let Some(symbol) = symbol_for(node, source, rope) {
+///
+/// `inside_class` is sticky-on-descent: once we enter a `class_declaration`
+/// every nested `function_body_declaration` / `task_body_declaration`
+/// gets tagged as [`SymbolKind::Method`] instead of `Function` / `Task`.
+/// Tree-sitter doesn't otherwise distinguish them — class scope is the
+/// only thing that makes a `function` a method in SystemVerilog.
+fn walk_for_symbols(
+    node: Node<'_>,
+    source: &str,
+    rope: &Rope,
+    inside_class: bool,
+    out: &mut Vec<Symbol>,
+) {
+    if let Some(symbol) = symbol_for(node, source, rope, inside_class) {
         out.push(symbol);
     }
+    let descend_inside_class = inside_class || node.kind() == "class_declaration";
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_for_symbols(child, source, rope, out);
+        walk_for_symbols(child, source, rope, descend_inside_class, out);
     }
 }
 
 /// If `node` is a declaration we recognise, build a `Symbol` for it.
-fn symbol_for(node: Node<'_>, source: &str, rope: &Rope) -> Option<Symbol> {
-    let kind = SymbolKind::from_node_kind(node.kind())?;
+fn symbol_for(
+    node: Node<'_>,
+    source: &str,
+    rope: &Rope,
+    inside_class: bool,
+) -> Option<Symbol> {
+    let mut kind = SymbolKind::from_node_kind(node.kind())?;
+    if inside_class && matches!(kind, SymbolKind::Function | SymbolKind::Task) {
+        kind = SymbolKind::Method;
+    }
     let name_node = name_node_of(node)?;
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
     Some(Symbol {
@@ -156,6 +192,12 @@ impl SymbolKind {
             "property_declaration" => SymbolKind::Property,
             "sequence_declaration" => SymbolKind::Sequence,
             "covergroup_declaration" => SymbolKind::Covergroup,
+            "enum_name_declaration" => SymbolKind::EnumMember,
+            // `constraint_declaration` covers in-class constraints;
+            // `extern_constraint_declaration` is the out-of-class body.
+            // The latter restates the name (`class_scope` + identifier),
+            // so we'd double-count if we picked it up — leave it for now.
+            "constraint_declaration" => SymbolKind::Constraint,
             _ => return None,
         })
     }
@@ -221,6 +263,17 @@ fn name_node_of<'a>(decl: Node<'a>) -> Option<Node<'a>> {
         "sequence_declaration" => first_named_child_of_kind(decl, "simple_identifier"),
         "covergroup_declaration" => {
             let id = first_named_child_of_kind(decl, "covergroup_identifier")?;
+            first_descendant_of_kind(id, "simple_identifier")
+        }
+        "enum_name_declaration" => {
+            // `enum_name_declaration` may carry a value expression
+            // (`A = 1`), so its tree contains other identifiers. The
+            // name is always the first `enum_identifier` child.
+            let id = first_named_child_of_kind(decl, "enum_identifier")?;
+            first_descendant_of_kind(id, "simple_identifier")
+        }
+        "constraint_declaration" => {
+            let id = first_named_child_of_kind(decl, "constraint_identifier")?;
             first_descendant_of_kind(id, "simple_identifier")
         }
         _ => None,
@@ -387,23 +440,36 @@ mod tests {
     }
 
     #[test]
-    fn function_is_indexed_once() {
+    fn class_function_is_indexed_once_as_method() {
         // Both `function_declaration` and `function_body_declaration`
         // appear in the tree; we want exactly one symbol per function.
+        // A function declared inside a class is a method.
         let s = idx("class c; function void f(); endfunction\nendclass\n");
-        let fns: Vec<&Symbol> =
-            s.iter().filter(|s| s.kind == SymbolKind::Function).collect();
-        assert_eq!(fns.len(), 1, "expected one function symbol, got {fns:#?}");
-        assert_eq!(fns[0].name, "f");
+        let methods: Vec<&Symbol> =
+            s.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        assert_eq!(methods.len(), 1, "expected one method symbol, got {methods:#?}");
+        assert_eq!(methods[0].name, "f");
+        // No bare `Function` should slip through.
+        assert!(!s.iter().any(|sy| sy.kind == SymbolKind::Function));
     }
 
     #[test]
-    fn task_is_indexed_once() {
+    fn class_task_is_indexed_once_as_method() {
         let s = idx("class c; task t(); endtask\nendclass\n");
-        let tasks: Vec<&Symbol> =
-            s.iter().filter(|s| s.kind == SymbolKind::Task).collect();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].name, "t");
+        let methods: Vec<&Symbol> =
+            s.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].name, "t");
+        assert!(!s.iter().any(|sy| sy.kind == SymbolKind::Task));
+    }
+
+    #[test]
+    fn package_function_stays_function_not_method() {
+        // Outside any class, `function`/`task` keeps its `Function`/`Task`
+        // tag — only class-scoped ones get retagged as `Method`.
+        let s = idx("package p;\nfunction int f(); return 0; endfunction\nendpackage\n");
+        assert_eq!(pick(&s, "f").kind, SymbolKind::Function);
+        assert!(!s.iter().any(|sy| sy.kind == SymbolKind::Method));
     }
 
     #[test]
@@ -460,6 +526,38 @@ mod tests {
     fn covergroup_is_indexed() {
         let s = idx("module m;\ncovergroup cg @(posedge clk); coverpoint x; endgroup\nendmodule\n");
         assert_eq!(pick(&s, "cg").kind, SymbolKind::Covergroup);
+    }
+
+    #[test]
+    fn enum_members_are_indexed() {
+        // The typedef alias still wins as the `Typedef`; the enumerator
+        // names show up as `EnumMember`s alongside it. Both are needed
+        // for F12 — one to jump to `e_t`, others to jump to `READ` /
+        // `WRITE`.
+        let s = idx("typedef enum { READ, WRITE } e_t;\n");
+        assert_eq!(pick(&s, "e_t").kind, SymbolKind::Typedef);
+        assert_eq!(pick(&s, "READ").kind, SymbolKind::EnumMember);
+        assert_eq!(pick(&s, "WRITE").kind, SymbolKind::EnumMember);
+    }
+
+    #[test]
+    fn enum_member_with_value_uses_member_name_not_value_ident() {
+        // `A = SOME_CONST` parses with `SOME_CONST` as a `simple_identifier`
+        // descendant of the enum_name_declaration. We must pick `A`, not
+        // the value-expression's identifier.
+        let s = idx("typedef enum { A = 1, B = 2 } e_t;\n");
+        let members: Vec<&str> = s
+            .iter()
+            .filter(|s| s.kind == SymbolKind::EnumMember)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(members, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn constraint_block_is_indexed() {
+        let s = idx("class c; rand int x; constraint c1 { x > 0; }\nendclass\n");
+        assert_eq!(pick(&s, "c1").kind, SymbolKind::Constraint);
     }
 
     #[test]
