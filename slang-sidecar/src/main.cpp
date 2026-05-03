@@ -39,6 +39,7 @@
 #include <slang/ast/expressions/CallExpression.h>
 #include <slang/ast/expressions/MiscExpressions.h>
 #include <slang/ast/expressions/SelectExpressions.h>
+#include <slang/ast/symbols/ClassSymbols.h>
 #include <slang/ast/symbols/InstanceSymbols.h>
 #include <slang/ast/symbols/SubroutineSymbols.h>
 #include <slang/ast/symbols/ValueSymbol.h>
@@ -411,6 +412,9 @@ static json handle_elaborate(const json& params) {
 // * module / interface instantiations — cursor on the type token of
 //   `apb_master u_dut(...)` resolves to `module apb_master`
 //   (`InstanceSymbol`)
+// * base-class references in `extends` clauses — cursor on `uvm_agent`
+//   in `class apb_agent extends uvm_agent;` resolves to the base
+//   class declaration (`ClassType` + its extendsClause syntax range)
 //
 // Still deferred (separate slices):
 // * macro expansions (`` `MY_MACRO ``) — the slang preprocessor's
@@ -420,7 +424,18 @@ static json handle_elaborate(const json& params) {
 struct DefinitionFinder : public slang::ast::ASTVisitor<DefinitionFinder,
                                                        /*VisitStatements=*/true,
                                                        /*VisitExpressions=*/true> {
-    slang::SourceLocation target;
+    // SourceManager pointer so `covers_target` can resolve a symbol's
+    // buffer back to a filename. Set in `handle_definition`.
+    const slang::SourceManager* sm = nullptr;
+    // Cursor identity: path + byte-offset. We deliberately *don't* key
+    // on `BufferID` — slang regularly ends up with two buffers for the
+    // same file (e.g. one we seeded via `assignText` for the open
+    // editor buffer, plus a second one the preprocessor loaded from
+    // disk while resolving `` `include `` in another compilation
+    // unit). The AST attaches to the preprocessor's buffer; the cursor
+    // lives in ours; matching by path makes them meet.
+    std::string target_path;
+    uint32_t target_offset = 0;
     const slang::ast::Symbol* found = nullptr;
     // Track the smallest containing range so an outer
     // `MemberAccessExpression` wrapping a `NamedValueExpression`
@@ -428,9 +443,17 @@ struct DefinitionFinder : public slang::ast::ASTVisitor<DefinitionFinder,
     uint32_t best_width = UINT32_MAX;
 
     bool covers_target(slang::SourceRange r) const {
-        if (!r.start().valid() || !r.end().valid()) return false;
-        if (r.start().buffer() != target.buffer()) return false;
-        return r.start().offset() <= target.offset() && target.offset() < r.end().offset();
+        if (!r.start().valid() || !r.end().valid() || sm == nullptr) return false;
+        auto orig_start = sm->getFullyOriginalLoc(r.start());
+        // `getFullPath` returns the absolute filesystem path slang
+        // resolved the buffer to. `getFileName` is "proximised"
+        // (relativised against CWD), which collapses `\`include`d
+        // files to their bare filename and breaks the comparison
+        // against our absolute `target_path`.
+        auto full = sm->getFullPath(orig_start.buffer()).string();
+        if (full != target_path) return false;
+        return orig_start.offset() <= target_offset
+            && target_offset < sm->getFullyOriginalLoc(r.end()).offset();
     }
 
     void record(slang::SourceRange r, const slang::ast::Symbol& sym) {
@@ -519,6 +542,29 @@ struct DefinitionFinder : public slang::ast::ASTVisitor<DefinitionFinder,
         }
         visitDefault(v);
     }
+
+    // `class apb_agent extends uvm_agent;` — cursor on the base class
+    // name in the `extends` clause. Resolves to the base `ClassType`,
+    // whose `getSyntax()` is the base class's declaration. Without
+    // this the visitor only sees the class's own decl + members and
+    // F12 on the base name returns nothing.
+    void handle(const slang::ast::ClassType& c) {
+        if (auto* syn = c.getSyntax();
+            syn != nullptr
+            && syn->kind == slang::syntax::SyntaxKind::ClassDeclaration) {
+            auto& class_syn =
+                *static_cast<const slang::syntax::ClassDeclarationSyntax*>(syn);
+            if (class_syn.extendsClause != nullptr) {
+                auto range = class_syn.extendsClause->baseName->sourceRange();
+                if (covers_target(range)) {
+                    if (auto* base = c.getBaseClass(); base != nullptr) {
+                        record(range, *base);
+                    }
+                }
+            }
+        }
+        visitDefault(c);
+    }
 };
 
 // Convert a found `Symbol`'s declaration site to a JSON
@@ -526,15 +572,24 @@ struct DefinitionFinder : public slang::ast::ASTVisitor<DefinitionFinder,
 // declaration token, used as the highlight range) and falls back to
 // `Symbol::location` as a zero-width point when there's no syntax.
 //
-// `buffers_by_path` is the forward map the build step recorded; we
-// reverse-search it to recover the *exact path string* the client sent
-// so the response's `path` round-trips byte-for-byte. `sm.getFileName`
-// alone is not safe — slang relativises paths internally and the
-// returned string may not match what the client put on the wire.
+// Path resolution is two-tier:
+//   1. Reverse-search `buffers_by_path` so files the client sent in
+//      `files[]` round-trip their exact path string back. This keeps
+//      the editor's URL matching deterministic for the open buffer and
+//      any explicit filelist entry.
+//   2. Fall back to `sm.getFileName(orig_start)` for buffers slang
+//      loaded itself via `` `include `` resolution. UVM-style projects
+//      list a single top in the filelist (e.g. `apb.sv`) and pull every
+//      class through `` `include `` from the package wrapper, so this
+//      fallback is the *common* case, not an edge. The path slang
+//      returns is the absolute filesystem path it resolved through the
+//      request's `+incdir+` — directly usable by `Url::from_file_path`
+//      on the Rust side.
 //
-// Returns `nullopt` when the symbol's location can't be resolved to a
-// file we sent (built-in symbols, synthesised library cells, etc.) —
-// caller turns that into an empty `locations` array.
+// Returns `nullopt` when the symbol's location can't be resolved at
+// all — built-in symbols, synthesised library cells, slang-internal
+// pseudo-buffers — so the caller turns that into an empty `locations`
+// array.
 static std::optional<json> symbol_to_definition_location(
     const slang::SourceManager& sm,
     const slang::ast::Symbol& sym,
@@ -556,10 +611,10 @@ static std::optional<json> symbol_to_definition_location(
         return std::nullopt;
     }
 
-    // Resolve the declaration's buffer back to the path-as-sent. We
-    // walk the forward map because there are typically only a handful
-    // of compilation-unit files; a dedicated reverse map isn't worth
-    // the storage overhead.
+    // Resolve the declaration's buffer back to a path the client can
+    // navigate to. First try the forward map for an exact-string
+    // round-trip; fall back to slang's own filename for `` `include ``'d
+    // buffers the client never sent.
     auto orig_start = sm.getFullyOriginalLoc(loc_start);
     auto target_buffer = orig_start.buffer();
     std::string path_out;
@@ -570,9 +625,16 @@ static std::optional<json> symbol_to_definition_location(
         }
     }
     if (path_out.empty()) {
-        // Slang knows about this file but the client didn't send it
-        // (e.g. an `\`include`'d header that wasn't in `files`). We'd
-        // rather return empty than send a path the client can't match.
+        // `getFullPath` returns the absolute filesystem path slang
+        // resolved the buffer to (via `+incdir+` for `` `include ``s).
+        // Prefer it over `getFileName`, which proximises to a bare
+        // filename and isn't navigable by `Url::from_file_path` on the
+        // Rust side.
+        path_out = sm.getFullPath(orig_start.buffer()).string();
+    }
+    if (path_out.empty()) {
+        // Buffer has no filename (slang-internal pseudo-buffer) — no
+        // file for the editor to open.
         return std::nullopt;
     }
 
@@ -616,10 +678,10 @@ static json handle_definition(const json& params) {
         return result;
     }
 
-    slang::SourceLocation cursor(buf_it->second, *byte_offset);
-
     DefinitionFinder finder;
-    finder.target = cursor;
+    finder.sm = &sm;
+    finder.target_path = target_path;
+    finder.target_offset = static_cast<uint32_t>(*byte_offset);
     compilation.getRoot().visit(finder);
 
     if (finder.found == nullptr) {

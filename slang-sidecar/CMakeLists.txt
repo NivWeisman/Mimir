@@ -16,7 +16,7 @@
 
 cmake_minimum_required(VERSION 3.20)
 project(mimir-slang-sidecar
-    VERSION      0.1.0
+    VERSION      0.1.1
     DESCRIPTION  "NDJSON-over-stdio slang elaborator for the Mimir LSP"
     LANGUAGES    CXX
 )
