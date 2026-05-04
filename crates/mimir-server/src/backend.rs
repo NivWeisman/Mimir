@@ -507,6 +507,7 @@ impl Backend {
         debug!(name, count = locations.len(), "syntax definition resolved");
         Some(GotoDefinitionResponse::Array(locations))
     }
+
 }
 
 // --------------------------------------------------------------------------
@@ -581,6 +582,14 @@ impl LanguageServer for Backend {
                 // Slang-only: cursor on virtual method → all overrides;
                 // cursor on class → all direct subclasses.
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+                // Syntax-only for stages 1–4; slang takes over for stages 5–6.
+                // Trigger characters: `.` (member access), `` ` `` (macros), `$`
+                // (system task/function names).
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".into(), "`".into(), "$".into()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 // We publish diagnostics as a *push* (via the `Client`) on
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
@@ -788,6 +797,21 @@ impl LanguageServer for Backend {
         let symbols = nest_symbols(&index);
         debug!(count = symbols.len(), "document_symbol returned");
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position.text_document.uri),
+    )]
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> LspResult<Option<CompletionResponse>> {
+        let _uri = params.text_document_position.text_document.uri;
+        let _pos = params.text_document_position.position;
+        // Stage 1 skeleton — candidates added in stage 2.
+        Ok(None)
     }
 }
 
@@ -2394,5 +2418,17 @@ mod tests {
     fn route_implementation_returns_empty_when_slang_not_run() {
         let route = route_implementation(None);
         assert_eq!(route, ImplementationRoute::UseEmpty);
+    }
+
+    /// `CompletionOptions` can be constructed with the trigger characters
+    /// declared in `initialize` — compile-time sanity check.
+    #[test]
+    fn completion_options_trigger_characters() {
+        let opts = CompletionOptions {
+            trigger_characters: Some(vec![".".into(), "`".into(), "$".into()]),
+            resolve_provider: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(opts.trigger_characters.unwrap().len(), 3);
     }
 }

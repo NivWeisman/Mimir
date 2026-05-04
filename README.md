@@ -414,7 +414,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 - ⬜ `textDocument/semanticTokens` ("LSP syntax highlighting")
 - ⬜ `textDocument/hover`
-- ⬜ `textDocument/completion`
+- 🚧 `textDocument/completion`
 - ⬜ `textDocument/signatureHelp`
 - ✅ `textDocument/documentSymbol` (flat, from the tree-sitter symbol index)
 - ⬜ `workspace/symbol`
