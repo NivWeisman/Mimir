@@ -33,6 +33,22 @@ for the live state of every LSP request, kept in sync with the code.
 | **C compiler**  | Any working `cc` (gcc, clang, MSVC)    | tree-sitter's grammar crate has a `build.rs` that compiles a C parser.                                 |
 | **OS**          | Linux, macOS, Windows                  | Anywhere Rust + tree-sitter build. CI currently exercises Linux only.                                  |
 
+### To build the slang sidecar (optional — required for semantic features)
+
+The sidecar is a separate C++ binary that wraps [slang][slang]. It powers
+semantic diagnostics, type-aware go-to-definition, `typeDefinition`, and
+`implementation`. Without it, mimir runs in tree-sitter-only mode (syntax
+diagnostics + structural navigation).
+
+| Requirement        | Version                          | Notes                                                                          |
+| ------------------ | -------------------------------- | ------------------------------------------------------------------------------ |
+| **CMake**          | 3.20 or newer                    | Drives the out-of-source build.                                                |
+| **C++20 compiler** | gcc 11+ / clang 14+ / MSVC 2022+ | slang requires C++20.                                                          |
+| **Ninja** or Make  | any recent                       | Build backend; Ninja recommended.                                              |
+| **git**            | any                              | CMake's `FetchContent` pulls slang (~30 MB) and nlohmann_json on first configure. |
+
+[slang]: https://github.com/MikePopoloski/slang
+
 ### To use the VS Code extension
 
 | Requirement | Version             | Notes                                                                  |
@@ -83,6 +99,52 @@ cargo build --release
 
 In that case point your editor at the absolute path
 (`<repo>/target/release/mimir-server`) instead of relying on `$PATH`.
+
+### 2b. Build the slang sidecar (optional)
+
+Skip this step if you only want syntax diagnostics. Run it if you want
+semantic diagnostics, type-aware go-to-definition, `typeDefinition`, or
+`implementation`. The sidecar lives outside the cargo workspace on purpose
+— contributors hacking on the Rust side don't need a C++ toolchain.
+
+```bash
+cd slang-sidecar
+cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+# binary lives at ./build/mimir-slang-sidecar
+```
+
+The first `cmake` invocation downloads slang (~30 MB) and nlohmann_json via
+`FetchContent` and caches them under `build/_deps/`. Subsequent configures
+reuse the cache. Drop `-G Ninja` to fall back to your platform's default
+generator (Make on Linux/macOS).
+
+Then point mimir at the binary by exporting `MIMIR_SLANG_PATH` before
+launching your editor:
+
+```bash
+export MIMIR_SLANG_PATH="$PWD/build/mimir-slang-sidecar"   # absolute path
+```
+
+For VS Code you can set it per-workspace instead:
+
+```jsonc
+{
+  "mimir.server.env": {
+    "MIMIR_SLANG_PATH": "/absolute/path/to/slang-sidecar/build/mimir-slang-sidecar"
+  }
+}
+```
+
+For Emacs (eglot picks up the parent process's environment):
+
+```elisp
+(setenv "MIMIR_SLANG_PATH"
+        (expand-file-name "~/Dev/mimir/slang-sidecar/build/mimir-slang-sidecar"))
+```
+
+Without `MIMIR_SLANG_PATH` mimir falls back to tree-sitter-only diagnostics
+and any `.mimir.toml` in the project is ignored.
 
 ### 3a. Configure VS Code
 
@@ -238,10 +300,11 @@ ${UVM_HOME}/src/uvm_pkg.sv
 -f ../verif/tests/all_tests.f
 ```
 
-Slang elaboration is opt-in: set `MIMIR_SLANG_PATH` to a
-`slang-sidecar` binary and the server uses your `.mimir.toml` automatically.
-Without it, mimir falls back to tree-sitter-only diagnostics and the
-`.mimir.toml` is simply ignored.
+Slang elaboration is opt-in: build the sidecar and set `MIMIR_SLANG_PATH`
+(see [Build the slang sidecar](#2b-build-the-slang-sidecar-optional)) and
+the server uses your `.mimir.toml` automatically. Without it, mimir falls
+back to tree-sitter-only diagnostics and the `.mimir.toml` is simply
+ignored.
 
 ---
 
