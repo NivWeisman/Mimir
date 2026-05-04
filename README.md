@@ -362,7 +362,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Navigation
 
-- ✅ `textDocument/definition` — tree-sitter index, same-file + workspace-wide (open docs and `.mimir.toml` filelist). Routes through slang's semantic resolver (scope-aware, hierarchical-name-aware) when `MIMIR_SLANG_PATH` is configured; falls back to the syntax index on transport error. Slang resolves variable / port / parameter / class-field references, hierarchical paths (`u_dut.fsm.state`), `obj.member`, subroutine calls (`f(x)`, `obj.method()`), type references in declarations (`my_t x;` → typedef/class), module/interface instantiations (`apb_master u_dut(...)` → the module), and base-class references in `extends` clauses. Macro `` `define `` resolution still deferred.
+- ✅ `textDocument/definition` — tree-sitter index, same-file + workspace-wide (open docs and `.mimir.toml` filelist). Routes through slang's semantic resolver (scope-aware, hierarchical-name-aware) when `MIMIR_SLANG_PATH` is configured; falls back to the syntax index on transport error. Slang resolves variable / port / parameter / class-field references, hierarchical paths (`u_dut.fsm.state`), `obj.member`, subroutine calls (`f(x)`, `obj.method()`), type references in declarations (`my_t x;` → typedef/class), module/interface instantiations (`apb_master u_dut(...)` → the module), base-class references in `extends` clauses, and macro `` `define `` sites (`` `MY_MACRO `` → the `` `define `` line, including cross-file defines pulled in via the filelist).
 - ⬜ `textDocument/declaration`
 - ⬜ `textDocument/typeDefinition`
 - ⬜ `textDocument/implementation`

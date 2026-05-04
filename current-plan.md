@@ -271,6 +271,124 @@ names work for free — slang already resolves them.
 
 ---
 
+## Stage 4 — Macro `` `define `` resolution (slang only)
+
+The last user-visible F12 gap. F12 on `` `MY_MACRO `` returns nothing
+in either backend today: tree-sitter doesn't index `` `define `` sites
+(preprocessor directives are below the grammar's interest), and slang's
+AST contains the *expanded* tokens — the `` `MY_MACRO `` reference is
+gone before the AST is built. Slang does retain everything we need
+elsewhere: macro references survive as directive trivia on tokens
+(`MacroUsageSyntax`), and `Preprocessor::getDefinedMacros()` returns
+every `DefineDirectiveSyntax*` it has seen.
+
+Tree-sitter fallback for macros stays out-of-scope (see
+[Out of scope](#out-of-scope-deliberately-for-this-slice)) — "macros
+require slang" is consistent with the existing semantic story and
+tree-sitter-verilog models `` `define `` weakly anyway.
+
+### Sidecar — cursor-on-macro detection
+
+In [`slang-sidecar/src/main.cpp::handle_definition`](./slang-sidecar/src/main.cpp),
+**before** invoking `DefinitionFinder.visit(...)`:
+
+1. Walk every token in the cursor's `SyntaxTree` (the one whose buffer
+   matches `target_path`'s `BufferID`). For each token, scan its
+   leading and trailing trivia.
+2. If a trivia entry's `directive()` is a `MacroUsageSyntax` whose
+   `sourceRange()` covers the cursor, capture the macro name from the
+   trivia's `directive` token text (strip the leading `` ` ``).
+3. Look the name up in `Preprocessor::getDefinedMacros()`. Find the
+   `DefineDirectiveSyntax*` whose `name.valueText()` matches.
+4. Return its `name.range()` as a single `DefinitionLocation`. **Skip
+   the AST visitor entirely** when a macro reference is hit — we have
+   the answer; running `DefinitionFinder` would either find nothing
+   (the reference isn't in the AST) or, worse, find a same-named symbol
+   inside the macro's expansion site.
+5. If no macro reference covers the cursor, fall through to
+   `DefinitionFinder` exactly as today. (`\`MY_MACRO.field` keeps
+   working — only the macro-name span hits step 4; the `.field` part
+   misses and falls through.)
+
+### Helper shape
+
+```cpp
+// Returns the `DefineDirectiveSyntax*` for the macro whose reference
+// spans `cursor`, or nullptr if the cursor isn't on a macro reference.
+//
+// Walks tokens in source order and inspects directive trivia. Cheap —
+// O(tokens) with early exit on first hit; the cursor's compilation
+// unit is typically a single file.
+const slang::syntax::DefineDirectiveSyntax*
+find_macro_at_cursor(const slang::syntax::SyntaxTree& tree,
+                     const slang::ast::Compilation& compilation,
+                     slang::SourceLocation cursor);
+```
+
+The trivia walk is the right shape for hover-show-expansion and a
+future "expand macro" code action too — build the helper once.
+
+### Why not a text scan?
+
+A "scan backwards from cursor for backtick-then-identifier" is shorter
+to write but mishandles:
+
+- Backticks inside string literals (`"foo `bar"`) — slang's tokeniser
+  already disambiguates this; the trivia walk inherits the answer.
+- Macro references inside expanded macros — `MacroUsageSyntax::sourceRange`
+  is in the *original* buffer, exactly where the user's cursor lives.
+
+### What stays the same
+
+- **`crates/mimir-slang/src/protocol.rs`** — wire shape unchanged. The
+  result is just another `DefinitionLocation`.
+- **`crates/mimir-server/src/backend.rs`** — no Rust logic changes.
+  `try_slang_definition` already returns whatever locations the sidecar
+  emits; `route_definition`'s outcomes already cover this.
+- **Tests** — no new Rust unit tests; the routing layer hasn't
+  changed. Manual sidecar smoke is the validation (consistent with
+  this slice's "pure-Rust tests only" rule).
+
+### Open questions
+
+1. **Cross-file macros.** Macros defined in `defines.svh` and
+   referenced in `dut.sv` need both files in the request's `files`
+   list. `assemble_elaborate_params` already pulls everything from the
+   filelist, so this should "just work" — verify with a UVM project
+   that splits defines into a header.
+2. **`+define+NAME=VALUE` from `.mimir.toml`.** No
+   `DefineDirectiveSyntax` source location. The lookup returns nothing
+   → empty `locations` array → trust-slang-on-empty short-circuits to
+   "no definition." That matches user expectation: there's nowhere
+   meaningful to jump to.
+3. **Built-in macros (`` `__FILE__ ``, `` `__LINE__ ``).** Same — no
+   syntax, return empty.
+4. **Where to source `getDefinedMacros()`.** The `Compilation`
+   accumulates trees; each tree has its own `Preprocessor`. For lookup
+   we want the *cursor's* tree's preprocessor — that's the one that
+   saw all the `` `define ``s reachable from the file being edited
+   (preceding files in the filelist contribute their definitions via
+   `inheritedMacros`). Resolve by matching `cursor.buffer()` against
+   each tree's root buffer, then call `tree.getMetadata().defines`
+   (TBC — verify exact API surface during implementation).
+
+### Stage 4 exit criteria
+
+- F12 on `` `MY_MACRO `` lands on the `define` site, including
+  cross-file (define in a header pulled in via the filelist).
+- F12 on `\`MY_MACRO.field`'s `.field` part still resolves through the
+  AST path (sanity check the fall-through).
+- README's `textDocument/definition` ✅ stays ✅; the surrounding
+  sentence drops "macro `` `define `` resolution still deferred."
+- `current-plan.md` Status table flips Stage 4 to `done`.
+
+### Estimated size
+
+~50–80 lines C++ (one helper + two-line splice into `handle_definition`),
+no Rust changes, no protocol changes. Smaller than Stage 3.2.
+
+---
+
 ## Open questions (resolved)
 
 1. **Land Stage 1 first as confidence check, then Stage 2 in the same
@@ -296,8 +414,9 @@ names work for free — slang already resolves them.
 - `workspace/didChangeWatchedFiles` integration. Filelist files that
   change while not open don't refresh until restart; live with this for
   now.
-- Macro definitions (`` `define ``) — preprocessor-level, slang-only,
-  picked up "for free" once Stage 3 routes to slang.
+- Tree-sitter coverage of `` `define `` macros. Macro resolution is
+  slang-only by design (see Stage 4); the syntactic backend doesn't
+  index preprocessor directives, and no fallback is planned.
 
 ---
 
@@ -309,4 +428,6 @@ names work for free — slang already resolves them.
 | 2. Tree-sitter, workspace (filelist+open) | done     | `WorkspaceIndex` + eager hydration on `initialize`; same-file precedence preserved |
 | 3. Slang-backed semantic resolution     | done     | `definition` method + `Client::definition`; trust-slang-on-empty, syntax fallback only on transport error. Sidecar handler ships the same change. |
 | 3-sidecar. C++ sidecar `definition` handler | done | `slang-sidecar/src/main.cpp` `handle_definition` — `ASTVisitor` over `NamedValue` / `HierarchicalValue` / `MemberAccess` expressions; declaration site via `Symbol::getSyntax()->sourceRange()`; path round-trip preserved by reverse-lookup against the request's `files`. Type-references and module-instantiations deferred. |
-| 3.2. Finishing slice                    | done     | Tree-sitter symbol kinds extended (`EnumMember`, `Method`, `Constraint`); class-internal `function`/`task` retagged as `Method` via inside-class flag in the walker. `documentSymbol` now uses the nested form (class methods nest under their class). `goto_definition` routing factored into pure `route_definition` with all four outcomes covered by unit tests. C++ `DefinitionFinder` extended for `CallExpression` (subroutine calls), `InstanceSymbol` (cursor on the type token of `m u_inst()`), and `ValueSymbol`-derived type references (`my_t x;` → typedef/class). Macro `` `define `` resolution still deferred — slang's preprocessor wiring needs its own slice. |
+| 3.2. Finishing slice                    | done     | Tree-sitter symbol kinds extended (`EnumMember`, `Method`, `Constraint`); class-internal `function`/`task` retagged as `Method` via inside-class flag in the walker. `documentSymbol` now uses the nested form (class methods nest under their class). `goto_definition` routing factored into pure `route_definition` with all four outcomes covered by unit tests. C++ `DefinitionFinder` extended for `CallExpression` (subroutine calls), `InstanceSymbol` (cursor on the type token of `m u_inst()`), and `ValueSymbol`-derived type references (`my_t x;` → typedef/class). |
+| 3.3. apb-fixture F12 fix                | done     | Two real bugs surfaced when smoke-testing F12 against `examples/uvm-1.2/.../apb`: (a) the fixture's `apb.f` hardcoded paths under `~/Downloads/uvm-1.2/`, so `target_path` never matched any compilation buffer — switched to repo-relative paths (`../../../src/uvm.sv`, `+incdir+.`); (b) more critically, even with the right paths slang ends up with **two buffers per file** when the open editor buffer is also reachable via `` `include `` (one from `assignText`, one from the preprocessor's disk read), and `DefinitionFinder::covers_target` keyed on `BufferID` so the cursor (in the seeded buffer) and the AST nodes (in the include'd buffer) never met. Switched cursor identity to **path + byte-offset** using `SourceManager::getFullPath` (not `getFileName`, which proximises `` `include ``'d files to bare filenames). Same `getFullPath` fallback added to `symbol_to_definition_location` for declaration sites in `` `include ``'d files. Added `handle(const ClassType&)` for base-class references in `extends` clauses. F12 now resolves on `apb_sequencer`, `apb_master`, `apb_monitor`, `apb_vif`, and `uvm_agent` from `apb_agent.sv`. |
+| 4. Macro `` `define `` resolution        | done     | `MacroWalker` (SyntaxVisitor over directive trivia) + `find_macro_at_cursor` helper added before `DefinitionFinder` in `handle_definition`. Strips backtick from `MacroUsageSyntax::directive.rawText()` to key into `SyntaxTree::getDefinedMacros()`. Cross-file defines handled by searching all trees. No Rust changes; no protocol changes. |

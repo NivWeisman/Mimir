@@ -52,6 +52,7 @@
 #include <slang/syntax/SyntaxKind.h>
 #include <slang/syntax/SyntaxNode.h>
 #include <slang/syntax/SyntaxTree.h>
+#include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceLocation.h>
 #include <slang/text/SourceManager.h>
 #include <slang/util/Bag.h>
@@ -390,6 +391,89 @@ static json handle_elaborate(const json& params) {
     return result;
 }
 
+// --- Stage 4: macro `define resolution -----------------------------------
+//
+// Macro invocations (`MY_MACRO) are preprocessed away before the AST is
+// built, so DefinitionFinder never sees them. They survive as
+// TriviaKind::Directive trivia (containing a MacroUsageSyntax) on the
+// first token of each macro's expansion. We scan those trivia entries
+// looking for one whose source range covers the cursor, then look the name
+// up in the compilation's DefineDirectiveSyntax list.
+//
+// This visitor must run BEFORE DefinitionFinder: if the cursor is on a
+// macro name, DefinitionFinder returns nothing (or, worse, resolves a
+// same-named identifier inside the expansion body).
+
+struct MacroWalker : public slang::syntax::SyntaxVisitor<MacroWalker> {
+    const slang::SourceManager* sm;
+    const std::string& target_path;
+    uint32_t target_offset;
+    const slang::syntax::MacroUsageSyntax* found = nullptr;
+
+    MacroWalker(const slang::SourceManager* sm_,
+                const std::string& path,
+                uint32_t offset)
+        : sm(sm_), target_path(path), target_offset(offset) {}
+
+    void visitToken(slang::parsing::Token t) {
+        if (found) return;
+        for (const auto& tr : t.trivia()) {
+            if (tr.kind != slang::parsing::TriviaKind::Directive) continue;
+            auto* s = tr.syntax();
+            if (!s || s->kind != slang::syntax::SyntaxKind::MacroUsage) continue;
+            auto* u = static_cast<const slang::syntax::MacroUsageSyntax*>(s);
+            auto r = u->directive.range();
+            if (!r.start().valid() || !r.end().valid()) continue;
+            auto orig_s = sm->getFullyOriginalLoc(r.start());
+            if (sm->getFullPath(orig_s.buffer()).string() != target_path) continue;
+            auto orig_e = sm->getFullyOriginalLoc(r.end());
+            if (orig_s.offset() <= target_offset && target_offset < orig_e.offset()) {
+                found = u;
+                return;
+            }
+        }
+    }
+};
+
+// Returns the DefineDirectiveSyntax* for the macro whose `reference spans
+// cursor, or nullptr. Walks directive trivia across all compiled trees;
+// looks up the define name in all trees' getDefinedMacros() lists.
+//
+// O(tokens + defines) with early exit on first cursor hit. Cheap enough
+// for interactive latency — the cursor's compilation unit is typically
+// one file.
+static const slang::syntax::DefineDirectiveSyntax*
+find_macro_at_cursor(
+    const slang::ast::Compilation& compilation,
+    const slang::SourceManager& sm,
+    const std::string& target_path,
+    uint32_t target_offset) {
+
+    MacroWalker walker(&sm, target_path, target_offset);
+    for (const auto& tree : compilation.getSyntaxTrees()) {
+        tree->root().visit(walker);
+        if (walker.found) break;
+    }
+    if (!walker.found) return nullptr;
+
+    // Strip the leading backtick from the directive token's raw text to
+    // get the plain name ("MY_MACRO") used as the key in getDefinedMacros().
+    std::string_view macro_name = walker.found->directive.rawText();
+    if (!macro_name.empty() && macro_name[0] == '`')
+        macro_name = macro_name.substr(1);
+
+    // Search all trees for the matching define. Headers pulled in first
+    // in the filelist typically hold the define; searching all trees
+    // handles the cross-file case transparently.
+    for (const auto& tree : compilation.getSyntaxTrees()) {
+        for (const auto* def : tree->getDefinedMacros()) {
+            if (def && def->name.valueText() == macro_name)
+                return def;
+        }
+    }
+    return nullptr;
+}
+
 // --- definition handler --------------------------------------------------
 //
 // AST visitor that finds the `ValueExpressionBase` (i.e. an identifier
@@ -678,10 +762,43 @@ static json handle_definition(const json& params) {
         return result;
     }
 
+    // Stage 4: cursor on a macro reference (`MY_MACRO) — check trivia
+    // before running the AST visitor. Macro usages are expanded away
+    // from the AST; DefinitionFinder would find nothing (or the wrong
+    // symbol inside the expansion body).
+    auto cursor_offset = static_cast<uint32_t>(*byte_offset);
+    if (const auto* macro_def =
+            find_macro_at_cursor(compilation, sm, target_path, cursor_offset)) {
+        // Report the `define name token's range as the jump target.
+        auto name_range = macro_def->name.range();
+        auto orig_start = sm.getFullyOriginalLoc(name_range.start());
+        std::string def_path;
+        for (const auto& [path, buf_id] : built.buffers_by_path) {
+            if (buf_id == orig_start.buffer()) {
+                def_path = path;
+                break;
+            }
+        }
+        if (def_path.empty())
+            def_path = sm.getFullPath(orig_start.buffer()).string();
+        if (!def_path.empty()) {
+            auto start = to_lsp_pos(sm, name_range.start());
+            auto end   = to_lsp_pos(sm, name_range.end());
+            json loc;
+            loc["path"] = std::move(def_path);
+            loc["range"] = {
+                {"start", {{"line", start.line}, {"character", start.character}}},
+                {"end",   {{"line", end.line},   {"character", end.character}}},
+            };
+            result["locations"].push_back(std::move(loc));
+            return result;
+        }
+    }
+
     DefinitionFinder finder;
     finder.sm = &sm;
     finder.target_path = target_path;
-    finder.target_offset = static_cast<uint32_t>(*byte_offset);
+    finder.target_offset = cursor_offset;
     compilation.getRoot().visit(finder);
 
     if (finder.found == nullptr) {
