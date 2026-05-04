@@ -50,5 +50,7 @@ pub mod protocol;
 pub use client::{Client, ClientError, Connection, ConnectionError};
 pub use protocol::{
     DefinitionLocation, DefinitionParams, DefinitionResult, Diagnostic, ElaborateParams,
-    ElaborateResult, MacroDefine, Severity, SourceFile,
+    ElaborateResult, ImplementationLocation, ImplementationParams, ImplementationResult,
+    MacroDefine, Severity, SourceFile, TypeDefinitionLocation, TypeDefinitionParams,
+    TypeDefinitionResult,
 };

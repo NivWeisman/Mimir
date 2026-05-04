@@ -5,12 +5,16 @@
 // (stdout is reserved for the protocol — same constraint as an LSP server).
 //
 // Wire shape mirrors `mimir-slang::protocol`. Methods today:
-//   * "elaborate"  — preprocess + parse + elaborate the supplied files,
-//                    return diagnostics in LSP coordinates.
-//   * "definition" — same compile front-end, plus a cursor (file + LSP
-//                    position); returns the declaration site of the
-//                    symbol referenced under the cursor.
-//   * "shutdown"   — reply with null result, exit cleanly.
+//   * "elaborate"       — preprocess + parse + elaborate the supplied files,
+//                         return diagnostics in LSP coordinates.
+//   * "definition"      — same compile front-end plus cursor; returns the
+//                         declaration site of the symbol under the cursor.
+//   * "typeDefinition"  — like definition but resolves to the *type* of the
+//                         symbol under the cursor (e.g. `my_class` for a
+//                         variable of that type).
+//   * "implementation"  — cursor on virtual method → all overrides in
+//                         subclasses; cursor on class → all direct subclasses.
+//   * "shutdown"        — reply with null result, exit cleanly.
 //
 // Anything else is replied to with `error.code = -32601` ("method not
 // found") and the loop continues so a misbehaving client doesn't take the
@@ -811,6 +815,370 @@ static json handle_definition(const json& params) {
     return result;
 }
 
+// --- typeDefinition handler ----------------------------------------------
+//
+// Like DefinitionFinder but resolves to the *declared type* of the symbol
+// under the cursor rather than the symbol itself:
+//
+//   my_class obj;   cursor on `obj`  → class my_class
+//   obj.field       cursor on field  → field's type
+//   f(x)            cursor on f      → return type of f (void → no result)
+//
+// Handlers that produce the same result as DefinitionFinder (cursor on
+// a type token, module name, etc.) are kept intact so typeDefinition is
+// always a superset of definition for those cursor positions.
+
+struct TypeDefinitionFinder
+    : public slang::ast::ASTVisitor<TypeDefinitionFinder,
+                                    /*VisitStatements=*/true,
+                                    /*VisitExpressions=*/true> {
+    const slang::SourceManager* sm = nullptr;
+    std::string target_path;
+    uint32_t target_offset = 0;
+    const slang::ast::Symbol* found = nullptr;
+    uint32_t best_width = UINT32_MAX;
+
+    bool covers_target(slang::SourceRange r) const {
+        if (!r.start().valid() || !r.end().valid() || sm == nullptr) return false;
+        auto orig_start = sm->getFullyOriginalLoc(r.start());
+        auto full = sm->getFullPath(orig_start.buffer()).string();
+        if (full != target_path) return false;
+        return orig_start.offset() <= target_offset
+            && target_offset < sm->getFullyOriginalLoc(r.end()).offset();
+    }
+
+    void record(slang::SourceRange r, const slang::ast::Symbol& sym) {
+        auto width = static_cast<uint32_t>(r.end().offset() - r.start().offset());
+        if (width <= best_width) {
+            best_width = width;
+            found = &sym;
+        }
+    }
+
+    // Cursor on a variable / port / parameter reference → type of symbol.
+    void handle(const slang::ast::NamedValueExpression& e) {
+        if (covers_target(e.sourceRange)) {
+            if (const auto* vs = e.symbol.as_if<slang::ast::ValueSymbol>()) {
+                record(e.sourceRange, vs->getType());
+            }
+        }
+        visitDefault(e);
+    }
+
+    // Cursor on hierarchical path → type of the final symbol.
+    void handle(const slang::ast::HierarchicalValueExpression& e) {
+        if (covers_target(e.sourceRange)) {
+            if (const auto* vs = e.symbol.as_if<slang::ast::ValueSymbol>()) {
+                record(e.sourceRange, vs->getType());
+            }
+        }
+        visitDefault(e);
+    }
+
+    // Cursor on `obj.member` → type of the member.
+    void handle(const slang::ast::MemberAccessExpression& e) {
+        if (covers_target(e.sourceRange)) {
+            if (const auto* vs = e.member.as_if<slang::ast::ValueSymbol>()) {
+                record(e.sourceRange, vs->getType());
+            }
+        }
+        visitDefault(e);
+    }
+
+    // Cursor on `f(x)` / `obj.method()` → return type of the subroutine.
+    // Void returns have no syntax → symbol_to_definition_location returns
+    // nullopt → empty locations (correct: nothing to jump to).
+    void handle(const slang::ast::CallExpression& e) {
+        if (!e.isSystemCall() && covers_target(e.sourceRange)) {
+            if (auto* sub_ptr =
+                    std::get_if<const slang::ast::SubroutineSymbol*>(&e.subroutine);
+                sub_ptr != nullptr && *sub_ptr != nullptr) {
+                record(e.sourceRange, (*sub_ptr)->getReturnType());
+            }
+        }
+        visitDefault(e);
+    }
+
+    // Cursor on the type token of a value declaration (`my_t x;` → my_t).
+    // Same result as DefinitionFinder — typeDefinition on a type name is
+    // the type itself, identical to definition.
+    void handle(std::derived_from<slang::ast::ValueSymbol> auto& v) {
+        if (auto* type_syn = v.getDeclaredType()->getTypeSyntax(); type_syn != nullptr) {
+            auto range = type_syn->sourceRange();
+            if (covers_target(range)) {
+                record(range, v.getDeclaredType()->getType());
+            }
+        }
+        visitDefault(v);
+    }
+
+    // Module / interface instantiation: cursor on the type token.
+    // Same result as DefinitionFinder.
+    void handle(const slang::ast::InstanceSymbol& s) {
+        if (auto* inst_syn = s.getSyntax(); inst_syn != nullptr) {
+            auto* parent = inst_syn->parent;
+            if (parent != nullptr &&
+                parent->kind == slang::syntax::SyntaxKind::HierarchyInstantiation) {
+                auto& hi = *static_cast<const slang::syntax::HierarchyInstantiationSyntax*>(
+                    parent);
+                auto type_range = hi.type.range();
+                if (covers_target(type_range)) {
+                    record(type_range, s.getDefinition());
+                }
+            }
+        }
+        visitDefault(s);
+    }
+};
+
+static json handle_type_definition(const json& params) {
+    auto built = build_compilation(params);
+    auto& sm = *built.sm;
+    auto& compilation = *built.compilation;
+
+    json result;
+    result["locations"] = json::array();
+
+    const auto target_path = params.value("target_path", std::string{});
+    auto buf_it = built.buffers_by_path.find(target_path);
+    if (buf_it == built.buffers_by_path.end()) {
+        std::cerr << "[mimir-slang-sidecar] typeDefinition: target_path not in request: "
+                  << target_path << '\n';
+        return result;
+    }
+
+    json pos = params.value("target_position", json::object());
+    uint32_t lsp_line = pos.value("line", 0u);
+    uint32_t lsp_char = pos.value("character", 0u);
+
+    auto byte_offset = lsp_position_to_byte_offset(sm, buf_it->second, lsp_line, lsp_char);
+    if (!byte_offset) return result;
+
+    TypeDefinitionFinder finder;
+    finder.sm = &sm;
+    finder.target_path = target_path;
+    finder.target_offset = static_cast<uint32_t>(*byte_offset);
+    compilation.getRoot().visit(finder);
+
+    if (finder.found == nullptr) return result;
+
+    if (auto loc = symbol_to_definition_location(sm, *finder.found, built.buffers_by_path)) {
+        result["locations"].push_back(std::move(*loc));
+    }
+    return result;
+}
+
+// --- implementation handler ----------------------------------------------
+//
+// Two cases:
+//   1. Cursor on a virtual / pure-virtual subroutine (declaration or call
+//      site) → return all overrides in subclasses across the compilation.
+//   2. Cursor on a class name → return all directly-derived subclasses.
+//
+// Non-virtual methods and leaf classes return empty locations.
+
+// Walk the compilation scope tree and collect every ClassType (recursive).
+static void collect_class_types(
+    const slang::ast::Scope& scope,
+    std::vector<const slang::ast::ClassType*>& classes
+) {
+    using namespace slang::ast;
+    for (const auto& member : scope.members()) {
+        if (member.kind == SymbolKind::ClassType) {
+            auto& cls = member.as<ClassType>();
+            classes.push_back(&cls);
+            collect_class_types(cls, classes);
+        } else if (const auto* s = member.as_if<Scope>()) {
+            collect_class_types(*s, classes);
+        }
+    }
+}
+
+// Walk the scope tree to find a SubroutineSymbol or ClassType whose *name*
+// token covers the cursor. Used when the cursor is at a declaration site
+// rather than an expression reference.
+static const slang::ast::Symbol* find_declaration_at_cursor(
+    const slang::ast::Scope& scope,
+    const slang::SourceManager& sm,
+    const std::string& target_path,
+    uint32_t target_offset
+) {
+    using namespace slang::ast;
+    using namespace slang::syntax;
+
+    for (const auto& member : scope.members()) {
+        // --- ClassType: check the class name token ---
+        if (member.kind == SymbolKind::ClassType) {
+            auto& cls = member.as<ClassType>();
+            if (auto* syn = cls.getSyntax();
+                syn != nullptr && syn->kind == SyntaxKind::ClassDeclaration) {
+                auto& cls_syn =
+                    *static_cast<const ClassDeclarationSyntax*>(syn);
+                auto name_range = cls_syn.name.range();
+                auto orig_start = sm.getFullyOriginalLoc(name_range.start());
+                auto full = sm.getFullPath(orig_start.buffer()).string();
+                if (full == target_path) {
+                    auto start = orig_start.offset();
+                    auto end = sm.getFullyOriginalLoc(name_range.end()).offset();
+                    if (start <= target_offset && target_offset < end) {
+                        return &member;
+                    }
+                }
+            }
+            // Recurse into the class scope to find methods.
+            auto* result =
+                find_declaration_at_cursor(cls, sm, target_path, target_offset);
+            if (result) return result;
+        }
+        // --- SubroutineSymbol: check via Symbol::location + name length ---
+        else if (member.kind == SymbolKind::Subroutine) {
+            auto& sub = member.as<SubroutineSymbol>();
+            if (sub.location.valid()) {
+                auto orig = sm.getFullyOriginalLoc(sub.location);
+                auto full = sm.getFullPath(orig.buffer()).string();
+                if (full == target_path) {
+                    auto start = orig.offset();
+                    auto end = start + static_cast<uint32_t>(sub.name.length());
+                    if (start <= target_offset && target_offset < end) {
+                        return &member;
+                    }
+                }
+            }
+        }
+        // --- Recurse into any other scope ---
+        else if (const auto* s = member.as_if<Scope>()) {
+            auto* result =
+                find_declaration_at_cursor(*s, sm, target_path, target_offset);
+            if (result) return result;
+        }
+    }
+    return nullptr;
+}
+
+// Find all overrides of `method_name` in the transitive subclass tree of
+// `base_cls`. Results appended to `locations_out`.
+static void find_overrides(
+    const slang::ast::ClassType& base_cls,
+    std::string_view method_name,
+    const std::vector<const slang::ast::ClassType*>& all_classes,
+    const slang::SourceManager& sm,
+    const std::unordered_map<std::string, slang::BufferID>& buffers_by_path,
+    json& locations_out
+) {
+    using namespace slang::ast;
+    for (const auto* cls : all_classes) {
+        if (auto* base = cls->getBaseClass(); base != nullptr) {
+            auto& canon = base->getCanonicalType();
+            bool is_direct_child =
+                (&canon == static_cast<const Symbol*>(&base_cls)) ||
+                (canon.kind == SymbolKind::ClassType &&
+                 &canon.as<ClassType>() == &base_cls);
+            if (!is_direct_child) continue;
+
+            // Check this subclass for the override.
+            if (auto* sym = cls->find(method_name); sym != nullptr) {
+                if (sym->kind == SymbolKind::Subroutine) {
+                    if (auto loc =
+                            symbol_to_definition_location(sm, *sym, buffers_by_path)) {
+                        locations_out.push_back(std::move(*loc));
+                    }
+                }
+            }
+            // Recurse into subclasses of cls.
+            find_overrides(*cls, method_name, all_classes, sm, buffers_by_path,
+                           locations_out);
+        }
+    }
+}
+
+static json handle_implementation(const json& params) {
+    using namespace slang::ast;
+
+    auto built = build_compilation(params);
+    auto& sm = *built.sm;
+    auto& compilation = *built.compilation;
+
+    json result;
+    result["locations"] = json::array();
+
+    const auto target_path = params.value("target_path", std::string{});
+    auto buf_it = built.buffers_by_path.find(target_path);
+    if (buf_it == built.buffers_by_path.end()) {
+        std::cerr << "[mimir-slang-sidecar] implementation: target_path not in request: "
+                  << target_path << '\n';
+        return result;
+    }
+
+    json pos = params.value("target_position", json::object());
+    uint32_t lsp_line = pos.value("line", 0u);
+    uint32_t lsp_char = pos.value("character", 0u);
+
+    auto byte_offset = lsp_position_to_byte_offset(sm, buf_it->second, lsp_line, lsp_char);
+    if (!byte_offset) return result;
+    auto cursor_offset = static_cast<uint32_t>(*byte_offset);
+
+    // 1. Try expression-level resolution (cursor at a call / reference site).
+    DefinitionFinder def_finder;
+    def_finder.sm = &sm;
+    def_finder.target_path = target_path;
+    def_finder.target_offset = cursor_offset;
+    compilation.getRoot().visit(def_finder);
+
+    // 2. Fall back to declaration-level scope walk (cursor at a declaration).
+    const Symbol* cursor_symbol = def_finder.found;
+    if (cursor_symbol == nullptr) {
+        cursor_symbol = find_declaration_at_cursor(
+            compilation.getRoot(), sm, target_path, cursor_offset);
+    }
+
+    if (cursor_symbol == nullptr) return result;
+
+    std::vector<const ClassType*> all_classes;
+    collect_class_types(compilation.getRoot(), all_classes);
+
+    // Case A: cursor on a class → return all direct subclasses.
+    if (cursor_symbol->kind == SymbolKind::ClassType) {
+        auto& base_cls = cursor_symbol->as<ClassType>();
+        for (const auto* cls : all_classes) {
+            if (auto* base = cls->getBaseClass(); base != nullptr) {
+                auto& canon = base->getCanonicalType();
+                bool is_child =
+                    (&canon == static_cast<const Symbol*>(&base_cls)) ||
+                    (canon.kind == SymbolKind::ClassType &&
+                     &canon.as<ClassType>() == &base_cls);
+                if (is_child) {
+                    if (auto loc = symbol_to_definition_location(
+                            sm, *cls, built.buffers_by_path)) {
+                        result["locations"].push_back(std::move(*loc));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    // Case B: cursor on a subroutine → return overrides in subclasses.
+    if (cursor_symbol->kind == SymbolKind::Subroutine) {
+        auto& sub = cursor_symbol->as<SubroutineSymbol>();
+        bool is_virtual =
+            sub.flags.has(MethodFlags::Virtual) || sub.flags.has(MethodFlags::Pure);
+        if (!is_virtual) return result;
+
+        // Find the enclosing class.
+        const Symbol* parent_sym =
+            sub.getParentScope() ? &sub.getParentScope()->asSymbol() : nullptr;
+        if (parent_sym == nullptr || parent_sym->kind != SymbolKind::ClassType) {
+            return result;
+        }
+        auto& enclosing = parent_sym->as<ClassType>();
+        find_overrides(enclosing, sub.name, all_classes, sm, built.buffers_by_path,
+                       result["locations"]);
+        return result;
+    }
+
+    return result;
+}
+
 // --- main loop -----------------------------------------------------------
 
 int main() {
@@ -841,6 +1209,10 @@ int main() {
                 resp["result"] = handle_elaborate(req.value("params", json::object()));
             } else if (method == "definition") {
                 resp["result"] = handle_definition(req.value("params", json::object()));
+            } else if (method == "typeDefinition") {
+                resp["result"] = handle_type_definition(req.value("params", json::object()));
+            } else if (method == "implementation") {
+                resp["result"] = handle_implementation(req.value("params", json::object()));
             } else if (method == "shutdown") {
                 // Acknowledge, flush, exit. Keeps the client from seeing
                 // a "Closed" before its shutdown response lands.

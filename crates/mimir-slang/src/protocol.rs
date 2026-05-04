@@ -43,6 +43,16 @@ pub mod methods {
     /// Params: [`super::DefinitionParams`]; result: [`super::DefinitionResult`].
     pub const DEFINITION: &str = "definition";
 
+    /// Resolve the declared type of the symbol under the cursor. Used to
+    /// power LSP `textDocument/typeDefinition`.
+    /// Params: [`super::TypeDefinitionParams`]; result: [`super::TypeDefinitionResult`].
+    pub const TYPE_DEFINITION: &str = "typeDefinition";
+
+    /// Resolve all implementations of a virtual method or all subclasses of a
+    /// class. Used to power LSP `textDocument/implementation`.
+    /// Params: [`super::ImplementationParams`]; result: [`super::ImplementationResult`].
+    pub const IMPLEMENTATION: &str = "implementation";
+
     /// Politely ask the sidecar to exit. No params, no result.
     /// The client should still wait on the child after sending this.
     pub const SHUTDOWN: &str = "shutdown";
@@ -250,6 +260,101 @@ pub struct DefinitionLocation {
     pub path: String,
     /// LSP-coordinate range of the declaration's identifier token. The
     /// server hands this to the editor verbatim as `Location.range`.
+    pub range: Range,
+}
+
+// --------------------------------------------------------------------------
+// `typeDefinition` method
+// --------------------------------------------------------------------------
+
+/// Params for [`methods::TYPE_DEFINITION`].
+///
+/// Structurally identical to [`DefinitionParams`] — kept as a distinct type so
+/// the two methods can diverge independently in future.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeDefinitionParams {
+    /// Same shape as [`DefinitionParams::files`].
+    pub files: Vec<SourceFile>,
+    /// `+incdir+` paths.
+    #[serde(default)]
+    pub include_dirs: Vec<String>,
+    /// `+define+` macros.
+    #[serde(default)]
+    pub defines: Vec<MacroDefine>,
+    /// Optional top module/program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<String>,
+    /// Filesystem path of the file containing the cursor.
+    pub target_path: String,
+    /// LSP-coordinate cursor position (zero-based line, UTF-16 character).
+    pub target_position: Position,
+}
+
+/// Result for [`methods::TYPE_DEFINITION`].
+///
+/// Empty `locations` means no type declaration was found (e.g. built-in scalar,
+/// void return, or cursor not on a type-bearing expression). Trust-slang-on-empty
+/// applies — the server does not fall back to the syntax index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TypeDefinitionResult {
+    /// Zero or one declaration sites for the type of the symbol under the cursor.
+    #[serde(default)]
+    pub locations: Vec<TypeDefinitionLocation>,
+}
+
+/// One type-declaration site returned by [`TypeDefinitionResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeDefinitionLocation {
+    /// Filesystem path of the file the type declaration lives in.
+    pub path: String,
+    /// LSP-coordinate range of the type declaration's name token.
+    pub range: Range,
+}
+
+// --------------------------------------------------------------------------
+// `implementation` method
+// --------------------------------------------------------------------------
+
+/// Params for [`methods::IMPLEMENTATION`].
+///
+/// Same shape as [`DefinitionParams`] — kept distinct for future flexibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementationParams {
+    /// Same shape as [`DefinitionParams::files`].
+    pub files: Vec<SourceFile>,
+    /// `+incdir+` paths.
+    #[serde(default)]
+    pub include_dirs: Vec<String>,
+    /// `+define+` macros.
+    #[serde(default)]
+    pub defines: Vec<MacroDefine>,
+    /// Optional top module/program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<String>,
+    /// Filesystem path of the file containing the cursor.
+    pub target_path: String,
+    /// LSP-coordinate cursor position (zero-based line, UTF-16 character).
+    pub target_position: Position,
+}
+
+/// Result for [`methods::IMPLEMENTATION`].
+///
+/// Empty `locations` means no implementations found (non-virtual method,
+/// leaf class, or cursor not on a class/virtual-method token).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImplementationResult {
+    /// Zero, one, or many implementation sites. Multiple sites are valid
+    /// (e.g. several subclasses all override the same virtual method).
+    #[serde(default)]
+    pub locations: Vec<ImplementationLocation>,
+}
+
+/// One implementation site returned by [`ImplementationResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImplementationLocation {
+    /// Filesystem path of the implementation.
+    pub path: String,
+    /// LSP-coordinate range of the implementation's name token.
     pub range: Range,
 }
 
@@ -522,5 +627,100 @@ mod tests {
         let s = serde_json::to_string(&d).unwrap();
         let back: Diagnostic = serde_json::from_str(&s).unwrap();
         assert_eq!(back, d);
+    }
+
+    /// `TypeDefinitionParams` round-trips including cursor fields.
+    #[test]
+    fn type_definition_params_roundtrip() {
+        let p = TypeDefinitionParams {
+            files: vec![SourceFile {
+                path: "/proj/a.sv".into(),
+                text: "class c; endclass".into(),
+                is_compilation_unit: true,
+            }],
+            include_dirs: vec!["/proj/inc".into()],
+            defines: vec![],
+            top: None,
+            target_path: "/proj/a.sv".into(),
+            target_position: Position::new(0, 6),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: TypeDefinitionParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_path, "/proj/a.sv");
+        assert_eq!(back.target_position.character, 6);
+    }
+
+    /// `TypeDefinitionResult` with empty locations round-trips and
+    /// `#[serde(default)]` lets an absent field decode as empty.
+    #[test]
+    fn type_definition_result_empty_roundtrip() {
+        let r = TypeDefinitionResult { locations: vec![] };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: TypeDefinitionResult = serde_json::from_str(&s).unwrap();
+        assert!(back.locations.is_empty());
+        let from_empty: TypeDefinitionResult = serde_json::from_str("{}").unwrap();
+        assert!(from_empty.locations.is_empty());
+    }
+
+    /// `TypeDefinitionLocation` round-trips.
+    #[test]
+    fn type_definition_location_roundtrip() {
+        let loc = TypeDefinitionLocation {
+            path: "/proj/types.sv".into(),
+            range: Range::new(Position::new(5, 0), Position::new(5, 10)),
+        };
+        let s = serde_json::to_string(&loc).unwrap();
+        let back: TypeDefinitionLocation = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, loc);
+    }
+
+    /// `ImplementationParams` round-trips including cursor fields.
+    #[test]
+    fn implementation_params_roundtrip() {
+        let p = ImplementationParams {
+            files: vec![SourceFile {
+                path: "/proj/a.sv".into(),
+                text: "virtual class base; virtual function void run(); endfunction endclass".into(),
+                is_compilation_unit: true,
+            }],
+            include_dirs: vec![],
+            defines: vec![],
+            top: None,
+            target_path: "/proj/a.sv".into(),
+            target_position: Position::new(0, 40),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: ImplementationParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_path, "/proj/a.sv");
+        assert_eq!(back.target_position.line, 0);
+    }
+
+    /// `ImplementationResult` with multiple locations round-trips.
+    #[test]
+    fn implementation_result_roundtrip() {
+        let r = ImplementationResult {
+            locations: vec![
+                ImplementationLocation {
+                    path: "/proj/derived_a.sv".into(),
+                    range: Range::new(Position::new(2, 4), Position::new(2, 7)),
+                },
+                ImplementationLocation {
+                    path: "/proj/derived_b.sv".into(),
+                    range: Range::new(Position::new(10, 2), Position::new(10, 5)),
+                },
+            ],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: ImplementationResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.locations.len(), 2);
+        assert_eq!(back.locations[0].path, "/proj/derived_a.sv");
+        assert_eq!(back.locations[1].path, "/proj/derived_b.sv");
+    }
+
+    /// `ImplementationResult` empty locations decodes cleanly from `{}`.
+    #[test]
+    fn implementation_result_empty_roundtrip() {
+        let from_empty: ImplementationResult = serde_json::from_str("{}").unwrap();
+        assert!(from_empty.locations.is_empty());
     }
 }

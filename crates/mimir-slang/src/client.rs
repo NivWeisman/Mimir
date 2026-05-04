@@ -43,8 +43,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, instrument, warn};
 
 use crate::protocol::{
-    methods, DefinitionParams, DefinitionResult, ElaborateParams, ElaborateResult, Request,
-    Response, ResponseError,
+    methods, DefinitionParams, DefinitionResult, ElaborateParams, ElaborateResult,
+    ImplementationParams, ImplementationResult, Request, Response, ResponseError,
+    TypeDefinitionParams, TypeDefinitionResult,
 };
 
 // --------------------------------------------------------------------------
@@ -232,6 +233,22 @@ where
     ) -> Result<DefinitionResult, ConnectionError> {
         self.request(methods::DEFINITION, params).await
     }
+
+    /// Convenience wrapper for the [`methods::TYPE_DEFINITION`] method.
+    pub async fn type_definition(
+        &mut self,
+        params: &TypeDefinitionParams,
+    ) -> Result<TypeDefinitionResult, ConnectionError> {
+        self.request(methods::TYPE_DEFINITION, params).await
+    }
+
+    /// Convenience wrapper for the [`methods::IMPLEMENTATION`] method.
+    pub async fn implementation(
+        &mut self,
+        params: &ImplementationParams,
+    ) -> Result<ImplementationResult, ConnectionError> {
+        self.request(methods::IMPLEMENTATION, params).await
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -328,6 +345,34 @@ impl Client {
     ) -> Result<DefinitionResult, ClientError> {
         let mut conn = self.connection.lock().await;
         Ok(conn.definition(params).await?)
+    }
+
+    /// Run a `typeDefinition` request against the sidecar.
+    ///
+    /// Returns the declaration site of the *type* of the symbol under the
+    /// cursor (e.g. `my_class` for a variable of type `my_class`). Empty
+    /// locations means no type declaration was found (built-in scalar,
+    /// void return, etc.) — trust-slang-on-empty applies.
+    pub async fn type_definition(
+        &self,
+        params: &TypeDefinitionParams,
+    ) -> Result<TypeDefinitionResult, ClientError> {
+        let mut conn = self.connection.lock().await;
+        Ok(conn.type_definition(params).await?)
+    }
+
+    /// Run an `implementation` request against the sidecar.
+    ///
+    /// Returns all overrides of a virtual method in subclasses, or all
+    /// direct subclasses of a class. Empty locations means no implementations
+    /// were found (non-virtual method, leaf class, cursor not on a relevant
+    /// symbol).
+    pub async fn implementation(
+        &self,
+        params: &ImplementationParams,
+    ) -> Result<ImplementationResult, ClientError> {
+        let mut conn = self.connection.lock().await;
+        Ok(conn.implementation(params).await?)
     }
 
     /// Send the `shutdown` request, then wait for the child to exit.

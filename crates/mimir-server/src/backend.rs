@@ -35,7 +35,10 @@ use mimir_core::{Position as MPosition, Range as MRange, TextDocument};
 use mimir_slang::{
     Client as SlangClient, DefinitionLocation as SlangDefinitionLocation,
     DefinitionParams as SlangDefinitionParams, Diagnostic as SlangDiagnostic, ElaborateParams,
-    ElaborateResult, Severity as SlangSeverity, SourceFile,
+    ElaborateResult, ImplementationLocation as SlangImplementationLocation,
+    ImplementationParams as SlangImplementationParams, Severity as SlangSeverity, SourceFile,
+    TypeDefinitionLocation as SlangTypeDefinitionLocation,
+    TypeDefinitionParams as SlangTypeDefinitionParams,
 };
 use mimir_syntax::{
     Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity, Symbol, SymbolKind as MSymbolKind,
@@ -357,6 +360,88 @@ impl Backend {
         }
     }
 
+    /// Try to resolve the type of the symbol under the cursor via slang.
+    ///
+    /// No syntax fallback — type resolution requires semantic information that
+    /// tree-sitter doesn't have. Returns `None` when slang is not configured or
+    /// the URI is not a filesystem path; `Some(Resolved(_))` on success;
+    /// `Some(TransportError)` on I/O failure.
+    async fn try_slang_type_definition(
+        &self,
+        uri: &Url,
+        target: MPosition,
+    ) -> Option<SlangTypeDefinitionOutcome> {
+        let slang = self.slang.clone()?;
+        let project = self.project.read().await.clone()?;
+
+        let (def_params, _) =
+            build_definition_params(&project, &self.documents, uri, target).await?;
+        let params = SlangTypeDefinitionParams {
+            files: def_params.files,
+            include_dirs: def_params.include_dirs,
+            defines: def_params.defines,
+            top: def_params.top,
+            target_path: def_params.target_path,
+            target_position: def_params.target_position,
+        };
+
+        match slang.type_definition(&params).await {
+            Ok(result) => {
+                let locations: Vec<Location> = result
+                    .locations
+                    .into_iter()
+                    .filter_map(slang_type_definition_location_to_lsp)
+                    .collect();
+                Some(SlangTypeDefinitionOutcome::Resolved(locations))
+            }
+            Err(e) => {
+                error!(error = %e, "slang type_definition transport error");
+                Some(SlangTypeDefinitionOutcome::TransportError)
+            }
+        }
+    }
+
+    /// Try to resolve implementations of the symbol under the cursor via slang.
+    ///
+    /// No syntax fallback — implementation queries need full class-hierarchy
+    /// information that tree-sitter doesn't provide. Returns `None` when slang
+    /// is not configured or the URI is not a filesystem path;
+    /// `Some(Resolved(_))` on success; `Some(TransportError)` on I/O failure.
+    async fn try_slang_implementation(
+        &self,
+        uri: &Url,
+        target: MPosition,
+    ) -> Option<SlangImplementationOutcome> {
+        let slang = self.slang.clone()?;
+        let project = self.project.read().await.clone()?;
+
+        let (def_params, _) =
+            build_definition_params(&project, &self.documents, uri, target).await?;
+        let params = SlangImplementationParams {
+            files: def_params.files,
+            include_dirs: def_params.include_dirs,
+            defines: def_params.defines,
+            top: def_params.top,
+            target_path: def_params.target_path,
+            target_position: def_params.target_position,
+        };
+
+        match slang.implementation(&params).await {
+            Ok(result) => {
+                let locations: Vec<Location> = result
+                    .locations
+                    .into_iter()
+                    .filter_map(slang_implementation_location_to_lsp)
+                    .collect();
+                Some(SlangImplementationOutcome::Resolved(locations))
+            }
+            Err(e) => {
+                error!(error = %e, "slang implementation transport error");
+                Some(SlangImplementationOutcome::TransportError)
+            }
+        }
+    }
+
     /// Stage 1 + Stage 2 syntax-based resolver, factored out so the
     /// `goto_definition` handler can either reach for slang first
     /// (when configured) or call this directly (when slang is absent
@@ -490,6 +575,12 @@ impl LanguageServer for Backend {
                 // free checkbox. The editor uses it to render the outline
                 // view and to drive symbol-aware navigation shortcuts.
                 document_symbol_provider: Some(OneOf::Left(true)),
+                // Slang-only: cursor on variable/field/return-site → type declaration.
+                // No tree-sitter fallback (tree-sitter has no semantic type info).
+                type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+                // Slang-only: cursor on virtual method → all overrides;
+                // cursor on class → all direct subclasses.
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 // We publish diagnostics as a *push* (via the `Client`) on
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
@@ -623,6 +714,56 @@ impl LanguageServer for Backend {
                 Ok(slang_locations_to_response(locs))
             }
             DefinitionRoute::UseSyntaxFallback => Ok(self.syntax_definition(&uri, target).await),
+        }
+    }
+
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
+    async fn goto_type_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> LspResult<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        // Slang-only: no tree-sitter fallback for type resolution.
+        // None (slang not configured / transport error) → returns None to editor.
+        let outcome = self.try_slang_type_definition(&uri, target).await;
+        match route_type_definition(outcome) {
+            TypeDefinitionRoute::UseSlangResult(locs) => {
+                debug!(count = locs.len(), "slang type_definition resolved");
+                Ok(slang_locations_to_response(locs))
+            }
+            TypeDefinitionRoute::UseEmpty => Ok(None),
+        }
+    }
+
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
+    async fn goto_implementation(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> LspResult<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        // Slang-only: implementation queries need full semantic analysis.
+        // None (slang not configured / transport error) → returns None to editor.
+        let outcome = self.try_slang_implementation(&uri, target).await;
+        match route_implementation(outcome) {
+            ImplementationRoute::UseSlangResult(locs) => {
+                debug!(count = locs.len(), "slang implementation resolved");
+                Ok(slang_locations_to_response(locs))
+            }
+            ImplementationRoute::UseEmpty => Ok(None),
         }
     }
 
@@ -947,6 +1088,80 @@ fn route_definition(outcome: Option<SlangDefinitionOutcome>) -> DefinitionRoute 
     match outcome {
         Some(SlangDefinitionOutcome::Resolved(locs)) => DefinitionRoute::UseSlangResult(locs),
         Some(SlangDefinitionOutcome::TransportError) | None => DefinitionRoute::UseSyntaxFallback,
+    }
+}
+
+/// Convert a slang `TypeDefinitionLocation` into LSP's `Location`.
+fn slang_type_definition_location_to_lsp(loc: SlangTypeDefinitionLocation) -> Option<Location> {
+    let url = path_to_url(&loc.path)?;
+    Some(Location {
+        uri: url,
+        range: m_range_to_lsp(loc.range),
+    })
+}
+
+/// Outcome of a slang `typeDefinition` request.
+#[derive(Debug)]
+enum SlangTypeDefinitionOutcome {
+    /// Slang answered (may be empty — no fallback in either case).
+    Resolved(Vec<Location>),
+    /// I/O / protocol error. The handler returns `None` to the editor.
+    TransportError,
+}
+
+/// Routing decision for `goto_type_definition`. Pure so the policy is
+/// unit-testable without a sidecar.
+#[derive(Debug, PartialEq, Eq)]
+enum TypeDefinitionRoute {
+    /// Use slang's locations (trust-slang-on-empty: empty → `None`).
+    UseSlangResult(Vec<Location>),
+    /// Slang not configured, untitled buffer, or transport error.
+    UseEmpty,
+}
+
+fn route_type_definition(outcome: Option<SlangTypeDefinitionOutcome>) -> TypeDefinitionRoute {
+    match outcome {
+        Some(SlangTypeDefinitionOutcome::Resolved(locs)) => {
+            TypeDefinitionRoute::UseSlangResult(locs)
+        }
+        Some(SlangTypeDefinitionOutcome::TransportError) | None => TypeDefinitionRoute::UseEmpty,
+    }
+}
+
+/// Convert a slang `ImplementationLocation` into LSP's `Location`.
+fn slang_implementation_location_to_lsp(loc: SlangImplementationLocation) -> Option<Location> {
+    let url = path_to_url(&loc.path)?;
+    Some(Location {
+        uri: url,
+        range: m_range_to_lsp(loc.range),
+    })
+}
+
+/// Outcome of a slang `implementation` request.
+#[derive(Debug)]
+enum SlangImplementationOutcome {
+    /// Slang answered (may be empty — no fallback in either case).
+    Resolved(Vec<Location>),
+    /// I/O / protocol error. The handler returns `None` to the editor.
+    TransportError,
+}
+
+/// Routing decision for `goto_implementation`. Pure so the policy is
+/// unit-testable without a sidecar.
+#[derive(Debug, PartialEq, Eq)]
+enum ImplementationRoute {
+    /// Use slang's locations (trust-slang-on-empty: empty → `None`).
+    UseSlangResult(Vec<Location>),
+    /// Slang not configured, untitled buffer, or transport error.
+    UseEmpty,
+}
+
+fn route_implementation(outcome: Option<SlangImplementationOutcome>) -> ImplementationRoute {
+    match outcome {
+        Some(SlangImplementationOutcome::Resolved(locs)) => {
+            ImplementationRoute::UseSlangResult(locs)
+        }
+        Some(SlangImplementationOutcome::TransportError) | None => ImplementationRoute::UseEmpty,
     }
 }
 
@@ -2101,5 +2316,83 @@ mod tests {
         // Just exercise the path; correctness of the path-parser is
         // covered by `path_to_url`'s own tests.
         let _ = slang_location_to_lsp(loc);
+    }
+
+    // ------------------------------------------------------------------
+    // route_type_definition
+    // ------------------------------------------------------------------
+
+    fn sample_location() -> Location {
+        Location {
+            uri: Url::parse("file:///proj/a.sv").unwrap(),
+            range: Range {
+                start: Position { line: 1, character: 0 },
+                end: Position { line: 1, character: 8 },
+            },
+        }
+    }
+
+    /// Slang resolved with locations → `UseSlangResult`.
+    #[test]
+    fn route_type_definition_uses_slang_when_resolved_non_empty() {
+        let locs = vec![sample_location()];
+        let route = route_type_definition(Some(SlangTypeDefinitionOutcome::Resolved(locs.clone())));
+        assert_eq!(route, TypeDefinitionRoute::UseSlangResult(locs));
+    }
+
+    /// Empty resolved → still `UseSlangResult` (trust-slang-on-empty — no syntax fallback).
+    #[test]
+    fn route_type_definition_uses_slang_when_resolved_empty() {
+        let route = route_type_definition(Some(SlangTypeDefinitionOutcome::Resolved(Vec::new())));
+        assert_eq!(route, TypeDefinitionRoute::UseSlangResult(Vec::new()));
+    }
+
+    /// Transport error → `UseEmpty` (no syntax fallback for type queries).
+    #[test]
+    fn route_type_definition_returns_empty_on_transport_error() {
+        let route = route_type_definition(Some(SlangTypeDefinitionOutcome::TransportError));
+        assert_eq!(route, TypeDefinitionRoute::UseEmpty);
+    }
+
+    /// `None` (slang not configured) → `UseEmpty`.
+    #[test]
+    fn route_type_definition_returns_empty_when_slang_not_run() {
+        let route = route_type_definition(None);
+        assert_eq!(route, TypeDefinitionRoute::UseEmpty);
+    }
+
+    // ------------------------------------------------------------------
+    // route_implementation
+    // ------------------------------------------------------------------
+
+    /// Slang resolved with locations → `UseSlangResult`.
+    #[test]
+    fn route_implementation_uses_slang_when_resolved_non_empty() {
+        let locs = vec![sample_location()];
+        let route =
+            route_implementation(Some(SlangImplementationOutcome::Resolved(locs.clone())));
+        assert_eq!(route, ImplementationRoute::UseSlangResult(locs));
+    }
+
+    /// Empty resolved → still `UseSlangResult` (trust-slang-on-empty).
+    #[test]
+    fn route_implementation_uses_slang_when_resolved_empty() {
+        let route =
+            route_implementation(Some(SlangImplementationOutcome::Resolved(Vec::new())));
+        assert_eq!(route, ImplementationRoute::UseSlangResult(Vec::new()));
+    }
+
+    /// Transport error → `UseEmpty`.
+    #[test]
+    fn route_implementation_returns_empty_on_transport_error() {
+        let route = route_implementation(Some(SlangImplementationOutcome::TransportError));
+        assert_eq!(route, ImplementationRoute::UseEmpty);
+    }
+
+    /// `None` (slang not configured) → `UseEmpty`.
+    #[test]
+    fn route_implementation_returns_empty_when_slang_not_run() {
+        let route = route_implementation(None);
+        assert_eq!(route, ImplementationRoute::UseEmpty);
     }
 }
