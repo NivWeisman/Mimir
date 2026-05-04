@@ -508,6 +508,37 @@ impl Backend {
         Some(GotoDefinitionResponse::Array(locations))
     }
 
+    /// Syntax-only completion for `uri` at `pos`.
+    ///
+    /// Reads the current document state, extracts the identifier prefix the
+    /// user is typing, then filters the per-file symbol index by case-insensitive
+    /// prefix match. Returns `None` only when the document is not in the store.
+    async fn syntax_completion(&self, uri: &Url, pos: MPosition) -> Option<CompletionResponse> {
+        let (text, index) = {
+            let docs = self.documents.read().await;
+            let state = docs.get(uri)?;
+            (state.document.text(), state.index.clone())
+        };
+
+        let rope = Rope::from_str(&text);
+        let prefix = mimir_syntax::symbols::prefix_at(&rope, pos).unwrap_or_default();
+        let prefix_lower = prefix.to_ascii_lowercase();
+
+        const MAX_ITEMS: usize = 200;
+        let items: Vec<CompletionItem> = index
+            .iter()
+            .filter(|sym| sym.name.to_ascii_lowercase().starts_with(&prefix_lower))
+            .take(MAX_ITEMS)
+            .map(|sym| CompletionItem {
+                label: sym.name.clone(),
+                kind: Some(symbol_kind_to_completion_kind(sym.kind)),
+                ..Default::default()
+            })
+            .collect();
+
+        debug!(count = items.len(), prefix = %prefix, "syntax completion");
+        Some(CompletionResponse::Array(items))
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -808,10 +839,10 @@ impl LanguageServer for Backend {
         &self,
         params: CompletionParams,
     ) -> LspResult<Option<CompletionResponse>> {
-        let _uri = params.text_document_position.text_document.uri;
-        let _pos = params.text_document_position.position;
-        // Stage 1 skeleton — candidates added in stage 2.
-        Ok(None)
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let target = MPosition::new(pos.line, pos.character);
+        Ok(self.syntax_completion(&uri, target).await)
     }
 }
 
@@ -1423,6 +1454,33 @@ fn symbol_kind_to_lsp(kind: MSymbolKind) -> SymbolKind {
         | MSymbolKind::Property
         | MSymbolKind::Sequence
         | MSymbolKind::Covergroup => SymbolKind::OBJECT,
+    }
+}
+
+/// Map a mimir-syntax [`MSymbolKind`] to a completion item kind.
+///
+/// Uses the nearest LSP [`CompletionItemKind`] for each SV construct.
+/// Exists in `mimir-server` (not `mimir-syntax`) to keep LSP types out of
+/// the lower crates, per the dependency rule in `CLAUDE.md`.
+fn symbol_kind_to_completion_kind(kind: MSymbolKind) -> CompletionItemKind {
+    match kind {
+        MSymbolKind::Module => CompletionItemKind::MODULE,
+        MSymbolKind::Interface => CompletionItemKind::INTERFACE,
+        MSymbolKind::Program => CompletionItemKind::MODULE,
+        MSymbolKind::Package => CompletionItemKind::MODULE,
+        MSymbolKind::Class => CompletionItemKind::CLASS,
+        MSymbolKind::Task => CompletionItemKind::FUNCTION,
+        MSymbolKind::Function => CompletionItemKind::FUNCTION,
+        MSymbolKind::Method => CompletionItemKind::METHOD,
+        MSymbolKind::Typedef => CompletionItemKind::CLASS,
+        MSymbolKind::EnumMember => CompletionItemKind::ENUM_MEMBER,
+        MSymbolKind::Constraint => CompletionItemKind::FIELD,
+        MSymbolKind::Parameter => CompletionItemKind::CONSTANT,
+        MSymbolKind::Variable => CompletionItemKind::VARIABLE,
+        MSymbolKind::Port => CompletionItemKind::VARIABLE,
+        MSymbolKind::Property => CompletionItemKind::PROPERTY,
+        MSymbolKind::Sequence => CompletionItemKind::VALUE,
+        MSymbolKind::Covergroup => CompletionItemKind::STRUCT,
     }
 }
 
@@ -2430,5 +2488,55 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.trigger_characters.unwrap().len(), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // symbol_kind_to_completion_kind
+    // ------------------------------------------------------------------
+
+    /// Every `MSymbolKind` variant must map to a `CompletionItemKind` — if
+    /// a variant is added without updating the match, this test panics.
+    #[test]
+    fn completion_kind_maps_all_symbol_kinds() {
+        let all = [
+            MSymbolKind::Module,
+            MSymbolKind::Interface,
+            MSymbolKind::Program,
+            MSymbolKind::Package,
+            MSymbolKind::Class,
+            MSymbolKind::Task,
+            MSymbolKind::Function,
+            MSymbolKind::Method,
+            MSymbolKind::Typedef,
+            MSymbolKind::EnumMember,
+            MSymbolKind::Constraint,
+            MSymbolKind::Parameter,
+            MSymbolKind::Variable,
+            MSymbolKind::Port,
+            MSymbolKind::Property,
+            MSymbolKind::Sequence,
+            MSymbolKind::Covergroup,
+        ];
+        for kind in all {
+            let _ = symbol_kind_to_completion_kind(kind);
+        }
+    }
+
+    /// `Class` maps to `CLASS`, `Method` to `METHOD` — spot-check the
+    /// most important SV-specific entries.
+    #[test]
+    fn completion_kind_spot_checks() {
+        assert_eq!(
+            symbol_kind_to_completion_kind(MSymbolKind::Class),
+            CompletionItemKind::CLASS,
+        );
+        assert_eq!(
+            symbol_kind_to_completion_kind(MSymbolKind::Method),
+            CompletionItemKind::METHOD,
+        );
+        assert_eq!(
+            symbol_kind_to_completion_kind(MSymbolKind::Parameter),
+            CompletionItemKind::CONSTANT,
+        );
     }
 }

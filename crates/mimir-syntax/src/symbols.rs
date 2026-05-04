@@ -364,6 +364,51 @@ pub fn identifier_at<'a>(tree: &'a SyntaxTree, rope: &Rope, pos: Position) -> Op
 }
 
 // --------------------------------------------------------------------------
+// prefix_at
+// --------------------------------------------------------------------------
+
+/// Return the identifier prefix the user is typing at `pos`.
+///
+/// Reads the rope line up to `pos.character` (UTF-16 code units) and
+/// extracts the trailing `[A-Za-z0-9_$]+` suffix. Rope-based and
+/// parse-tree-independent — works even when the document has syntax errors
+/// or the tree is stale.
+///
+/// Returns `Some("")` when the cursor is positioned immediately after a
+/// delimiter (e.g. `(`, space, `.`). Returns `None` only when `pos.line`
+/// is out of bounds.
+#[must_use]
+pub fn prefix_at(rope: &Rope, pos: Position) -> Option<String> {
+    if (pos.line as usize) >= rope.len_lines() {
+        return None;
+    }
+    let line_slice = rope.line(pos.line as usize);
+
+    // Collect chars up to the UTF-16 column, respecting surrogate-pair widths.
+    let mut buf = String::new();
+    let mut utf16: u32 = 0;
+    for ch in line_slice.chars() {
+        if ch == '\n' || ch == '\r' || utf16 >= pos.character {
+            break;
+        }
+        buf.push(ch);
+        utf16 += ch.len_utf16() as u32;
+    }
+
+    // Extract the trailing [A-Za-z0-9_$]* suffix from `buf`.
+    // Walk char_indices in reverse; stop at the first non-identifier char.
+    let start = buf
+        .char_indices()
+        .rev()
+        .take_while(|(_, ch)| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$'))
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(buf.len());
+
+    Some(buf[start..].to_owned())
+}
+
+// --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------
 
@@ -620,5 +665,55 @@ mod tests {
         let src = "module m;\nparameter int W = 8;\ninitial W = W;\nendmodule\n";
         // Line 2 ("initial W = W;"), column 8 is the 'W' after `=`.
         assert_eq!(ident_at(src, 2, 12).as_deref(), Some("W"));
+    }
+
+    // ------------------------------------------------------------------
+    // prefix_at
+    // ------------------------------------------------------------------
+
+    /// Helper: compute prefix at (line, col) in `src`.
+    fn pfx(src: &str, line: u32, col: u32) -> Option<String> {
+        prefix_at(&Rope::from_str(src), Position::new(line, col))
+    }
+
+    #[test]
+    fn prefix_at_mid_identifier() {
+        // Cursor after "my_cl" in "my_class" → prefix is "my_cl".
+        assert_eq!(pfx("my_class foo;", 0, 5), Some("my_cl".into()));
+    }
+
+    #[test]
+    fn prefix_at_after_space_returns_empty() {
+        // Cursor on whitespace (after "class ") → no identifier chars before cursor.
+        assert_eq!(pfx("class foo;", 0, 6), Some("".into()));
+    }
+
+    #[test]
+    fn prefix_at_after_dot_returns_empty() {
+        // Cursor right after the `.` in `obj.` → empty prefix.
+        assert_eq!(pfx("obj.field", 0, 4), Some("".into()));
+    }
+
+    #[test]
+    fn prefix_at_full_identifier() {
+        // Cursor at end of "my_class" → full name returned.
+        assert_eq!(pfx("my_class", 0, 8), Some("my_class".into()));
+    }
+
+    #[test]
+    fn prefix_at_dollar_prefix() {
+        // SystemVerilog system tasks start with `$`.
+        assert_eq!(pfx("$disp", 0, 5), Some("$disp".into()));
+    }
+
+    #[test]
+    fn prefix_at_out_of_bounds_returns_none() {
+        assert_eq!(pfx("module foo;", 99, 0), None);
+    }
+
+    #[test]
+    fn prefix_at_start_of_line_returns_empty() {
+        // Cursor at column 0 → nothing before it.
+        assert_eq!(pfx("class foo;", 0, 0), Some("".into()));
     }
 }
