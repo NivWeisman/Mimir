@@ -15,6 +15,9 @@
 //!    emits one [`Symbol`] per declaration; [`symbols::identifier_at`]
 //!    looks up the identifier under an LSP position. Powers
 //!    `documentSymbol` and same-file go-to-definition in `mimir-server`.
+//! 5. **IEEE 1800-2017 keyword list.** [`keywords::KEYWORDS`] and
+//!    [`keywords::matches_prefix`] provide a static list of all SV reserved
+//!    words for completion (no tree required).
 //!
 //! ## Why tree-sitter?
 //!
@@ -34,6 +37,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod diagnostics;
+pub mod keywords;
 pub mod parser;
 pub mod symbols;
 

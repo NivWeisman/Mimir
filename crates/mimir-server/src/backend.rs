@@ -582,6 +582,18 @@ impl Backend {
             });
         }
 
+        // --- 3. Keywords (appended last, after user symbols) ----------------
+        for kw in mimir_syntax::keywords::matches_prefix(&prefix) {
+            if items.len() >= MAX_ITEMS {
+                break;
+            }
+            items.push(CompletionItem {
+                label: kw.to_owned(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                ..Default::default()
+            });
+        }
+
         debug!(count = items.len(), prefix = %prefix, "syntax completion");
         Some(CompletionResponse::Array(items))
     }

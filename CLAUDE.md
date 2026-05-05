@@ -56,7 +56,7 @@ RUST_LOG=mimir=debug cargo run -p mimir-server
 
 Per-crate test entry points:
 - `mimir-core`: [crates/mimir-core/src/document.rs:339](./crates/mimir-core/src/document.rs), [crates/mimir-core/src/logging.rs:82](./crates/mimir-core/src/logging.rs)
-- `mimir-syntax`: [crates/mimir-syntax/src/parser.rs:128](./crates/mimir-syntax/src/parser.rs), [crates/mimir-syntax/src/diagnostics.rs:150](./crates/mimir-syntax/src/diagnostics.rs)
+- `mimir-syntax`: [crates/mimir-syntax/src/parser.rs:128](./crates/mimir-syntax/src/parser.rs), [crates/mimir-syntax/src/diagnostics.rs:150](./crates/mimir-syntax/src/diagnostics.rs), [crates/mimir-syntax/src/keywords.rs](./crates/mimir-syntax/src/keywords.rs)
 - `mimir-server`: [crates/mimir-server/src/backend.rs:310](./crates/mimir-server/src/backend.rs)
 
 ## Critical invariants
