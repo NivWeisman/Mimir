@@ -1,4 +1,4 @@
-# Plan — `textDocument/completion` for mimir
+# Plan — `textDocument/completion` for mimir (completed) + env-var config (completed)
 
 ## Context
 
@@ -151,6 +151,23 @@ list. End-to-end plumbing only — no candidates yet.
 - README: flip `textDocument/completion` to ✅.
 
 **Done when:** Typing `` `MY_ `` offers all `` `define `` names visible in the compilation unit.
+
+### Env-var config ✅ DONE
+
+**Goal:** `.mimir.toml` `[env]` table lets users set workspace-local env vars
+that are checked before the process env when expanding `${VAR}` in filelist
+tokens / inline `include_dirs` / `defines`, and when resolving `MIMIR_SLANG_PATH`.
+
+- `crates/mimir-server/src/project.rs`
+  - Added `env: HashMap<String, String>` to `ProjectConfig` (top-level `[env]` table).
+  - Added `env: HashMap<String, String>` to `ResolvedProject`.
+  - `expand_env_vars(s, env)` — config env first, process env fallback.
+  - Threaded `env` through `expand_filelist` and inline config expansion.
+- `crates/mimir-server/src/backend.rs`
+  - Changed `slang: Option<Arc<SlangClient>>` → `Arc<RwLock<Option<Arc<SlangClient>>>>`.
+  - `initialize`: if slang not yet running and project env has `MIMIR_SLANG_PATH`, spawn it.
+
+---
 
 ### Stage 8 — Polish (deferred, do separately)
 

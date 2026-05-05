@@ -119,14 +119,15 @@ The first `cmake` invocation downloads slang (~30 MB) and nlohmann_json via
 reuse the cache. Drop `-G Ninja` to fall back to your platform's default
 generator (Make on Linux/macOS).
 
-Then point mimir at the binary by exporting `MIMIR_SLANG_PATH` before
-launching your editor:
+Then point mimir at the binary using **one** of these options (in priority order):
+
+**Option A — process environment** (recommended for CI / shared machines):
 
 ```bash
 export MIMIR_SLANG_PATH="$PWD/build/mimir-slang-sidecar"   # absolute path
 ```
 
-For VS Code you can set it per-workspace instead:
+VS Code (per-workspace):
 
 ```jsonc
 {
@@ -136,14 +137,24 @@ For VS Code you can set it per-workspace instead:
 }
 ```
 
-For Emacs (eglot picks up the parent process's environment):
+Emacs (eglot picks up the parent process's environment):
 
 ```elisp
 (setenv "MIMIR_SLANG_PATH"
         (expand-file-name "~/Dev/mimir/slang-sidecar/build/mimir-slang-sidecar"))
 ```
 
-Without `MIMIR_SLANG_PATH` mimir falls back to tree-sitter-only diagnostics
+**Option B — `.mimir.toml` `[env]` table** (recommended for project-local setup):
+
+```toml
+[env]
+MIMIR_SLANG_PATH = "/absolute/path/to/slang-sidecar/build/mimir-slang-sidecar"
+```
+
+The process environment always takes precedence over `.mimir.toml`'s `[env]`
+section, so CI can override the project config by exporting `MIMIR_SLANG_PATH`.
+
+Without a sidecar path mimir falls back to tree-sitter-only diagnostics
 and any `.mimir.toml` in the project is ignored.
 
 ### 3a. Configure VS Code
@@ -234,9 +245,16 @@ Full schema (every field is optional; the canonical types live in
 [`crates/mimir-server/src/project.rs`](./crates/mimir-server/src/project.rs)):
 
 ```toml
+# Workspace-local environment variables.  Checked before the process env
+# when expanding ${VAR} in filelist tokens, inline include_dirs/defines,
+# and when looking up MIMIR_SLANG_PATH.  Process env always overrides.
+[env]
+MIMIR_SLANG_PATH = "/opt/mimir/bin/mimir-slang-sidecar"
+PROJECT_ROOT     = "/work/my_project"
+
 [slang]
 # Path to a .f filelist, relative to .mimir.toml.
-filelist     = "sim/uvm.f"
+filelist     = "${PROJECT_ROOT}/sim/uvm.f"
 
 # Extra include search paths, on top of anything the filelist contributes.
 # Relative entries resolve against .mimir.toml's directory.
@@ -265,9 +283,9 @@ Every commercial simulator (VCS, Xcelium, Questa) and Verilator reads it,
 so most projects already have one. Mimir parses the same dialect.
 
 Whitespace-separated tokens. `\` followed by newline continues a line.
-`//` and `#` start line comments. `${VAR}` interpolates from the process
-environment — unknown variables expand to empty (matches `make` / most
-simulators).
+`//` and `#` start line comments. `${VAR}` interpolates from the `[env]`
+table first, then the process environment — unknown variables expand to
+empty (matches `make` / most simulators).
 
 | Token                            | Meaning                                                 |
 | -------------------------------- | ------------------------------------------------------- |

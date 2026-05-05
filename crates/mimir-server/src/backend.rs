@@ -102,10 +102,12 @@ pub(crate) struct Backend {
     /// human types into one file at a time).
     parser: Arc<Mutex<SyntaxParser>>,
 
-    /// Optional slang sidecar client. `None` when the user hasn't opted in
-    /// via `MIMIR_SLANG_PATH`, or the configured path failed to spawn.
-    /// While `None`, the diagnostic pipeline is tree-sitter-only.
-    slang: Option<Arc<SlangClient>>,
+    /// Optional slang sidecar client. `None` when neither `MIMIR_SLANG_PATH`
+    /// process env nor `[env] MIMIR_SLANG_PATH` in `.mimir.toml` is set, or
+    /// the configured path failed to spawn.  While `None`, the diagnostic
+    /// pipeline is tree-sitter-only.  Wrapped in `RwLock` so `initialize`
+    /// can set it from the project config after startup.
+    slang: Arc<RwLock<Option<Arc<SlangClient>>>>,
 
     /// Resolved project config (`.mimir.toml` + expanded filelist),
     /// discovered on `initialize` from the workspace root. `None` when no
@@ -152,7 +154,7 @@ impl Backend {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
             parser: Arc::new(Mutex::new(parser)),
-            slang,
+            slang: Arc::new(RwLock::new(slang)),
             project: Arc::new(RwLock::new(None)),
             pending_elaborations: Arc::new(RwLock::new(HashMap::new())),
             slang_published: Arc::new(RwLock::new(HashSet::new())),
@@ -252,7 +254,7 @@ impl Backend {
     /// project lacks a `.mimir.toml` — both are normal "tree-sitter only"
     /// states the user opts into by not configuring the sidecar.
     async fn schedule_elaborate(&self, trigger_uri: Url) {
-        let Some(slang) = self.slang.clone() else {
+        let Some(slang) = self.slang.read().await.clone() else {
             return;
         };
         // Snapshot the project config under the read lock so the spawned
@@ -338,7 +340,7 @@ impl Backend {
         uri: &Url,
         target: MPosition,
     ) -> Option<SlangDefinitionOutcome> {
-        let slang = self.slang.clone()?;
+        let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
         // Build the request envelope. `build_definition_params` returns
@@ -374,7 +376,7 @@ impl Backend {
         uri: &Url,
         target: MPosition,
     ) -> Option<SlangTypeDefinitionOutcome> {
-        let slang = self.slang.clone()?;
+        let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
         let (def_params, _) =
@@ -415,7 +417,7 @@ impl Backend {
         uri: &Url,
         target: MPosition,
     ) -> Option<SlangImplementationOutcome> {
-        let slang = self.slang.clone()?;
+        let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
         let (def_params, _) =
@@ -524,7 +526,7 @@ impl Backend {
         uri: &Url,
         pos: MPosition,
     ) -> Option<CompletionResponse> {
-        let slang = self.slang.clone()?;
+        let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
         let text = {
@@ -603,7 +605,7 @@ impl Backend {
         uri: &Url,
         pos: MPosition,
     ) -> Option<CompletionResponse> {
-        let slang = self.slang.clone()?;
+        let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
         let text = {
@@ -670,7 +672,7 @@ impl Backend {
         pos: MPosition,
         macro_prefix: &str,
     ) -> Option<CompletionResponse> {
-        let slang = self.slang.clone()?;
+        let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
         let (def_params, _) =
@@ -900,6 +902,33 @@ impl LanguageServer for Backend {
         if let Some(start) = workspace_root_path(&params) {
             match ResolvedProject::discover(&start) {
                 Ok(Some(resolved)) => {
+                    // If slang wasn't configured via process env at startup,
+                    // check whether the project's [env] table provides
+                    // MIMIR_SLANG_PATH and try to spawn from there.
+                    if self.slang.read().await.is_none() {
+                        if let Some(path) = resolved.env.get(crate::SLANG_PATH_ENV) {
+                            match mimir_slang::Client::spawn(path, std::iter::empty::<&str>())
+                                .await
+                            {
+                                Ok(client) => {
+                                    info!(
+                                        path = %path,
+                                        "slang sidecar spawned from .mimir.toml [env]",
+                                    );
+                                    *self.slang.write().await = Some(Arc::new(client));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        path = %path,
+                                        error = %e,
+                                        "could not spawn slang sidecar from .mimir.toml [env]; \
+                                         continuing without",
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // Spawn the workspace-index hydration *before* moving
                     // `resolved` into the project lock so we don't have to
                     // re-read it. The task is fire-and-forget — the index
@@ -2331,6 +2360,7 @@ mod tests {
             defines: vec![],
             top: Some("tb_top".into()),
             debounce_ms: 350,
+            env: HashMap::new(),
         }
     }
 

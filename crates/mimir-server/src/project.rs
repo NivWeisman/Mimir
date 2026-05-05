@@ -38,12 +38,12 @@
 //! | `// rest of line`        | Comment.                                           |
 //! | `# rest of line`         | Comment (alternate).                               |
 //! | trailing `\` + newline   | Line continuation.                                 |
-//! | `${VAR}` anywhere        | Expanded from the process environment.             |
+//! | `${VAR}` anywhere        | Expanded from config `[env]`, then the process environment. |
 //!
 //! Recursion is bounded ([`FILELIST_MAX_DEPTH`]) and cycles are detected
 //! by canonical path so a malformed `-f a.f -f a.f` doesn't loop forever.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -128,6 +128,19 @@ pub struct ProjectConfig {
     /// open for future top-level tables (e.g. `[lint]`, `[uvm]`).
     #[serde(default)]
     pub slang: SlangConfig,
+
+    /// Extra environment variables for this workspace. Entries here are
+    /// checked first when expanding `${VAR}` in filelist tokens and when
+    /// looking up `MIMIR_SLANG_PATH`; the process environment provides
+    /// fallbacks (so CI can still override by setting the real env var).
+    ///
+    /// ```toml
+    /// [env]
+    /// MIMIR_SLANG_PATH = "/opt/mimir/bin/mimir-slang-sidecar"
+    /// PROJECT_ROOT     = "/work/my_project"
+    /// ```
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// `[slang]` section of `.mimir.toml`.
@@ -216,6 +229,11 @@ pub struct ResolvedProject {
     pub top: Option<String>,
     /// Stage-3 debounce window.
     pub debounce_ms: u64,
+    /// Config-provided environment variables (from `[env]` in `.mimir.toml`).
+    /// Consulted before the process environment when expanding `${VAR}` and
+    /// when looking up `MIMIR_SLANG_PATH`. Empty when no `[env]` table is
+    /// present.
+    pub env: HashMap<String, String>,
 }
 
 impl ResolvedProject {
@@ -259,18 +277,25 @@ impl ResolvedProject {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
 
+        let env = cfg.env.clone();
+
         let mut files: Vec<PathBuf> = Vec::new();
         let mut include_dirs: Vec<PathBuf> = cfg
             .slang
             .include_dirs
             .iter()
-            .map(|p| absolutise(&root, p))
+            .map(|p| absolutise(&root, Path::new(&expand_env_vars(&p.to_string_lossy(), &env))))
             .collect();
-        let mut defines: Vec<MacroDefine> =
-            cfg.slang.defines.iter().map(|s| parse_define(s)).collect();
+        let mut defines: Vec<MacroDefine> = cfg
+            .slang
+            .defines
+            .iter()
+            .map(|s| parse_define(&expand_env_vars(s, &env)))
+            .collect();
 
         if let Some(filelist) = cfg.slang.filelist.as_deref() {
-            let absolute = absolutise(&root, filelist);
+            let expanded = expand_env_vars(&filelist.to_string_lossy(), &env);
+            let absolute = absolutise(&root, Path::new(&expanded));
             let mut visited = HashSet::new();
             expand_filelist(
                 &absolute,
@@ -279,6 +304,7 @@ impl ResolvedProject {
                 &mut files,
                 &mut include_dirs,
                 &mut defines,
+                &env,
             )?;
         }
 
@@ -287,6 +313,7 @@ impl ResolvedProject {
             files = files.len(),
             include_dirs = include_dirs.len(),
             defines = defines.len(),
+            env_vars = env.len(),
             top = ?cfg.slang.top,
             debounce_ms = cfg.slang.debounce_ms,
             "resolved project config",
@@ -299,6 +326,7 @@ impl ResolvedProject {
             defines,
             top: cfg.slang.top,
             debounce_ms: cfg.slang.debounce_ms,
+            env,
         })
     }
 }
@@ -356,11 +384,12 @@ fn tokenise_filelist(text: &str) -> Vec<String> {
     tokens
 }
 
-/// Expand `${VAR}` references using the process environment. Unknown
-/// variables expand to the empty string (matches GNU `make`'s behaviour
-/// and what most simulators do). Bare `$VAR` (without braces) is left
-/// alone — too easy to false-positive on a literal `$` in a path.
-fn expand_env_vars(s: &str) -> String {
+/// Expand `${VAR}` references. `env` (config-provided) is checked first;
+/// the process environment is the fallback. Unknown variables expand to the
+/// empty string (matches GNU `make`'s behaviour and what most simulators
+/// do). Bare `$VAR` (without braces) is left alone — too easy to
+/// false-positive on a literal `$` in a path.
+fn expand_env_vars(s: &str, env: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -377,10 +406,12 @@ fn expand_env_vars(s: &str) -> String {
                 name.push(n);
             }
             if closed {
-                if let Ok(value) = std::env::var(&name) {
+                // Config env first, then process env; unknown → empty.
+                if let Some(value) = env.get(&name) {
+                    out.push_str(value);
+                } else if let Ok(value) = std::env::var(&name) {
                     out.push_str(&value);
                 }
-                // Unknown var → empty string.
             } else {
                 // Unterminated `${`; emit it literally so we don't lose data.
                 out.push('$');
@@ -435,6 +466,7 @@ fn expand_filelist(
     files: &mut Vec<PathBuf>,
     include_dirs: &mut Vec<PathBuf>,
     defines: &mut Vec<MacroDefine>,
+    env: &HashMap<String, String>,
 ) -> Result<(), ProjectError> {
     if depth >= FILELIST_MAX_DEPTH {
         return Err(ProjectError::FilelistTooDeep {
@@ -469,12 +501,12 @@ fn expand_filelist(
         let token = &tokens[i];
         if let Some(rest) = token.strip_prefix("+incdir+") {
             for dir in rest.split('+').filter(|s| !s.is_empty()) {
-                include_dirs.push(absolutise(&base, Path::new(&expand_env_vars(dir))));
+                include_dirs.push(absolutise(&base, Path::new(&expand_env_vars(dir, env))));
             }
             i += 1;
         } else if let Some(rest) = token.strip_prefix("+define+") {
             for d in rest.split('+').filter(|s| !s.is_empty()) {
-                defines.push(parse_define(&expand_env_vars(d)));
+                defines.push(parse_define(&expand_env_vars(d, env)));
             }
             i += 1;
         } else if token == "-f" || token == "-F" {
@@ -483,20 +515,20 @@ fn expand_filelist(
                 warn!("trailing `-f` with no filelist path; ignoring");
                 break;
             };
-            let nested = absolutise(&base, Path::new(&expand_env_vars(next)));
-            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines)?;
+            let nested = absolutise(&base, Path::new(&expand_env_vars(next, env)));
+            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines, env)?;
             i += 2;
         } else if let Some(rest) = token.strip_prefix("-f") {
             // One-token form: `-fnested.f`.
-            let nested = absolutise(&base, Path::new(&expand_env_vars(rest)));
-            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines)?;
+            let nested = absolutise(&base, Path::new(&expand_env_vars(rest, env)));
+            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines, env)?;
             i += 1;
         } else if let Some(rest) = token.strip_prefix("-F") {
-            let nested = absolutise(&base, Path::new(&expand_env_vars(rest)));
-            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines)?;
+            let nested = absolutise(&base, Path::new(&expand_env_vars(rest, env)));
+            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines, env)?;
             i += 1;
         } else {
-            files.push(absolutise(&base, Path::new(&expand_env_vars(token))));
+            files.push(absolutise(&base, Path::new(&expand_env_vars(token, env))));
             i += 1;
         }
     }
@@ -524,6 +556,45 @@ mod tests {
         assert!(cfg.slang.defines.is_empty());
         assert!(cfg.slang.top.is_none());
         assert_eq!(cfg.slang.debounce_ms, DEFAULT_DEBOUNCE_MS);
+        assert!(cfg.env.is_empty());
+    }
+
+    /// `[env]` table parses into a key-value map.
+    #[test]
+    fn project_config_env_section_decodes() {
+        let toml_text = r#"
+            [env]
+            MIMIR_SLANG_PATH = "/opt/mimir/sidecar"
+            MY_ROOT = "/work/proj"
+        "#;
+        let cfg: ProjectConfig = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            cfg.env.get("MIMIR_SLANG_PATH").map(|s| s.as_str()),
+            Some("/opt/mimir/sidecar")
+        );
+        assert_eq!(cfg.env.get("MY_ROOT").map(|s| s.as_str()), Some("/work/proj"));
+    }
+
+    /// `[env]` vars expand in filelist tokens (verify via `ResolvedProject::load`).
+    #[test]
+    fn env_vars_expand_in_filelist() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("project.f");
+        fs::write(&f, "+incdir+${MY_INC}\n").unwrap();
+        fs::write(
+            dir.path().join(".mimir.toml"),
+            &format!(
+                "[env]\nMY_INC = \"{}\"\n\n[slang]\nfilelist = \"project.f\"\n",
+                dir.path().join("verif").display()
+            ),
+        )
+        .unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.include_dirs.len(), 1);
+        assert!(resolved.include_dirs[0].ends_with("verif"));
+        assert_eq!(resolved.env.get("MY_INC").map(|s| s.as_str()),
+            Some(dir.path().join("verif").to_str().unwrap()));
     }
 
     /// A fully-populated `[slang]` section round-trips into our types.
@@ -599,16 +670,42 @@ mod tests {
         );
     }
 
-    /// `${VAR}` interpolates from the env; unknown vars become empty.
+    /// `${VAR}` interpolates: config env first, then process env; unknown → empty.
     /// `$BARE` is left alone (we only recognise the braced form).
     #[test]
     fn expand_env_vars_basic() {
+        let empty: HashMap<String, String> = HashMap::new();
         std::env::set_var("MIMIR_TEST_FOO", "hello");
-        assert_eq!(expand_env_vars("${MIMIR_TEST_FOO}/x"), "hello/x");
-        assert_eq!(expand_env_vars("${MIMIR_NOPE_NOPE}/y"), "/y");
-        assert_eq!(expand_env_vars("$LITERAL"), "$LITERAL");
-        assert_eq!(expand_env_vars("plain"), "plain");
+        assert_eq!(expand_env_vars("${MIMIR_TEST_FOO}/x", &empty), "hello/x");
+        assert_eq!(expand_env_vars("${MIMIR_NOPE_NOPE}/y", &empty), "/y");
+        assert_eq!(expand_env_vars("$LITERAL", &empty), "$LITERAL");
+        assert_eq!(expand_env_vars("plain", &empty), "plain");
         std::env::remove_var("MIMIR_TEST_FOO");
+    }
+
+    /// Config env takes precedence over the process environment.
+    #[test]
+    fn expand_env_vars_config_overrides_process() {
+        std::env::set_var("MIMIR_TEST_OVERRIDE", "from_process");
+        let mut env = HashMap::new();
+        env.insert("MIMIR_TEST_OVERRIDE".into(), "from_config".into());
+        assert_eq!(
+            expand_env_vars("${MIMIR_TEST_OVERRIDE}", &env),
+            "from_config"
+        );
+        std::env::remove_var("MIMIR_TEST_OVERRIDE");
+    }
+
+    /// Unknown in config → falls back to process env.
+    #[test]
+    fn expand_env_vars_config_fallback_to_process() {
+        std::env::set_var("MIMIR_TEST_FALLBACK", "from_process");
+        let env: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            expand_env_vars("${MIMIR_TEST_FALLBACK}", &env),
+            "from_process"
+        );
+        std::env::remove_var("MIMIR_TEST_FALLBACK");
     }
 
     /// Single-file expansion: every directive type, paths absolutised
@@ -633,7 +730,7 @@ mod tests {
         let mut incs = Vec::new();
         let mut defs = Vec::new();
         let mut visited = HashSet::new();
-        expand_filelist(&f, 0, &mut visited, &mut files, &mut incs, &mut defs).unwrap();
+        expand_filelist(&f, 0, &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
 
         assert_eq!(files.len(), 2);
         assert!(files[0].ends_with("a.sv"));
@@ -661,7 +758,7 @@ mod tests {
         let mut incs = Vec::new();
         let mut defs = Vec::new();
         let mut visited = HashSet::new();
-        expand_filelist(&outer, 0, &mut visited, &mut files, &mut incs, &mut defs).unwrap();
+        expand_filelist(&outer, 0, &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
 
         // Order is: outer.sv, inner.sv (from nested), after.sv. The nested
         // include lands between the outer files that bracket the `-f`.
@@ -685,7 +782,7 @@ mod tests {
         let mut incs = Vec::new();
         let mut defs = Vec::new();
         let mut visited = HashSet::new();
-        let err = expand_filelist(&f, 0, &mut visited, &mut files, &mut incs, &mut defs)
+        let err = expand_filelist(&f, 0, &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new())
             .expect_err("self-include should fail");
         assert!(matches!(err, ProjectError::FilelistCycle { .. }));
     }
