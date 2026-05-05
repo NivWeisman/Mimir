@@ -331,4 +331,25 @@ mod tests {
     fn matches_prefix_no_match_returns_empty() {
         assert_eq!(matches_prefix("zzz_nonexistent").count(), 0);
     }
+
+    /// Every keyword in KEYWORDS must be returned by `matches_prefix` when
+    /// given that keyword's full name as the prefix. This is the exhaustive
+    /// self-match guard — if any keyword is accidentally missing from the list
+    /// or `matches_prefix` has a bug, exactly that keyword's assertion fails.
+    #[test]
+    fn every_keyword_is_self_matching() {
+        for kw in KEYWORDS {
+            let found = matches_prefix(kw).any(|k| k == *kw);
+            assert!(found, "keyword '{kw}' was not returned by matches_prefix(\"{kw}\")");
+        }
+    }
+
+    /// No duplicate entries in KEYWORDS.
+    #[test]
+    fn keywords_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for kw in KEYWORDS {
+            assert!(seen.insert(*kw), "duplicate keyword in KEYWORDS: '{kw}'");
+        }
+    }
 }
