@@ -14,6 +14,9 @@
 //                         variable of that type).
 //   * "implementation"  — cursor on virtual method → all overrides in
 //                         subclasses; cursor on class → all direct subclasses.
+//   * "complete"        — member-access (obj.) or package-scope (pkg::)
+//                         completion: enumerate fields/methods of LHS type,
+//                         or members of a named package.
 //   * "shutdown"        — reply with null result, exit cleanly.
 //
 // Anything else is replied to with `error.code = -32601` ("method not
@@ -24,6 +27,7 @@
 // shared state between requests today. When that changes (e.g. caching a
 // `Compilation` across edits) we'll fold it into a Server class.
 
+#include <cctype>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -1179,6 +1183,234 @@ static json handle_implementation(const json& params) {
     return result;
 }
 
+// --- complete handler --------------------------------------------------------
+//
+// Member-access completion (`obj.prefix`) and package-scope completion
+// (`pkg::prefix`). Given the cursor position after an optional partial
+// identifier, we:
+//
+//   1. Walk backwards in the raw source bytes to find the trigger char
+//      (`.` for member access, `::` for package scope) and the end of the
+//      LHS expression.
+//   2. For `.`: run TypeAtCursorFinder at the byte just before the `.` to
+//      get the type of the LHS expression, then enumerate its Scope members.
+//   3. For `::`: look up a PackageSymbol by name in the compilation root,
+//      then enumerate its members.
+//
+// Returns `{items: [{label, kind}, ...]}` — same JSON shape as
+// `CompleteResult` on the Rust side.
+
+// Finds the type of the expression at `target_offset` in `target_path`.
+// Operates exactly like TypeDefinitionFinder but records `found_type`
+// (a `const Type*`) instead of a declaration `Symbol`.
+struct TypeAtCursorFinder
+    : public slang::ast::ASTVisitor<TypeAtCursorFinder,
+                                    /*VisitStatements=*/true,
+                                    /*VisitExpressions=*/true> {
+    const slang::SourceManager* sm = nullptr;
+    std::string target_path;
+    uint32_t target_offset = 0;
+    const slang::ast::Type* found_type = nullptr;
+    uint32_t best_width = UINT32_MAX;
+
+    bool covers_target(slang::SourceRange r) const {
+        if (!r.start().valid() || !r.end().valid() || sm == nullptr) return false;
+        auto orig_start = sm->getFullyOriginalLoc(r.start());
+        if (sm->getFullPath(orig_start.buffer()).string() != target_path) return false;
+        return orig_start.offset() <= target_offset
+            && target_offset < sm->getFullyOriginalLoc(r.end()).offset();
+    }
+
+    void record_type(slang::SourceRange r, const slang::ast::Type& t) {
+        auto width = static_cast<uint32_t>(r.end().offset() - r.start().offset());
+        if (width <= best_width) {
+            best_width = width;
+            found_type = &t;
+        }
+    }
+
+    void handle(const slang::ast::NamedValueExpression& e) {
+        if (covers_target(e.sourceRange)) {
+            if (auto* vs = e.symbol.as_if<slang::ast::ValueSymbol>())
+                record_type(e.sourceRange, vs->getType());
+        }
+        visitDefault(e);
+    }
+
+    void handle(const slang::ast::HierarchicalValueExpression& e) {
+        if (covers_target(e.sourceRange)) {
+            if (auto* vs = e.symbol.as_if<slang::ast::ValueSymbol>())
+                record_type(e.sourceRange, vs->getType());
+        }
+        visitDefault(e);
+    }
+
+    void handle(const slang::ast::MemberAccessExpression& e) {
+        if (covers_target(e.sourceRange)) {
+            if (auto* vs = e.member.as_if<slang::ast::ValueSymbol>())
+                record_type(e.sourceRange, vs->getType());
+        }
+        visitDefault(e);
+    }
+
+    void handle(const slang::ast::CallExpression& e) {
+        if (!e.isSystemCall() && covers_target(e.sourceRange)) {
+            if (auto* sub_ptr =
+                    std::get_if<const slang::ast::SubroutineSymbol*>(&e.subroutine);
+                sub_ptr != nullptr && *sub_ptr != nullptr) {
+                record_type(e.sourceRange, (*sub_ptr)->getReturnType());
+            }
+        }
+        visitDefault(e);
+    }
+
+    void handle(std::derived_from<slang::ast::ValueSymbol> auto& v) {
+        if (auto* type_syn = v.getDeclaredType()->getTypeSyntax(); type_syn != nullptr) {
+            auto range = type_syn->sourceRange();
+            if (covers_target(range))
+                record_type(range, v.getDeclaredType()->getType());
+        }
+        visitDefault(v);
+    }
+};
+
+// Case-insensitive prefix check.
+static bool ci_starts_with(std::string_view name, std::string_view prefix) {
+    if (prefix.size() > name.size()) return false;
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(name[i]))
+                != std::tolower(static_cast<unsigned char>(prefix[i])))
+            return false;
+    }
+    return true;
+}
+
+// LSP CompletionItemKind codes used by the sidecar.
+// 2=Method, 5=Field, 6=Variable, 20=EnumMember, 21=Constant.
+static uint8_t member_kind_code(slang::ast::SymbolKind k) {
+    using K = slang::ast::SymbolKind;
+    switch (k) {
+        case K::Subroutine:    return 2;   // Method
+        case K::Field:         return 5;   // Field
+        case K::EnumValue:     return 20;  // EnumMember
+        case K::Parameter:
+        case K::TypeParameter: return 21;  // Constant
+        default:               return 6;   // Variable
+    }
+}
+
+// Enumerate members of `scope` whose names start with `prefix`
+// (case-insensitive) and append them to `items_out`.
+static void enumerate_scope_members(
+    const slang::ast::Scope& scope,
+    std::string_view prefix,
+    json& items_out
+) {
+    for (const auto& member : scope.members()) {
+        if (member.name.empty()) continue;
+        if (!prefix.empty() && !ci_starts_with(member.name, prefix)) continue;
+        json item;
+        item["label"] = std::string(member.name);
+        item["kind"]  = member_kind_code(member.kind);
+        items_out.push_back(std::move(item));
+    }
+}
+
+static json handle_complete(const json& params) {
+    using namespace slang::ast;
+
+    auto built = build_compilation(params);
+    auto& sm   = *built.sm;
+    auto& compilation = *built.compilation;
+
+    json result;
+    result["items"] = json::array();
+
+    const auto target_path = params.value("target_path", std::string{});
+    auto buf_it = built.buffers_by_path.find(target_path);
+    if (buf_it == built.buffers_by_path.end()) {
+        std::cerr << "[mimir-slang-sidecar] complete: target_path not in request: "
+                  << target_path << '\n';
+        return result;
+    }
+
+    json pos_json = params.value("target_position", json::object());
+    uint32_t lsp_line = pos_json.value("line", 0u);
+    uint32_t lsp_char = pos_json.value("character", 0u);
+
+    auto cursor_opt = lsp_position_to_byte_offset(sm, buf_it->second, lsp_line, lsp_char);
+    if (!cursor_opt) return result;
+    uint32_t cursor = static_cast<uint32_t>(*cursor_opt);
+
+    auto text = sm.getSourceText(buf_it->second);
+    std::string kind_str = params.value("kind", std::string{"memberAccess"});
+    std::string prefix   = params.value("prefix", std::string{});
+
+    auto is_ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+    };
+
+    // --- Member access (obj.prefix) ---
+    if (kind_str == "memberAccess") {
+        // Walk backwards past identifier chars (the partial member prefix).
+        uint32_t p = cursor;
+        while (p > 0 && is_ident(text[p - 1])) --p;
+
+        // `text[p-1]` must be '.'; if not, bail.
+        if (p == 0 || text[p - 1] != '.') return result;
+        uint32_t dot_offset = p - 1;
+        if (dot_offset == 0) return result;
+
+        // Run TypeAtCursorFinder just before the '.'.
+        TypeAtCursorFinder finder;
+        finder.sm            = &sm;
+        finder.target_path   = target_path;
+        finder.target_offset = dot_offset - 1;
+        compilation.getRoot().visit(finder);
+
+        if (!finder.found_type) return result;
+
+        auto& canonical = finder.found_type->getCanonicalType();
+        if (auto* scope = canonical.as_if<Scope>()) {
+            enumerate_scope_members(*scope, prefix, result["items"]);
+        }
+        return result;
+    }
+
+    // --- Package scope (pkg::prefix) ---
+    if (kind_str == "packageScope") {
+        // Walk backwards past identifier chars (the partial member prefix).
+        uint32_t p = cursor;
+        while (p > 0 && is_ident(text[p - 1])) --p;
+
+        // Must have '::' immediately before.
+        if (p < 2 || text[p - 1] != ':' || text[p - 2] != ':') return result;
+        uint32_t scope_end = p - 2;
+
+        // Walk backwards to extract the LHS name (package or class name).
+        uint32_t name_start = scope_end;
+        auto is_ident_no_dollar = [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+        };
+        while (name_start > 0 && is_ident_no_dollar(text[name_start - 1])) --name_start;
+        if (name_start >= scope_end) return result;  // empty name
+
+        std::string_view lhs_name = text.substr(name_start, scope_end - name_start);
+
+        // Search for a Package or ClassType with this name in the compilation root.
+        for (const auto& member : compilation.getRoot().members()) {
+            if (member.name != lhs_name) continue;
+            if (auto* scope = member.as_if<Scope>()) {
+                enumerate_scope_members(*scope, prefix, result["items"]);
+                break;
+            }
+        }
+        return result;
+    }
+
+    return result;
+}
+
 // --- main loop -----------------------------------------------------------
 
 int main() {
@@ -1213,6 +1445,8 @@ int main() {
                 resp["result"] = handle_type_definition(req.value("params", json::object()));
             } else if (method == "implementation") {
                 resp["result"] = handle_implementation(req.value("params", json::object()));
+            } else if (method == "complete") {
+                resp["result"] = handle_complete(req.value("params", json::object()));
             } else if (method == "shutdown") {
                 // Acknowledge, flush, exit. Keeps the client from seeing
                 // a "Closed" before its shutdown response lands.

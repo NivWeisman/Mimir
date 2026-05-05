@@ -43,8 +43,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, instrument, warn};
 
 use crate::protocol::{
-    methods, DefinitionParams, DefinitionResult, ElaborateParams, ElaborateResult,
-    ImplementationParams, ImplementationResult, Request, Response, ResponseError,
+    methods, CompleteParams, CompleteResult, DefinitionParams, DefinitionResult, ElaborateParams,
+    ElaborateResult, ImplementationParams, ImplementationResult, Request, Response, ResponseError,
     TypeDefinitionParams, TypeDefinitionResult,
 };
 
@@ -249,6 +249,14 @@ where
     ) -> Result<ImplementationResult, ConnectionError> {
         self.request(methods::IMPLEMENTATION, params).await
     }
+
+    /// Convenience wrapper for the [`methods::COMPLETE`] method.
+    pub async fn complete(
+        &mut self,
+        params: &CompleteParams,
+    ) -> Result<CompleteResult, ConnectionError> {
+        self.request(methods::COMPLETE, params).await
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -373,6 +381,21 @@ impl Client {
     ) -> Result<ImplementationResult, ClientError> {
         let mut conn = self.connection.lock().await;
         Ok(conn.implementation(params).await?)
+    }
+
+    /// Run a `complete` request against the sidecar.
+    ///
+    /// Returns member-access (`obj.`) or package-scope (`pkg::`) completion
+    /// candidates for the expression left of the cursor. An empty `items`
+    /// vector means the sidecar could not resolve the LHS type or the type
+    /// has no members matching the prefix — the caller should fall through
+    /// to syntax-only candidates.
+    pub async fn complete(
+        &self,
+        params: &CompleteParams,
+    ) -> Result<CompleteResult, ClientError> {
+        let mut conn = self.connection.lock().await;
+        Ok(conn.complete(params).await?)
     }
 
     /// Send the `shutdown` request, then wait for the child to exit.

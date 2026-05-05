@@ -53,6 +53,11 @@ pub mod methods {
     /// Params: [`super::ImplementationParams`]; result: [`super::ImplementationResult`].
     pub const IMPLEMENTATION: &str = "implementation";
 
+    /// Enumerate completion candidates for the expression to the left of the
+    /// cursor (`obj.` member access or `pkg::` package-scope access).
+    /// Params: [`super::CompleteParams`]; result: [`super::CompleteResult`].
+    pub const COMPLETE: &str = "complete";
+
     /// Politely ask the sidecar to exit. No params, no result.
     /// The client should still wait on the child after sending this.
     pub const SHUTDOWN: &str = "shutdown";
@@ -356,6 +361,83 @@ pub struct ImplementationLocation {
     pub path: String,
     /// LSP-coordinate range of the implementation's name token.
     pub range: Range,
+}
+
+// --------------------------------------------------------------------------
+// `complete` method
+// --------------------------------------------------------------------------
+
+/// What kind of completion context triggered the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompletionRequestKind {
+    /// Plain identifier at the cursor — no trigger character before it.
+    /// The sidecar returns an empty list; syntax candidates are handled
+    /// by the Rust side without calling slang.
+    Identifier,
+    /// `obj.` or `obj.prefix` — enumerate fields and methods of the LHS type.
+    MemberAccess,
+    /// `pkg::` or `pkg::prefix` — enumerate members of a named package
+    /// (or static members of a class).
+    PackageScope,
+}
+
+/// Params for [`methods::COMPLETE`].
+///
+/// Shares the `files` / `include_dirs` / `defines` / `top` / `target_path` /
+/// `target_position` shape with [`DefinitionParams`]. The extra `kind` and
+/// optional `prefix` tell the sidecar what category of candidates to enumerate
+/// and let it pre-filter by the already-typed identifier prefix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteParams {
+    /// Same shape as [`DefinitionParams::files`].
+    pub files: Vec<SourceFile>,
+    /// `+incdir+` paths.
+    #[serde(default)]
+    pub include_dirs: Vec<String>,
+    /// `+define+` macros.
+    #[serde(default)]
+    pub defines: Vec<MacroDefine>,
+    /// Optional top module/program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<String>,
+    /// Filesystem path of the file containing the cursor.
+    pub target_path: String,
+    /// LSP-coordinate cursor position (zero-based line, UTF-16 character).
+    /// The sidecar backs up from this position to find the trigger character
+    /// (`.` or `::`) and the LHS expression.
+    pub target_position: Position,
+    /// What kind of completion the cursor context calls for.
+    pub kind: CompletionRequestKind,
+    /// The partial identifier typed after the trigger character, if any.
+    /// Absent or empty means "return all members". The sidecar applies
+    /// a case-insensitive prefix filter before returning items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+/// Result for [`methods::COMPLETE`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompleteResult {
+    /// Completion candidates.  Empty when no type was resolved at the LHS,
+    /// the type has no members, or no members matched the prefix filter.
+    #[serde(default)]
+    pub items: Vec<SlangCompletionItem>,
+}
+
+/// One completion candidate returned by the sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlangCompletionItem {
+    /// The identifier to insert.
+    pub label: String,
+    /// LSP `CompletionItemKind` numeric code.
+    /// Values the sidecar emits today: 2 = Method, 5 = Field, 6 = Variable,
+    /// 20 = EnumMember, 21 = Constant.
+    pub kind: u8,
+    /// Optional extra text shown alongside the label in the completion popup
+    /// (e.g. the member's declared type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 // --------------------------------------------------------------------------
@@ -722,5 +804,109 @@ mod tests {
     fn implementation_result_empty_roundtrip() {
         let from_empty: ImplementationResult = serde_json::from_str("{}").unwrap();
         assert!(from_empty.locations.is_empty());
+    }
+
+    /// `CompletionRequestKind` serialises as camelCase strings.
+    #[test]
+    fn completion_request_kind_serialises_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&CompletionRequestKind::MemberAccess).unwrap(),
+            "\"memberAccess\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&CompletionRequestKind::PackageScope).unwrap(),
+            "\"packageScope\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&CompletionRequestKind::Identifier).unwrap(),
+            "\"identifier\"",
+        );
+    }
+
+    /// `CompleteParams` round-trips with all fields present.
+    #[test]
+    fn complete_params_roundtrip() {
+        let p = CompleteParams {
+            files: vec![SourceFile {
+                path: "/proj/a.sv".into(),
+                text: "class c; endclass".into(),
+                is_compilation_unit: true,
+            }],
+            include_dirs: vec!["/proj/inc".into()],
+            defines: vec![],
+            top: None,
+            target_path: "/proj/a.sv".into(),
+            target_position: Position::new(0, 8),
+            kind: CompletionRequestKind::MemberAccess,
+            prefix: Some("run".into()),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: CompleteParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_path, "/proj/a.sv");
+        assert_eq!(back.target_position.character, 8);
+        assert_eq!(back.kind, CompletionRequestKind::MemberAccess);
+        assert_eq!(back.prefix.as_deref(), Some("run"));
+    }
+
+    /// `CompleteParams` defaults: omitted optional fields decode cleanly.
+    #[test]
+    fn complete_params_defaults_on_missing_fields() {
+        let json = r#"{
+            "files": [],
+            "target_path": "a.sv",
+            "target_position": {"line": 0, "character": 5},
+            "kind": "memberAccess"
+        }"#;
+        let p: CompleteParams = serde_json::from_str(json).unwrap();
+        assert!(p.include_dirs.is_empty());
+        assert!(p.defines.is_empty());
+        assert!(p.top.is_none());
+        assert!(p.prefix.is_none());
+    }
+
+    /// `CompleteResult` round-trips with items.
+    #[test]
+    fn complete_result_roundtrip() {
+        let r = CompleteResult {
+            items: vec![
+                SlangCompletionItem {
+                    label: "run_phase".into(),
+                    kind: 2,
+                    detail: Some("function void run_phase(uvm_phase phase)".into()),
+                },
+                SlangCompletionItem {
+                    label: "m_data".into(),
+                    kind: 5,
+                    detail: None,
+                },
+            ],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: CompleteResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.items.len(), 2);
+        assert_eq!(back.items[0].label, "run_phase");
+        assert_eq!(back.items[0].kind, 2);
+        assert!(back.items[0].detail.is_some());
+        assert_eq!(back.items[1].label, "m_data");
+        assert!(back.items[1].detail.is_none());
+    }
+
+    /// `CompleteResult` with no items decodes from `{}`.
+    #[test]
+    fn complete_result_empty_roundtrip() {
+        let from_empty: CompleteResult = serde_json::from_str("{}").unwrap();
+        assert!(from_empty.items.is_empty());
+    }
+
+    /// `SlangCompletionItem` omits `detail` when absent (keeps wire compact).
+    #[test]
+    fn slang_completion_item_omits_null_detail() {
+        let item = SlangCompletionItem {
+            label: "foo".into(),
+            kind: 6,
+            detail: None,
+        };
+        let s = serde_json::to_string(&item).unwrap();
+        assert!(!s.contains("detail"), "expected `detail` to be omitted: {s}");
     }
 }

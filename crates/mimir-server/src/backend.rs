@@ -33,9 +33,11 @@ use std::time::Duration;
 
 use mimir_core::{Position as MPosition, Range as MRange, TextDocument};
 use mimir_slang::{
-    Client as SlangClient, DefinitionLocation as SlangDefinitionLocation,
-    DefinitionParams as SlangDefinitionParams, Diagnostic as SlangDiagnostic, ElaborateParams,
-    ElaborateResult, ImplementationLocation as SlangImplementationLocation,
+    Client as SlangClient, CompleteParams as SlangCompleteParams,
+    CompletionRequestKind as SlangCompletionRequestKind,
+    DefinitionLocation as SlangDefinitionLocation, DefinitionParams as SlangDefinitionParams,
+    Diagnostic as SlangDiagnostic, ElaborateParams, ElaborateResult,
+    ImplementationLocation as SlangImplementationLocation,
     ImplementationParams as SlangImplementationParams, Severity as SlangSeverity, SourceFile,
     TypeDefinitionLocation as SlangTypeDefinitionLocation,
     TypeDefinitionParams as SlangTypeDefinitionParams,
@@ -508,6 +510,83 @@ impl Backend {
         Some(GotoDefinitionResponse::Array(locations))
     }
 
+    /// Try slang-backed member-access or package-scope completion.
+    ///
+    /// Returns `Some` when:
+    /// * slang is configured + project loaded,
+    /// * the line has a `.` or `::` trigger before the cursor,
+    /// * the sidecar successfully resolves the LHS type or package.
+    ///
+    /// Returns `None` otherwise — the caller falls back to `syntax_completion`.
+    async fn try_slang_member_completion(
+        &self,
+        uri: &Url,
+        pos: MPosition,
+    ) -> Option<CompletionResponse> {
+        let slang = self.slang.clone()?;
+        let project = self.project.read().await.clone()?;
+
+        let text = {
+            let docs = self.documents.read().await;
+            docs.get(uri)?.document.text()
+        };
+        let rope = Rope::from_str(&text);
+
+        let (is_pkg_scope, member_prefix) = detect_member_access(&rope, pos)?;
+        let kind = if is_pkg_scope {
+            SlangCompletionRequestKind::PackageScope
+        } else {
+            SlangCompletionRequestKind::MemberAccess
+        };
+
+        let (def_params, _) =
+            build_definition_params(&project, &self.documents, uri, pos).await?;
+        let params = SlangCompleteParams {
+            files: def_params.files,
+            include_dirs: def_params.include_dirs,
+            defines: def_params.defines,
+            top: def_params.top,
+            target_path: def_params.target_path,
+            target_position: def_params.target_position,
+            kind,
+            prefix: if member_prefix.is_empty() {
+                None
+            } else {
+                Some(member_prefix.clone())
+            },
+        };
+
+        match slang.complete(&params).await {
+            Ok(result) if !result.items.is_empty() => {
+                let prefix_lower = member_prefix.to_ascii_lowercase();
+                let items: Vec<CompletionItem> = result
+                    .items
+                    .into_iter()
+                    .filter(|it| {
+                        prefix_lower.is_empty()
+                            || it.label.to_ascii_lowercase().starts_with(&prefix_lower)
+                    })
+                    .map(|it| CompletionItem {
+                        label: it.label,
+                        kind: Some(slang_completion_kind_to_lsp(it.kind)),
+                        detail: it.detail,
+                        ..Default::default()
+                    })
+                    .collect();
+                debug!(count = items.len(), "slang member completion");
+                Some(CompletionResponse::Array(items))
+            }
+            Ok(_) => {
+                debug!("slang member completion: no items; falling back to syntax");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "slang complete transport error; falling back to syntax");
+                None
+            }
+        }
+    }
+
     /// Syntax-only completion for `uri` at `pos`.
     ///
     /// Merges three candidate sources (in priority order):
@@ -900,6 +979,12 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
+
+        // Slang-backed member access takes priority; falls back to syntax when
+        // slang isn't configured, no trigger is found, or the LHS can't be resolved.
+        if let Some(resp) = self.try_slang_member_completion(&uri, target).await {
+            return Ok(Some(resp));
+        }
         Ok(self.syntax_completion(&uri, target).await)
     }
 }
@@ -1539,6 +1624,70 @@ fn symbol_kind_to_completion_kind(kind: MSymbolKind) -> CompletionItemKind {
         MSymbolKind::Property => CompletionItemKind::PROPERTY,
         MSymbolKind::Sequence => CompletionItemKind::VALUE,
         MSymbolKind::Covergroup => CompletionItemKind::STRUCT,
+    }
+}
+
+/// Scan the rope line up to `pos` for a member-access or package-scope trigger.
+///
+/// Returns `Some((is_package_scope, prefix_after_trigger))` when a `.` or
+/// `::` trigger is found immediately before any partial identifier at the
+/// cursor. `is_package_scope` is `true` for `::`, `false` for `.`.
+/// The returned prefix is the partial identifier typed after the trigger
+/// (may be empty when the cursor is immediately after the trigger character).
+/// Returns `None` when no trigger is found.
+fn detect_member_access(rope: &Rope, pos: MPosition) -> Option<(bool, String)> {
+    if (pos.line as usize) >= rope.len_lines() {
+        return None;
+    }
+    let line = rope.line(pos.line as usize);
+
+    // Build the line text up to the cursor (respecting UTF-16 character count).
+    let mut buf = String::new();
+    let mut utf16: u32 = 0;
+    for ch in line.chars() {
+        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
+            break;
+        }
+        buf.push(ch);
+        utf16 += ch.len_utf16() as u32;
+    }
+
+    let chars: Vec<char> = buf.chars().collect();
+    let mut i = chars.len();
+
+    // Skip trailing identifier chars (the partial member name being typed).
+    while i > 0
+        && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$')
+    {
+        i -= 1;
+    }
+    let prefix: String = chars[i..].iter().collect();
+
+    // Check for `.` trigger.
+    if i > 0 && chars[i - 1] == '.' {
+        return Some((false, prefix));
+    }
+    // Check for `::` trigger.
+    if i >= 2 && chars[i - 2] == ':' && chars[i - 1] == ':' {
+        return Some((true, prefix));
+    }
+
+    None
+}
+
+/// Map a sidecar numeric `kind` code to an LSP [`CompletionItemKind`].
+///
+/// The sidecar uses a small numeric vocabulary that mirrors LSP's enum but
+/// doesn't depend on the Rust `lsp_types` crate. This is the only place we
+/// decode those numbers back into the typed enum.
+fn slang_completion_kind_to_lsp(kind: u8) -> CompletionItemKind {
+    match kind {
+        2 => CompletionItemKind::METHOD,
+        5 => CompletionItemKind::FIELD,
+        6 => CompletionItemKind::VARIABLE,
+        20 => CompletionItemKind::ENUM_MEMBER,
+        21 => CompletionItemKind::CONSTANT,
+        _ => CompletionItemKind::VARIABLE,
     }
 }
 
@@ -2596,5 +2745,91 @@ mod tests {
             symbol_kind_to_completion_kind(MSymbolKind::Parameter),
             CompletionItemKind::CONSTANT,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // detect_member_access
+    // ------------------------------------------------------------------
+
+    fn rope_from(s: &str) -> ropey::Rope {
+        ropey::Rope::from_str(s)
+    }
+
+    /// Cursor immediately after `.` → Some((false, "")).
+    #[test]
+    fn detect_member_access_dot_empty_prefix() {
+        let rope = rope_from("my_obj.");
+        let pos = MPosition::new(0, 7); // right after '.'
+        let result = detect_member_access(&rope, pos);
+        assert_eq!(result, Some((false, String::new())));
+    }
+
+    /// Cursor mid-identifier after `.` → returns dot trigger + prefix.
+    #[test]
+    fn detect_member_access_dot_with_prefix() {
+        let rope = rope_from("my_obj.run_p");
+        let pos = MPosition::new(0, 12); // end of "run_p"
+        let result = detect_member_access(&rope, pos);
+        assert_eq!(result, Some((false, "run_p".to_string())));
+    }
+
+    /// Cursor immediately after `::` → Some((true, "")).
+    #[test]
+    fn detect_member_access_scope_empty_prefix() {
+        let rope = rope_from("my_pkg::");
+        let pos = MPosition::new(0, 8); // right after '::'
+        let result = detect_member_access(&rope, pos);
+        assert_eq!(result, Some((true, String::new())));
+    }
+
+    /// Cursor mid-identifier after `::` → returns scope trigger + prefix.
+    #[test]
+    fn detect_member_access_scope_with_prefix() {
+        let rope = rope_from("uvm_pkg::uvm_seq");
+        let pos = MPosition::new(0, 16); // end of "uvm_seq"
+        let result = detect_member_access(&rope, pos);
+        assert_eq!(result, Some((true, "uvm_seq".to_string())));
+    }
+
+    /// Plain identifier with no trigger → `None`.
+    #[test]
+    fn detect_member_access_no_trigger() {
+        let rope = rope_from("my_var");
+        let pos = MPosition::new(0, 6);
+        assert!(detect_member_access(&rope, pos).is_none());
+    }
+
+    /// Cursor past the end of an out-of-bounds line → `None`.
+    #[test]
+    fn detect_member_access_out_of_bounds_line() {
+        let rope = rope_from("x.y");
+        let pos = MPosition::new(99, 0); // line 99 doesn't exist
+        assert!(detect_member_access(&rope, pos).is_none());
+    }
+
+    /// Only `:` (single colon, not `::`) is not a trigger.
+    #[test]
+    fn detect_member_access_single_colon_not_a_trigger() {
+        let rope = rope_from("foo:bar");
+        let pos = MPosition::new(0, 7);
+        assert!(detect_member_access(&rope, pos).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // slang_completion_kind_to_lsp
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn slang_completion_kind_to_lsp_known_codes() {
+        assert_eq!(slang_completion_kind_to_lsp(2), CompletionItemKind::METHOD);
+        assert_eq!(slang_completion_kind_to_lsp(5), CompletionItemKind::FIELD);
+        assert_eq!(slang_completion_kind_to_lsp(6), CompletionItemKind::VARIABLE);
+        assert_eq!(slang_completion_kind_to_lsp(20), CompletionItemKind::ENUM_MEMBER);
+        assert_eq!(slang_completion_kind_to_lsp(21), CompletionItemKind::CONSTANT);
+    }
+
+    #[test]
+    fn slang_completion_kind_to_lsp_unknown_falls_back_to_variable() {
+        assert_eq!(slang_completion_kind_to_lsp(99), CompletionItemKind::VARIABLE);
     }
 }

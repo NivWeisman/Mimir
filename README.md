@@ -414,7 +414,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 - ⬜ `textDocument/semanticTokens` ("LSP syntax highlighting")
 - ⬜ `textDocument/hover`
-- 🚧 `textDocument/completion`
+- 🚧 `textDocument/completion` — stages 1–5 done: syntax candidates (same-file symbols, workspace-wide symbols, SV keywords) always on; slang-backed `obj.` member-access and `pkg::` package-scope completion when `MIMIR_SLANG_PATH` is configured. Stages 6–7 (scope-aware identifier + macro completion) pending.
 - ⬜ `textDocument/signatureHelp`
 - ✅ `textDocument/documentSymbol` (flat, from the tree-sitter symbol index)
 - ⬜ `workspace/symbol`
