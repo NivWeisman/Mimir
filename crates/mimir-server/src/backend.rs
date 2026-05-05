@@ -587,10 +587,204 @@ impl Backend {
         }
     }
 
+    /// Try slang-backed scope-aware identifier completion.
+    ///
+    /// Called when there is no `.` / `::` / `` ` `` trigger before the cursor
+    /// — i.e. the user is typing a plain identifier. The sidecar walks the
+    /// enclosing scope chain and returns all visiblesymbols, inner scopes
+    /// shadowing outer ones.
+    ///
+    /// Returns `Some` when slang resolves at least one candidate. Returns
+    /// `None` on transport error, empty result, or no slang configured —
+    /// the caller falls through to `syntax_completion`.
+    async fn try_slang_identifier_completion(
+        &self,
+        uri: &Url,
+        pos: MPosition,
+    ) -> Option<CompletionResponse> {
+        let slang = self.slang.clone()?;
+        let project = self.project.read().await.clone()?;
+
+        let text = {
+            let docs = self.documents.read().await;
+            docs.get(uri)?.document.text()
+        };
+        let rope = Rope::from_str(&text);
+        let prefix = mimir_syntax::symbols::prefix_at(&rope, pos).unwrap_or_default();
+
+        let (def_params, _) =
+            build_definition_params(&project, &self.documents, uri, pos).await?;
+        let params = SlangCompleteParams {
+            files: def_params.files,
+            include_dirs: def_params.include_dirs,
+            defines: def_params.defines,
+            top: def_params.top,
+            target_path: def_params.target_path,
+            target_position: def_params.target_position,
+            kind: SlangCompletionRequestKind::Identifier,
+            prefix: if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix.to_owned())
+            },
+        };
+
+        match slang.complete(&params).await {
+            Ok(result) if !result.items.is_empty() => {
+                let items: Vec<CompletionItem> = result
+                    .items
+                    .into_iter()
+                    .map(|it| CompletionItem {
+                        label: it.label,
+                        kind: Some(slang_completion_kind_to_lsp(it.kind)),
+                        detail: it.detail,
+                        ..Default::default()
+                    })
+                    .collect();
+                debug!(count = items.len(), "slang identifier completion");
+                Some(CompletionResponse::Array(items))
+            }
+            Ok(_) => {
+                debug!("slang identifier completion: no items; falling back to syntax");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "slang identifier complete error; falling back to syntax");
+                None
+            }
+        }
+    }
+
+    /// Try slang-backed macro-name completion.
+    ///
+    /// Called when the cursor is right after a `` ` `` trigger character.
+    /// The sidecar returns all `` `define `` names visible in the compilation
+    /// unit; the prefix (if any) is applied server-side.
+    ///
+    /// Returns `None` on transport error or no slang configured — the caller
+    /// falls through to `syntax_macro_completion`.
+    async fn try_slang_macro_completion(
+        &self,
+        uri: &Url,
+        pos: MPosition,
+        macro_prefix: &str,
+    ) -> Option<CompletionResponse> {
+        let slang = self.slang.clone()?;
+        let project = self.project.read().await.clone()?;
+
+        let (def_params, _) =
+            build_definition_params(&project, &self.documents, uri, pos).await?;
+        let params = SlangCompleteParams {
+            files: def_params.files,
+            include_dirs: def_params.include_dirs,
+            defines: def_params.defines,
+            top: def_params.top,
+            target_path: def_params.target_path,
+            target_position: def_params.target_position,
+            kind: SlangCompletionRequestKind::Macro,
+            prefix: if macro_prefix.is_empty() {
+                None
+            } else {
+                Some(macro_prefix.to_owned())
+            },
+        };
+
+        match slang.complete(&params).await {
+            Ok(result) => {
+                let items: Vec<CompletionItem> = result
+                    .items
+                    .into_iter()
+                    .map(|it| CompletionItem {
+                        label: it.label,
+                        kind: Some(slang_completion_kind_to_lsp(it.kind)),
+                        detail: it.detail,
+                        ..Default::default()
+                    })
+                    .collect();
+                debug!(count = items.len(), "slang macro completion");
+                Some(CompletionResponse::Array(items))
+            }
+            Err(e) => {
+                warn!(error = %e, "slang macro complete error; falling back to syntax");
+                None
+            }
+        }
+    }
+
+    /// Syntax-only macro completion for `uri` at `pos`.
+    ///
+    /// Fallback when slang is not configured. Gathers `` `define `` symbols
+    /// from the workspace index (indexed via `SymbolKind::Macro`) filtered
+    /// by `macro_prefix`.
+    async fn syntax_macro_completion(
+        &self,
+        uri: &Url,
+        macro_prefix: &str,
+    ) -> Option<CompletionResponse> {
+        const MAX_ITEMS: usize = 200;
+        let prefix_lower = macro_prefix.to_ascii_lowercase();
+
+        // Same-file macros first.
+        let same_file_macros: Vec<String> = {
+            let docs = self.documents.read().await;
+            let state = docs.get(uri)?;
+            state
+                .index
+                .iter()
+                .filter(|s| s.kind == MSymbolKind::Macro)
+                .filter(|s| s.name.to_ascii_lowercase().starts_with(&prefix_lower))
+                .map(|s| s.name.clone())
+                .collect()
+        };
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut items: Vec<CompletionItem> = Vec::new();
+
+        for name in same_file_macros {
+            if items.len() >= MAX_ITEMS {
+                break;
+            }
+            seen.insert(name.clone());
+            items.push(CompletionItem {
+                label: name,
+                kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some("`define".to_owned()),
+                ..Default::default()
+            });
+        }
+
+        // Cross-file macros from workspace index.
+        let workspace_macros: Vec<String> = {
+            let wi = self.workspace_index.read().await;
+            wi.lookup_prefix(macro_prefix, MAX_ITEMS)
+                .into_iter()
+                .filter(|e| e.symbol.kind == MSymbolKind::Macro)
+                .filter(|e| !seen.contains(&e.symbol.name))
+                .map(|e| e.symbol.name.clone())
+                .collect()
+        };
+        for name in workspace_macros {
+            if items.len() >= MAX_ITEMS {
+                break;
+            }
+            seen.insert(name.clone());
+            items.push(CompletionItem {
+                label: name,
+                kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some("`define".to_owned()),
+                ..Default::default()
+            });
+        }
+
+        debug!(count = items.len(), prefix = %macro_prefix, "syntax macro completion");
+        Some(CompletionResponse::Array(items))
+    }
+
     /// Syntax-only completion for `uri` at `pos`.
     ///
     /// Merges three candidate sources (in priority order):
-    /// 1. Same-file symbol index — shown without `detail`.
+    /// 1. Same-file symbol index — shown without `detail`. Macros are excluded
+    ///    (those come through the dedicated macro-completion path).
     /// 2. Workspace index — cross-file symbols with filename as `detail`.
     /// 3. SV keywords — appended last with `CompletionItemKind::KEYWORD`.
     ///
@@ -618,9 +812,13 @@ impl Backend {
         let mut items: Vec<CompletionItem> = Vec::new();
 
         // --- 1. Same-file symbols (no detail, shown first) ------------------
+        // Macros are excluded — they're served by the dedicated macro path.
         for sym in &same_file_index {
             if items.len() >= MAX_ITEMS {
                 break;
+            }
+            if sym.kind == MSymbolKind::Macro {
+                continue;
             }
             if sym.name.to_ascii_lowercase().starts_with(&prefix_lower) {
                 seen.insert((sym.name.clone(), uri.clone()));
@@ -633,10 +831,12 @@ impl Backend {
         }
 
         // --- 2. Workspace symbols (cross-file, with filename as detail) ------
+        // Macros excluded — served by the dedicated macro path.
         let workspace_hits: Vec<(Url, Symbol)> = {
             let wi = self.workspace_index.read().await;
             wi.lookup_prefix(&prefix, MAX_ITEMS)
                 .into_iter()
+                .filter(|e| e.symbol.kind != MSymbolKind::Macro)
                 .map(|e| (e.url.clone(), e.symbol.clone()))
                 .collect()
         };
@@ -980,9 +1180,34 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
 
-        // Slang-backed member access takes priority; falls back to syntax when
-        // slang isn't configured, no trigger is found, or the LHS can't be resolved.
+        // Route 1: `` ` `` trigger — macro-name completion.
+        // The text says e.g. `` `MY_ ``, we detect the backtick and prefix.
+        let text = {
+            let docs = self.documents.read().await;
+            docs.get(&uri).map(|s| s.document.text())
+        };
+        if let Some(text) = text {
+            let rope = Rope::from_str(&text);
+            if let Some(macro_prefix) = detect_macro_trigger(&rope, target) {
+                if let Some(resp) =
+                    self.try_slang_macro_completion(&uri, target, &macro_prefix).await
+                {
+                    return Ok(Some(resp));
+                }
+                // Syntax fallback: `define symbols from the index.
+                return Ok(self.syntax_macro_completion(&uri, &macro_prefix).await);
+            }
+        }
+
+        // Route 2: `.` or `::` trigger — member / package-scope completion.
+        // Slang-only; no syntax fallback (without types, guessing is unhelpful).
         if let Some(resp) = self.try_slang_member_completion(&uri, target).await {
+            return Ok(Some(resp));
+        }
+
+        // Route 3: plain identifier — scope-aware completion.
+        // Slang first (scope-correct); falls back to syntax+workspace+keywords.
+        if let Some(resp) = self.try_slang_identifier_completion(&uri, target).await {
             return Ok(Some(resp));
         }
         Ok(self.syntax_completion(&uri, target).await)
@@ -1590,6 +1815,7 @@ fn symbol_kind_to_lsp(kind: MSymbolKind) -> SymbolKind {
         MSymbolKind::Variable => SymbolKind::VARIABLE,
         MSymbolKind::Port => SymbolKind::FIELD,
         MSymbolKind::EnumMember => SymbolKind::ENUM_MEMBER,
+        MSymbolKind::Macro => SymbolKind::CONSTANT,
         // SV `constraint` blocks have no direct LSP kind; `OBJECT` is
         // the same neutral fallback we use for SVA properties /
         // covergroups.
@@ -1624,6 +1850,7 @@ fn symbol_kind_to_completion_kind(kind: MSymbolKind) -> CompletionItemKind {
         MSymbolKind::Property => CompletionItemKind::PROPERTY,
         MSymbolKind::Sequence => CompletionItemKind::VALUE,
         MSymbolKind::Covergroup => CompletionItemKind::STRUCT,
+        MSymbolKind::Macro => CompletionItemKind::CONSTANT,
     }
 }
 
@@ -1670,6 +1897,50 @@ fn detect_member_access(rope: &Rope, pos: MPosition) -> Option<(bool, String)> {
     // Check for `::` trigger.
     if i >= 2 && chars[i - 2] == ':' && chars[i - 1] == ':' {
         return Some((true, prefix));
+    }
+
+    None
+}
+
+/// Detect a `` ` `` macro trigger before the cursor.
+///
+/// Returns `Some(prefix)` when the identifier (or empty string) immediately
+/// before the cursor is preceded by a backtick. For example:
+///   `` `MY_ `` at column 5 → `Some("MY_")`
+///   `` `     `` at column 1 → `Some("")`
+///
+/// Returns `None` for any other context (including `.` or `::`).
+fn detect_macro_trigger(rope: &Rope, pos: MPosition) -> Option<String> {
+    if (pos.line as usize) >= rope.len_lines() {
+        return None;
+    }
+    let line = rope.line(pos.line as usize);
+
+    // Build the line text up to the cursor (UTF-16 aware).
+    let mut buf = String::new();
+    let mut utf16: u32 = 0;
+    for ch in line.chars() {
+        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
+            break;
+        }
+        buf.push(ch);
+        utf16 += ch.len_utf16() as u32;
+    }
+
+    let chars: Vec<char> = buf.chars().collect();
+    let mut i = chars.len();
+
+    // Skip trailing identifier chars (the partial macro name being typed).
+    while i > 0
+        && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')
+    {
+        i -= 1;
+    }
+    let prefix: String = chars[i..].iter().collect();
+
+    // The character immediately before the identifier must be a backtick.
+    if i > 0 && chars[i - 1] == '`' {
+        return Some(prefix);
     }
 
     None
@@ -2357,6 +2628,7 @@ mod tests {
             (MSymbolKind::Variable, SymbolKind::VARIABLE),
             (MSymbolKind::Port, SymbolKind::FIELD),
             (MSymbolKind::EnumMember, SymbolKind::ENUM_MEMBER),
+            (MSymbolKind::Macro, SymbolKind::CONSTANT),
             (MSymbolKind::Property, SymbolKind::OBJECT),
             (MSymbolKind::Sequence, SymbolKind::OBJECT),
             (MSymbolKind::Covergroup, SymbolKind::OBJECT),
@@ -2723,10 +2995,21 @@ mod tests {
             MSymbolKind::Property,
             MSymbolKind::Sequence,
             MSymbolKind::Covergroup,
+            MSymbolKind::Macro,
         ];
         for kind in all {
             let _ = symbol_kind_to_completion_kind(kind);
         }
+    }
+
+    /// `Macro` → `CONSTANT` in both LSP-symbol and completion-item mappings.
+    #[test]
+    fn macro_symbol_kind_maps_to_constant() {
+        assert_eq!(
+            symbol_kind_to_completion_kind(MSymbolKind::Macro),
+            CompletionItemKind::CONSTANT,
+        );
+        assert_eq!(symbol_kind_to_lsp(MSymbolKind::Macro), SymbolKind::CONSTANT);
     }
 
     /// `Class` maps to `CLASS`, `Method` to `METHOD` — spot-check the
@@ -2813,6 +3096,58 @@ mod tests {
         let rope = rope_from("foo:bar");
         let pos = MPosition::new(0, 7);
         assert!(detect_member_access(&rope, pos).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // detect_macro_trigger
+    // ------------------------------------------------------------------
+
+    /// Cursor immediately after `` ` `` → `Some("")`.
+    #[test]
+    fn detect_macro_trigger_empty_prefix() {
+        let rope = rope_from("`");
+        let pos = MPosition::new(0, 1); // right after backtick
+        assert_eq!(detect_macro_trigger(&rope, pos), Some(String::new()));
+    }
+
+    /// Cursor after `` `MY_ `` → `Some("MY_")`.
+    #[test]
+    fn detect_macro_trigger_with_prefix() {
+        let rope = rope_from("`MY_MACRO");
+        let pos = MPosition::new(0, 4); // after "MY_"
+        assert_eq!(detect_macro_trigger(&rope, pos), Some("MY_".to_string()));
+    }
+
+    /// Full macro name typed → prefix is the full name.
+    #[test]
+    fn detect_macro_trigger_full_name() {
+        let rope = rope_from("`UVM_INFO");
+        let pos = MPosition::new(0, 9); // end of "UVM_INFO"
+        assert_eq!(detect_macro_trigger(&rope, pos), Some("UVM_INFO".to_string()));
+    }
+
+    /// No backtick — plain identifier → `None`.
+    #[test]
+    fn detect_macro_trigger_no_backtick() {
+        let rope = rope_from("my_signal");
+        let pos = MPosition::new(0, 9);
+        assert!(detect_macro_trigger(&rope, pos).is_none());
+    }
+
+    /// `.` trigger is not a macro trigger.
+    #[test]
+    fn detect_macro_trigger_dot_not_macro() {
+        let rope = rope_from("obj.field");
+        let pos = MPosition::new(0, 9);
+        assert!(detect_macro_trigger(&rope, pos).is_none());
+    }
+
+    /// Out-of-bounds line → `None`.
+    #[test]
+    fn detect_macro_trigger_oob_line() {
+        let rope = rope_from("`M");
+        let pos = MPosition::new(99, 0);
+        assert!(detect_macro_trigger(&rope, pos).is_none());
     }
 
     // ------------------------------------------------------------------

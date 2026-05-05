@@ -14,9 +14,11 @@
 //                         variable of that type).
 //   * "implementation"  — cursor on virtual method → all overrides in
 //                         subclasses; cursor on class → all direct subclasses.
-//   * "complete"        — member-access (obj.) or package-scope (pkg::)
-//                         completion: enumerate fields/methods of LHS type,
-//                         or members of a named package.
+//   * "complete"        — completion candidates keyed by `kind`:
+//                           "memberAccess"  — obj. → fields/methods of LHS type
+//                           "packageScope"  — pkg:: → members of a package
+//                           "identifier"    — scope-aware identifier completion
+//                           "macro"         — `define names in the compilation
 //   * "shutdown"        — reply with null result, exit cleanly.
 //
 // Anything else is replied to with `error.code = -32601` ("method not
@@ -36,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1185,20 +1188,83 @@ static json handle_implementation(const json& params) {
 
 // --- complete handler --------------------------------------------------------
 //
-// Member-access completion (`obj.prefix`) and package-scope completion
-// (`pkg::prefix`). Given the cursor position after an optional partial
-// identifier, we:
+// Completion candidates keyed by `kind`:
+//   "memberAccess"  — obj.prefix: enumerate fields/methods of LHS type.
+//   "packageScope"  — pkg::prefix: enumerate members of a named package.
+//   "identifier"    — scope-aware completion: walk the enclosing scope chain
+//                     and return all visible names, inner shadows outer.
+//   "macro"         — `define completion: return all macro names from every
+//                     syntax tree in the compilation unit.
 //
-//   1. Walk backwards in the raw source bytes to find the trigger char
-//      (`.` for member access, `::` for package scope) and the end of the
-//      LHS expression.
-//   2. For `.`: run TypeAtCursorFinder at the byte just before the `.` to
-//      get the type of the LHS expression, then enumerate its Scope members.
-//   3. For `::`: look up a PackageSymbol by name in the compilation root,
-//      then enumerate its members.
-//
-// Returns `{items: [{label, kind}, ...]}` — same JSON shape as
+// Returns `{items: [{label, kind, ?detail}, ...]}` — same JSON shape as
 // `CompleteResult` on the Rust side.
+
+// Finds the innermost Scope whose syntax range contains the cursor.
+// Used by the "identifier" completion path to seed the outward scope walk.
+struct EnclosingScopeFinder
+    : public slang::ast::ASTVisitor<EnclosingScopeFinder,
+                                    /*VisitStatements=*/true,
+                                    /*VisitExpressions=*/false> {
+
+    const slang::SourceManager* sm = nullptr;
+    std::string target_path;
+    uint32_t target_offset = 0;
+
+    const slang::ast::Scope* found_scope = nullptr;
+    uint32_t best_width = UINT32_MAX;
+
+    bool covers_target(slang::SourceRange r) const {
+        if (!r.start().valid() || !r.end().valid() || sm == nullptr) return false;
+        auto orig_start = sm->getFullyOriginalLoc(r.start());
+        if (sm->getFullPath(orig_start.buffer()).string() != target_path) return false;
+        auto orig_end   = sm->getFullyOriginalLoc(r.end());
+        return orig_start.offset() <= target_offset
+            && target_offset <= orig_end.offset();
+    }
+
+    void try_scope(slang::SourceRange r, const slang::ast::Scope& scope) {
+        if (!covers_target(r)) return;
+        auto orig_start = sm->getFullyOriginalLoc(r.start());
+        auto orig_end   = sm->getFullyOriginalLoc(r.end());
+        if (!orig_end.valid()) return;
+        uint32_t width = orig_end.offset() - orig_start.offset();
+        if (width < best_width) {
+            best_width = width;
+            found_scope = &scope;
+        }
+    }
+
+    // function / task bodies are Scopes — local variables and parameters
+    // live here.
+    void handle(const slang::ast::SubroutineSymbol& s) {
+        if (auto* syn = s.getSyntax()) try_scope(syn->sourceRange(), s);
+        visitDefault(s);
+    }
+
+    // class body — fields and methods.
+    void handle(const slang::ast::ClassType& c) {
+        if (auto* syn = c.getSyntax()) try_scope(syn->sourceRange(), c);
+        visitDefault(c);
+    }
+
+    // module / interface / program instance body.
+    void handle(const slang::ast::InstanceBodySymbol& b) {
+        if (auto* syn = b.getSyntax()) try_scope(syn->sourceRange(), b);
+        visitDefault(b);
+    }
+
+    // begin / end blocks — locally declared variables.
+    void handle(const slang::ast::StatementBlockSymbol& b) {
+        if (auto* syn = b.getSyntax()) try_scope(syn->sourceRange(), b);
+        visitDefault(b);
+    }
+
+    // package body.
+    void handle(const slang::ast::PackageSymbol& p) {
+        if (auto* syn = p.getSyntax()) try_scope(syn->sourceRange(), p);
+        visitDefault(p);
+    }
+};
 
 // Finds the type of the expression at `target_offset` in `target_path`.
 // Operates exactly like TypeDefinitionFinder but records `found_type`
@@ -1403,6 +1469,65 @@ static json handle_complete(const json& params) {
             if (auto* scope = member.as_if<Scope>()) {
                 enumerate_scope_members(*scope, prefix, result["items"]);
                 break;
+            }
+        }
+        return result;
+    }
+
+    // --- Scope-aware identifier completion -----------------------------------
+    //
+    // Walk to the innermost Scope enclosing the cursor, then walk outward
+    // through the parent scope chain, emitting all visible members. Inner
+    // scopes shadow outer ones: the first definition of a name wins.
+    if (kind_str == "identifier") {
+        EnclosingScopeFinder scope_finder;
+        scope_finder.sm            = &sm;
+        scope_finder.target_path   = target_path;
+        scope_finder.target_offset = cursor;
+        compilation.getRoot().visit(scope_finder);
+
+        constexpr size_t IDENT_CAP = 500;
+        std::unordered_set<std::string> seen;
+        const slang::ast::Scope* scope = scope_finder.found_scope
+                                             ? scope_finder.found_scope
+                                             : &compilation.getRoot();
+
+        while (scope && result["items"].size() < IDENT_CAP) {
+            for (const auto& member : scope->members()) {
+                if (result["items"].size() >= IDENT_CAP) break;
+                if (member.name.empty()) continue;
+                if (!prefix.empty() && !ci_starts_with(member.name, prefix)) continue;
+                auto name = std::string(member.name);
+                if (!seen.insert(name).second) continue;  // inner scope already emitted
+                json item;
+                item["label"] = name;
+                item["kind"]  = member_kind_code(member.kind);
+                result["items"].push_back(std::move(item));
+            }
+            const slang::ast::Symbol& sym = scope->asSymbol();
+            scope = sym.getParentScope();
+        }
+        return result;
+    }
+
+    // --- Macro name completion -----------------------------------------------
+    //
+    // Return all `\`define` names visible in the compilation unit. The sidecar
+    // iterates every syntax tree's `getDefinedMacros()` list, which covers
+    // macros defined in the project's source files as well as any headers
+    // pulled in via `\`include`.
+    if (kind_str == "macro") {
+        for (const auto& tree : compilation.getSyntaxTrees()) {
+            for (const auto* def : tree->getDefinedMacros()) {
+                if (!def) continue;
+                auto name = std::string(def->name.valueText());
+                if (name.empty()) continue;
+                if (!prefix.empty() && !ci_starts_with(name, prefix)) continue;
+                json item;
+                item["label"]  = name;
+                item["kind"]   = 21;    // Constant (LSP CompletionItemKind)
+                item["detail"] = "`define";
+                result["items"].push_back(std::move(item));
             }
         }
         return result;

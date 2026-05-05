@@ -92,6 +92,8 @@ list. End-to-end plumbing only — no candidates yet.
 **Done when:** Typing `mod` shows `module` alongside any user `module`s.
 
 ### Stage 5 — Member access via slang (`obj.` / `pkg::`) ✅ DONE
+### Stage 6 — Scope-aware identifier completion via slang ✅ DONE
+### Stage 7 — Macro completion ✅ DONE
 
 **Goal:** When cursor is right after `.` or `::`, list members of the LHS — class fields/methods, struct fields, enum members, package symbols. Slang-only (no syntax fallback — without types we'd guess).
 

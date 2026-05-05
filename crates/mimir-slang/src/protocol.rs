@@ -372,14 +372,17 @@ pub struct ImplementationLocation {
 #[serde(rename_all = "camelCase")]
 pub enum CompletionRequestKind {
     /// Plain identifier at the cursor — no trigger character before it.
-    /// The sidecar returns an empty list; syntax candidates are handled
-    /// by the Rust side without calling slang.
+    /// The sidecar walks the enclosing scope chain and returns all visible
+    /// names, inner scopes shadowing outer.
     Identifier,
     /// `obj.` or `obj.prefix` — enumerate fields and methods of the LHS type.
     MemberAccess,
     /// `pkg::` or `pkg::prefix` — enumerate members of a named package
     /// (or static members of a class).
     PackageScope,
+    /// Cursor is right after a `` ` `` — return all `` `define `` names
+    /// visible in the compilation unit.
+    Macro,
 }
 
 /// Params for [`methods::COMPLETE`].
@@ -820,6 +823,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CompletionRequestKind::Identifier).unwrap(),
             "\"identifier\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&CompletionRequestKind::Macro).unwrap(),
+            "\"macro\"",
         );
     }
 

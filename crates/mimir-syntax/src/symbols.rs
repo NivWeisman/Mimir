@@ -80,6 +80,8 @@ pub enum SymbolKind {
     Sequence,
     /// `covergroup cg @(…); … endgroup`.
     Covergroup,
+    /// `` `define MY_MACRO … `` — a preprocessor text-macro definition.
+    Macro,
 }
 
 /// One declared name in the source file.
@@ -198,6 +200,7 @@ impl SymbolKind {
             // The latter restates the name (`class_scope` + identifier),
             // so we'd double-count if we picked it up — leave it for now.
             "constraint_declaration" => SymbolKind::Constraint,
+            "text_macro_definition" => SymbolKind::Macro,
             _ => return None,
         })
     }
@@ -275,6 +278,14 @@ fn name_node_of<'a>(decl: Node<'a>) -> Option<Node<'a>> {
         "constraint_declaration" => {
             let id = first_named_child_of_kind(decl, "constraint_identifier")?;
             first_descendant_of_kind(id, "simple_identifier")
+        }
+        // `` `define MY_MACRO … `` — the macro name is in the
+        // `text_macro_name` → `text_macro_identifier` → `simple_identifier`
+        // chain.
+        "text_macro_definition" => {
+            let macro_name = first_named_child_of_kind(decl, "text_macro_name")?;
+            let ident      = first_named_child_of_kind(macro_name, "text_macro_identifier")?;
+            first_descendant_of_kind(ident, "simple_identifier")
         }
         _ => None,
     }
@@ -603,6 +614,19 @@ mod tests {
     fn constraint_block_is_indexed() {
         let s = idx("class c; rand int x; constraint c1 { x > 0; }\nendclass\n");
         assert_eq!(pick(&s, "c1").kind, SymbolKind::Constraint);
+    }
+
+    #[test]
+    fn text_macro_definition_is_indexed() {
+        let s = idx("`define MY_MACRO 1\n`define ANOTHER_MACRO(x) (x+1)\n");
+        assert_eq!(pick(&s, "MY_MACRO").kind, SymbolKind::Macro);
+        assert_eq!(pick(&s, "ANOTHER_MACRO").kind, SymbolKind::Macro);
+    }
+
+    #[test]
+    fn text_macro_inside_module_is_indexed() {
+        let s = idx("module m;\n`define LOCAL 42\nendmodule\n");
+        assert_eq!(pick(&s, "LOCAL").kind, SymbolKind::Macro);
     }
 
     #[test]
