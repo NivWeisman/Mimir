@@ -40,7 +40,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument, warn, trace};
 
 use crate::protocol::{
     methods, CompleteParams, CompleteResult, DefinitionParams, DefinitionResult, ElaborateParams,
@@ -76,8 +76,14 @@ pub enum ConnectionError {
     #[error("sidecar returned error {}: {}", .0.code, .0.message)]
     Sidecar(ResponseError),
 
-    /// Sidecar's response had an `id` that didn't match the request we
-    /// just sent. Means the sidecar is buggy or we lost framing somewhere.
+    /// Sidecar's response had an `id` strictly greater than the request we
+    /// just sent. This is a genuine protocol violation — the sidecar skipped
+    /// ahead in the id space, which should never happen with a single-flight
+    /// sequenced sender.
+    ///
+    /// Note: responses with `id < expected` are *stale* (from a previously
+    /// cancelled task) and are silently drained by [`Connection::request`],
+    /// so they never surface as this error.
     #[error("response id mismatch: expected {expected}, got {got}")]
     IdMismatch {
         /// The id we put on the outgoing request.
@@ -166,6 +172,21 @@ where
         }
     }
 
+    /// Test-only constructor that starts `next_id` at a given value.
+    ///
+    /// Used by tests that simulate a prior task having been cancelled after
+    /// writing its request bytes (advancing `next_id`) but before reading
+    /// the response, leaving stale bytes in the reader.
+    #[cfg(test)]
+    fn with_next_id(reader: R, writer: W, next_id: u64) -> Self {
+        Self {
+            reader,
+            writer,
+            next_id,
+            line_buf: String::new(),
+        }
+    }
+
     /// Send a request and wait for its matching response.
     ///
     /// `params` is serialised to a `serde_json::Value` so we can build the
@@ -195,26 +216,44 @@ where
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.flush().await?;
 
-        // Read exactly one line back. read_line keeps the trailing '\n',
-        // which `serde_json::from_str` is happy to ignore.
-        self.line_buf.clear();
-        let n = self.reader.read_line(&mut self.line_buf).await?;
-        if n == 0 {
-            return Err(ConnectionError::Closed);
-        }
-        debug!(bytes = n, "received response");
+        // Read lines until we find the response for `id`.
+        //
+        // Responses with `resp.id < id` are *stale*: they were produced by
+        // the sidecar for an earlier request whose Tokio task was aborted
+        // after the request bytes were written but before the response was
+        // read.  When a task is aborted at an `await` point the
+        // `MutexGuard` on the `Connection` is dropped, so the next task
+        // acquires the lock with `next_id` already advanced but the stale
+        // bytes still sitting in the sidecar's stdout buffer.  We drain
+        // them here rather than surfacing an `IdMismatch` error.
+        loop {
+            self.line_buf.clear();
+            let n = self.reader.read_line(&mut self.line_buf).await?;
+            if n == 0 {
+                return Err(ConnectionError::Closed);
+            }
+            debug!(bytes = n, "received response");
 
-        let resp: Response = serde_json::from_str(&self.line_buf)?;
-        if resp.id != id {
+            let resp: Response = serde_json::from_str(&self.line_buf)?;
+            if resp.id == id {
+                return match (resp.result, resp.error) {
+                    (Some(value), None) => Ok(serde_json::from_value(value)?),
+                    (None, Some(err)) => Err(ConnectionError::Sidecar(err)),
+                    (None, None) | (Some(_), Some(_)) => {
+                        Err(ConnectionError::EmptyResponse { id })
+                    }
+                };
+            }
+            if resp.id < id {
+                // Stale response from a prior task that was cancelled mid-flight.
+                trace!(stale_id = resp.id, expected = id, "discarding stale sidecar response");
+                continue;
+            }
+            // resp.id > id — the sidecar jumped ahead. Genuine protocol error.
             return Err(ConnectionError::IdMismatch {
                 expected: id,
                 got: resp.id,
             });
-        }
-        match (resp.result, resp.error) {
-            (Some(value), None) => Ok(serde_json::from_value(value)?),
-            (None, Some(err)) => Err(ConnectionError::Sidecar(err)),
-            (None, None) | (Some(_), Some(_)) => Err(ConnectionError::EmptyResponse { id }),
         }
     }
 
@@ -601,9 +640,10 @@ mod tests {
         assert!(err.is_terminal());
     }
 
-    /// Sidecar returns a response with the wrong id → client refuses it.
+    /// Sidecar returns a response with an id *ahead* of what we sent
+    /// (id > expected) — genuine protocol violation → `IdMismatch`.
     #[tokio::test]
-    async fn id_mismatch_surfaces_as_id_mismatch() {
+    async fn id_ahead_surfaces_as_id_mismatch() {
         let ((c_r, c_w), (mut s_r, mut s_w)) = pair();
 
         let sidecar = tokio::spawn(async move {
@@ -611,7 +651,7 @@ mod tests {
             s_r.read_line(&mut line).await.unwrap();
             let req: Request = serde_json::from_str(&line).unwrap();
             let resp = Response {
-                id: req.id.wrapping_add(999),
+                id: req.id.wrapping_add(999), // jump ahead → protocol error
                 result: Some(serde_json::json!({"diagnostics": []})),
                 error: None,
             };
@@ -633,6 +673,63 @@ mod tests {
         sidecar.await.unwrap();
 
         assert!(matches!(err, ConnectionError::IdMismatch { .. }));
+    }
+
+    /// When a previous task was aborted after sending its request, the
+    /// sidecar still writes back a stale response. The next `request` call
+    /// should drain the stale response and return the fresh one.
+    ///
+    /// This reproduces the "response id mismatch: expected 2, got 1" error
+    /// that appeared when `did_change` cancelled a pending elaborate that
+    /// had already been sent to the sidecar.
+    #[tokio::test]
+    async fn stale_response_drained_transparently() {
+        let ((c_r, c_w), (mut s_r, mut s_w)) = pair();
+
+        // The "sidecar" reads one request (id=2) and first sends back a
+        // stale id=1 response (simulating the buffered response from a prior
+        // cancelled task), then the fresh id=2 response.
+        let sidecar = tokio::spawn(async move {
+            let mut line = String::new();
+            s_r.read_line(&mut line).await.unwrap();
+
+            // Stale response for the prior cancelled request.
+            let stale = Response {
+                id: 1,
+                result: Some(serde_json::json!({"diagnostics": []})),
+                error: None,
+            };
+            let mut out = serde_json::to_string(&stale).unwrap();
+            out.push('\n');
+            s_w.write_all(out.as_bytes()).await.unwrap();
+            s_w.flush().await.unwrap();
+
+            // Fresh response for the current request.
+            let fresh = Response {
+                id: 2,
+                result: Some(serde_json::json!({"diagnostics": []})),
+                error: None,
+            };
+            let mut out = serde_json::to_string(&fresh).unwrap();
+            out.push('\n');
+            s_w.write_all(out.as_bytes()).await.unwrap();
+        });
+
+        // Start at next_id=2, simulating a prior request (id=1) that was
+        // written but never read (Tokio task aborted before read_line).
+        let mut conn = Connection::with_next_id(c_r, c_w, 2);
+        let result = conn
+            .elaborate(&ElaborateParams {
+                files: vec![],
+                include_dirs: vec![],
+                defines: vec![],
+                top: None,
+            })
+            .await;
+        sidecar.await.unwrap();
+
+        // Stale id=1 is drained; id=2 matches → success.
+        assert!(result.is_ok(), "expected ok, got {result:?}");
     }
 
     /// Two sequential requests get sequential ids and both round-trip.

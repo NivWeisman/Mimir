@@ -264,9 +264,10 @@ impl Backend {
         let debounce = Duration::from_millis(project.debounce_ms);
 
         // Cancel any pending elaborate for this trigger URI. Aborting
-        // during the sleep is clean; aborting after the request was sent
-        // means the response is dropped (the next request will get the
-        // next id, no protocol confusion).
+        // during the debounce sleep is clean. Aborting while a request is
+        // in-flight (after the bytes were sent but before the response is
+        // read) leaves a stale response in the sidecar's stdout buffer;
+        // Connection::request drains such responses transparently.
         {
             let mut pending = self.pending_elaborations.write().await;
             if let Some(prior) = pending.remove(&trigger_uri) {
