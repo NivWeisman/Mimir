@@ -110,6 +110,32 @@ impl WorkspaceIndex {
     pub fn lookup(&self, name: &str) -> &[Entry] {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
+
+    /// All entries whose name starts with `prefix` (case-insensitive), up
+    /// to `limit` total results.
+    ///
+    /// Linear scan over `by_name` keys — O(total_symbols). Fine for the
+    /// ~10K symbols typical of a mid-size UVM project; a trie is only
+    /// warranted if profiling shows this path hot.
+    ///
+    /// Order is HashMap iteration order (i.e. arbitrary but stable within
+    /// a session). The editor's popup re-sorts by best match anyway.
+    #[must_use]
+    pub fn lookup_prefix(&self, prefix: &str, limit: usize) -> Vec<&Entry> {
+        let prefix_lower = prefix.to_ascii_lowercase();
+        let mut out: Vec<&Entry> = Vec::new();
+        'outer: for (name, entries) in &self.by_name {
+            if name.to_ascii_lowercase().starts_with(&prefix_lower) {
+                for entry in entries {
+                    out.push(entry);
+                    if out.len() >= limit {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Parse every path in `paths` and build a `(Url, Vec<Symbol>)` pair for
@@ -273,6 +299,69 @@ mod tests {
         assert!(syms_b
             .iter()
             .any(|s| s.name == "b" && s.kind == SymbolKind::Class));
+    }
+
+    /// `lookup_prefix` returns all entries whose name starts with the prefix
+    /// (case-insensitive) across all registered URLs.
+    #[test]
+    fn lookup_prefix_finds_matching_entries() {
+        let mut idx = WorkspaceIndex::new();
+        idx.update(
+            url("file:///a.sv"),
+            &[
+                sym("my_class", SymbolKind::Class, 0),
+                sym("my_module", SymbolKind::Module, 1),
+                sym("other", SymbolKind::Package, 2),
+            ],
+        );
+        let hits = idx.lookup_prefix("my_", 100);
+        assert_eq!(hits.len(), 2);
+        let names: Vec<&str> = hits.iter().map(|e| e.symbol.name.as_str()).collect();
+        assert!(names.contains(&"my_class"));
+        assert!(names.contains(&"my_module"));
+    }
+
+    /// `lookup_prefix` is case-insensitive: `"MY_"` matches `"my_class"`.
+    #[test]
+    fn lookup_prefix_is_case_insensitive() {
+        let mut idx = WorkspaceIndex::new();
+        idx.update(
+            url("file:///a.sv"),
+            &[sym("my_class", SymbolKind::Class, 0)],
+        );
+        assert_eq!(idx.lookup_prefix("MY_", 100).len(), 1);
+    }
+
+    /// `lookup_prefix` with an empty prefix returns all entries (up to
+    /// `limit`).
+    #[test]
+    fn lookup_prefix_empty_prefix_matches_all() {
+        let mut idx = WorkspaceIndex::new();
+        idx.update(
+            url("file:///a.sv"),
+            &[
+                sym("alpha", SymbolKind::Module, 0),
+                sym("beta", SymbolKind::Class, 1),
+            ],
+        );
+        let hits = idx.lookup_prefix("", 100);
+        assert_eq!(hits.len(), 2);
+    }
+
+    /// `limit` caps the returned slice length.
+    #[test]
+    fn lookup_prefix_respects_limit() {
+        let mut idx = WorkspaceIndex::new();
+        idx.update(
+            url("file:///a.sv"),
+            &[
+                sym("foo_a", SymbolKind::Module, 0),
+                sym("foo_b", SymbolKind::Class, 1),
+                sym("foo_c", SymbolKind::Task, 2),
+            ],
+        );
+        let hits = idx.lookup_prefix("foo", 2);
+        assert_eq!(hits.len(), 2);
     }
 
     /// Paths the reader can't satisfy are skipped (no panic, no entry).

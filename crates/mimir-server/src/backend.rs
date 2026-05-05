@@ -510,11 +510,20 @@ impl Backend {
 
     /// Syntax-only completion for `uri` at `pos`.
     ///
-    /// Reads the current document state, extracts the identifier prefix the
-    /// user is typing, then filters the per-file symbol index by case-insensitive
-    /// prefix match. Returns `None` only when the document is not in the store.
+    /// Merges three candidate sources (in priority order):
+    /// 1. Same-file symbol index — shown without `detail`.
+    /// 2. Workspace index — cross-file symbols with filename as `detail`.
+    /// 3. SV keywords — appended last with `CompletionItemKind::KEYWORD`.
+    ///
+    /// Deduplication key: `(name, url)` — same-file symbols win and are not
+    /// repeated from the workspace index even though both indices contain them.
+    /// Returns `None` only when `uri` is not in the document store.
     async fn syntax_completion(&self, uri: &Url, pos: MPosition) -> Option<CompletionResponse> {
-        let (text, index) = {
+        const MAX_ITEMS: usize = 200;
+
+        // Snapshot same-file state under the read lock; release before
+        // touching the workspace index (different lock).
+        let (text, same_file_index) = {
             let docs = self.documents.read().await;
             let state = docs.get(uri)?;
             (state.document.text(), state.index.clone())
@@ -524,17 +533,54 @@ impl Backend {
         let prefix = mimir_syntax::symbols::prefix_at(&rope, pos).unwrap_or_default();
         let prefix_lower = prefix.to_ascii_lowercase();
 
-        const MAX_ITEMS: usize = 200;
-        let items: Vec<CompletionItem> = index
-            .iter()
-            .filter(|sym| sym.name.to_ascii_lowercase().starts_with(&prefix_lower))
-            .take(MAX_ITEMS)
-            .map(|sym| CompletionItem {
+        // Dedup set: (name, url). Populated as we add items so cross-file
+        // entries skip symbols the current file already provides.
+        let mut seen: HashSet<(String, Url)> = HashSet::new();
+        let mut items: Vec<CompletionItem> = Vec::new();
+
+        // --- 1. Same-file symbols (no detail, shown first) ------------------
+        for sym in &same_file_index {
+            if items.len() >= MAX_ITEMS {
+                break;
+            }
+            if sym.name.to_ascii_lowercase().starts_with(&prefix_lower) {
+                seen.insert((sym.name.clone(), uri.clone()));
+                items.push(CompletionItem {
+                    label: sym.name.clone(),
+                    kind: Some(symbol_kind_to_completion_kind(sym.kind)),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // --- 2. Workspace symbols (cross-file, with filename as detail) ------
+        let workspace_hits: Vec<(Url, Symbol)> = {
+            let wi = self.workspace_index.read().await;
+            wi.lookup_prefix(&prefix, MAX_ITEMS)
+                .into_iter()
+                .map(|e| (e.url.clone(), e.symbol.clone()))
+                .collect()
+        };
+        for (entry_url, sym) in workspace_hits {
+            if items.len() >= MAX_ITEMS {
+                break;
+            }
+            let key = (sym.name.clone(), entry_url.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+            let detail = entry_url
+                .path_segments()
+                .and_then(|mut segs| segs.next_back())
+                .map(str::to_owned);
+            items.push(CompletionItem {
                 label: sym.name.clone(),
                 kind: Some(symbol_kind_to_completion_kind(sym.kind)),
+                detail,
                 ..Default::default()
-            })
-            .collect();
+            });
+        }
 
         debug!(count = items.len(), prefix = %prefix, "syntax completion");
         Some(CompletionResponse::Array(items))
