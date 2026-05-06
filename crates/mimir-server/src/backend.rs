@@ -657,10 +657,9 @@ impl Backend {
     /// prefilter would hide legitimate subsequence matches (e.g. `cls`
     /// → `my_class`).
     ///
-    /// No deduplication — callers apply their own
-    /// (`syntax_completion` keys by `(name, url)`,
-    /// `syntax_macro_completion` keys by `name`). Returns `None` only when
-    /// `uri` is not in the document store.
+    /// No deduplication — callers apply their own (both
+    /// `syntax_completion` and `syntax_macro_completion` key by `name`).
+    /// Returns `None` only when `uri` is not in the document store.
     async fn gather_syntax_candidates(
         &self,
         uri: &Url,
@@ -759,8 +758,9 @@ impl Backend {
     ///    so even a perfect keyword score sits below user symbols.
     ///
     /// Macros excluded — served by the dedicated macro path.
-    /// Deduplication key: `(name, url)`. Returns `None` only when `uri` is
-    /// not in the document store.
+    /// Deduplication key: `name`. Same-file is processed first, so a
+    /// shadowed cross-file or keyword entry never displaces the same-file
+    /// hit. Returns `None` only when `uri` is not in the document store.
     async fn syntax_completion(&self, uri: &Url, pos: MPosition) -> Option<CompletionResponse> {
         const MAX_ITEMS: usize = 200;
 
@@ -776,14 +776,14 @@ impl Backend {
             .await?;
 
         let mut matcher = completion_score::matcher();
-        let mut seen: HashSet<(String, Url)> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut scored: Vec<(u32, CompletionItem)> = Vec::new();
 
         for sym in candidates.same_file {
             let Some(s) = completion_score::score(&mut matcher, &prefix, &sym.name) else {
                 continue;
             };
-            if !seen.insert((sym.name.clone(), uri.clone())) {
+            if !seen.insert(sym.name.clone()) {
                 continue;
             }
             let total = s + completion_score::SAME_FILE_BOOST;
@@ -803,7 +803,7 @@ impl Backend {
             let Some(s) = completion_score::score(&mut matcher, &prefix, &sym.name) else {
                 continue;
             };
-            if !seen.insert((sym.name.clone(), entry_url.clone())) {
+            if !seen.insert(sym.name.clone()) {
                 continue;
             }
             let detail = entry_url
@@ -827,6 +827,9 @@ impl Backend {
             let Some(s) = completion_score::score(&mut matcher, &prefix, kw) else {
                 continue;
             };
+            if !seen.insert(kw.to_owned()) {
+                continue;
+            }
             let demoted = s / completion_score::KEYWORD_DIVIDE;
             let mut item = keyword_completion_item(kw);
             item.sort_text = Some(completion_score::assign_sort_text(demoted));
@@ -2103,9 +2106,14 @@ fn into_complete_params(
 /// Convert a vector of sidecar [`SlangCompletionItem`]s into an LSP
 /// [`CompletionResponse::Array`]. Single-source mapping for the three
 /// slang routes; keeps the field-by-field translation in one place.
+///
+/// Dedupes by `label` (first-wins) so a symbol visible through multiple
+/// paths — e.g. lexical scope and a `import pkg::*` — only surfaces once.
 fn slang_items_to_response(items: Vec<SlangCompletionItem>) -> CompletionResponse {
+    let mut seen: HashSet<String> = HashSet::new();
     let mapped: Vec<CompletionItem> = items
         .into_iter()
+        .filter(|it| seen.insert(it.label.clone()))
         .map(|it| CompletionItem {
             label: it.label,
             kind: Some(slang_completion_kind_to_lsp(it.kind)),
