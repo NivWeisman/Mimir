@@ -470,7 +470,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mimir-core"
-version = "0.6.7"
+version = "0.6.11"
 dependencies = [
  "pretty_assertions",
  "ropey",
@@ -482,12 +482,13 @@ dependencies = [
 
 [[package]]
 name = "mimir-server"
-version = "0.6.7"
+version = "0.6.11"
 dependencies = [
  "anyhow",
  "mimir-core",
  "mimir-slang",
  "mimir-syntax",
+ "nucleo-matcher",
  "pretty_assertions",
  "ropey",
  "serde",
@@ -503,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-slang"
-version = "0.6.7"
+version = "0.6.11"
 dependencies = [
  "mimir-core",
  "pretty_assertions",
@@ -516,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-syntax"
-version = "0.6.7"
+version = "0.6.11"
 dependencies = [
  "mimir-core",
  "pretty_assertions",
@@ -545,6 +546,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys",
+]
+
+[[package]]
+name = "nucleo-matcher"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
+dependencies = [
+ "memchr",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -1151,6 +1162,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9629274872b2bfaf8d66f5f15725007f635594914870f65218920345aa11aa8c"
 
 [[package]]
 name = "unicode-xid"

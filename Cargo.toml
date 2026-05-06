@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.6.7"
+version      = "0.6.11"
 edition      = "2021"
 rust-version = "1.75"
 license      = "MIT OR Apache-2.0"
@@ -65,6 +65,12 @@ serde_json  = "1"
 # `toml` reads `.mimir.toml`. Pinned at 0.8 (current series; 0.5 had a very
 # different API). Used by `mimir-server::project`.
 toml        = "0.8"
+
+# --- Fuzzy matching --------------------------------------------------------
+# `nucleo-matcher` is the scorer extracted from the helix editor. Pure-Rust,
+# fast, MIT/Apache. Used by `mimir-server` to rank completion candidates by
+# subsequence-with-bonus score; not pulled into the lower crates.
+nucleo-matcher = "0.3"
 
 # --- Internal crates (used by other workspace members) --------------------
 mimir-core   = { path = "crates/mimir-core",   version = "0.6.7" }

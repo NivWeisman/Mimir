@@ -268,6 +268,40 @@ pub fn matches_prefix(prefix: &str) -> impl Iterator<Item = &'static str> {
     KEYWORDS.iter().copied().filter(move |kw| kw.starts_with(p.as_str()))
 }
 
+/// LSP snippet bodies for the SV constructs users almost always want
+/// expanded to a block, not just the bare keyword. Each entry is
+/// `(trigger_keyword, snippet_body)` where the body uses LSP snippet
+/// syntax: `${N:placeholder}` for tab stops, `$0` for final cursor.
+///
+/// Plain `&str` table — no LSP types here, per the dependency rule
+/// (`mimir-syntax` must stay LSP-free; `mimir-server` wraps these into
+/// `CompletionItem.insert_text` + `InsertTextFormat::Snippet`).
+pub const KEYWORD_SNIPPETS: &[(&str, &str)] = &[
+    ("module",      "module ${1:name} (${2});\n  $0\nendmodule"),
+    ("interface",   "interface ${1:name} (${2});\n  $0\nendinterface"),
+    ("class",       "class ${1:name};\n  $0\nendclass"),
+    ("package",     "package ${1:name};\n  $0\nendpackage"),
+    ("program",     "program ${1:name} (${2});\n  $0\nendprogram"),
+    ("task",        "task ${1:name}(${2});\n  $0\nendtask"),
+    ("function",    "function ${1:return_type} ${2:name}(${3});\n  $0\nendfunction"),
+    ("always_ff",   "always_ff @(posedge ${1:clk}) begin\n  $0\nend"),
+    ("always_comb", "always_comb begin\n  $0\nend"),
+    ("always_latch","always_latch begin\n  $0\nend"),
+    ("initial",     "initial begin\n  $0\nend"),
+    ("final",       "final begin\n  $0\nend"),
+    ("covergroup",  "covergroup ${1:name};\n  $0\nendgroup"),
+    ("property",    "property ${1:name};\n  $0\nendproperty"),
+    ("sequence",    "sequence ${1:name};\n  $0\nendsequence"),
+];
+
+/// Look up the LSP snippet body for `keyword`, if one is registered.
+/// Lookup is case-sensitive — the table is canonical lowercase.
+pub fn snippet_for(keyword: &str) -> Option<&'static str> {
+    KEYWORD_SNIPPETS
+        .iter()
+        .find_map(|(k, body)| (*k == keyword).then_some(*body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +385,60 @@ mod tests {
         for kw in KEYWORDS {
             assert!(seen.insert(*kw), "duplicate keyword in KEYWORDS: '{kw}'");
         }
+    }
+
+    /// Every snippet trigger must also appear in `KEYWORDS` so the
+    /// completion code path that emits snippets is reachable: the keyword
+    /// list is what surfaces candidates; the snippet table only enriches
+    /// `insert_text`. A trigger missing from `KEYWORDS` is dead code.
+    #[test]
+    fn snippet_triggers_are_all_keywords() {
+        for (trigger, _) in KEYWORD_SNIPPETS {
+            assert!(
+                KEYWORDS.contains(trigger),
+                "snippet trigger '{trigger}' is not in KEYWORDS",
+            );
+        }
+    }
+
+    /// Every snippet body must have balanced `${` / `}` placeholder
+    /// markers and exactly one `$0` final cursor stop. Catches stray-`$`
+    /// typos that would render literally in editors.
+    #[test]
+    fn snippet_bodies_are_well_formed() {
+        for (trigger, body) in KEYWORD_SNIPPETS {
+            let opens = body.matches("${").count();
+            let mut closes = 0;
+            // Count `}` that aren't part of `${`. A simple state-walk
+            // suffices: we don't have nested braces in our snippets.
+            let mut chars = body.chars().peekable();
+            let mut prev = ' ';
+            while let Some(c) = chars.next() {
+                if c == '}' && prev != '$' {
+                    closes += 1;
+                }
+                prev = c;
+            }
+            assert_eq!(
+                opens, closes,
+                "snippet '{trigger}' has unbalanced placeholders: {opens} `${{` vs {closes} `}}`",
+            );
+            assert_eq!(
+                body.matches("$0").count(),
+                1,
+                "snippet '{trigger}' must have exactly one `$0` final cursor stop",
+            );
+        }
+    }
+
+    /// `snippet_for` finds registered triggers and returns `None` otherwise.
+    #[test]
+    fn snippet_for_lookup() {
+        assert!(snippet_for("module").is_some());
+        assert!(snippet_for("class").is_some());
+        assert!(snippet_for("always_ff").is_some());
+        assert!(snippet_for("nonexistent_keyword_xyz").is_none());
+        // Plain keywords without a registered snippet fall through.
+        assert!(snippet_for("if").is_none());
     }
 }

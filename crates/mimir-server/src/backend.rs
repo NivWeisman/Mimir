@@ -38,8 +38,8 @@ use mimir_slang::{
     DefinitionLocation as SlangDefinitionLocation, DefinitionParams as SlangDefinitionParams,
     Diagnostic as SlangDiagnostic, ElaborateParams, ElaborateResult,
     ImplementationLocation as SlangImplementationLocation,
-    ImplementationParams as SlangImplementationParams, Severity as SlangSeverity, SourceFile,
-    TypeDefinitionLocation as SlangTypeDefinitionLocation,
+    ImplementationParams as SlangImplementationParams, Severity as SlangSeverity, SlangCompletionItem,
+    SourceFile, TypeDefinitionLocation as SlangTypeDefinitionLocation,
     TypeDefinitionParams as SlangTypeDefinitionParams,
 };
 use mimir_syntax::{
@@ -54,6 +54,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::completion_score;
 use crate::project::ResolvedProject;
 use crate::workspace_index::{self, WorkspaceIndex};
 
@@ -513,6 +514,35 @@ impl Backend {
         Some(GotoDefinitionResponse::Array(locations))
     }
 
+    /// Common scaffolding for the three slang-backed completion routes.
+    ///
+    /// Owns: lock-acquire on slang+project, [`build_definition_params`],
+    /// constructing [`SlangCompleteParams`], dispatching `slang.complete`,
+    /// and converting transport errors to `None` so callers fall back to
+    /// the syntax path. Returns the raw `Vec<SlangCompletionItem>` on
+    /// success (possibly empty) so each caller can apply its own
+    /// per-route filtering and empty-result fallback policy.
+    async fn slang_complete_request(
+        &self,
+        uri: &Url,
+        pos: MPosition,
+        kind: SlangCompletionRequestKind,
+        prefix: Option<String>,
+    ) -> Option<Vec<SlangCompletionItem>> {
+        let slang = self.slang.read().await.clone()?;
+        let project = self.project.read().await.clone()?;
+        let (def_params, _) =
+            build_definition_params(&project, &self.documents, uri, pos).await?;
+        let params = into_complete_params(def_params, kind, prefix);
+        match slang.complete(&params).await {
+            Ok(result) => Some(result.items),
+            Err(e) => {
+                warn!(error = %e, "slang complete error; falling back to syntax");
+                None
+            }
+        }
+    }
+
     /// Try slang-backed member-access or package-scope completion.
     ///
     /// Returns `Some` when:
@@ -526,75 +556,43 @@ impl Backend {
         uri: &Url,
         pos: MPosition,
     ) -> Option<CompletionResponse> {
-        let slang = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
-
         let text = {
             let docs = self.documents.read().await;
             docs.get(uri)?.document.text()
         };
         let rope = Rope::from_str(&text);
-
         let (is_pkg_scope, member_prefix) = detect_member_access(&rope, pos)?;
         let kind = if is_pkg_scope {
             SlangCompletionRequestKind::PackageScope
         } else {
             SlangCompletionRequestKind::MemberAccess
         };
+        let wire_prefix = (!member_prefix.is_empty()).then(|| member_prefix.clone());
 
-        let (def_params, _) =
-            build_definition_params(&project, &self.documents, uri, pos).await?;
-        let params = SlangCompleteParams {
-            files: def_params.files,
-            include_dirs: def_params.include_dirs,
-            defines: def_params.defines,
-            top: def_params.top,
-            target_path: def_params.target_path,
-            target_position: def_params.target_position,
-            kind,
-            prefix: if member_prefix.is_empty() {
-                None
-            } else {
-                Some(member_prefix.clone())
-            },
-        };
-
-        match slang.complete(&params).await {
-            Ok(result) if !result.items.is_empty() => {
-                let prefix_lower = member_prefix.to_ascii_lowercase();
-                let items: Vec<CompletionItem> = result
-                    .items
-                    .into_iter()
-                    .filter(|it| {
-                        prefix_lower.is_empty()
-                            || it.label.to_ascii_lowercase().starts_with(&prefix_lower)
-                    })
-                    .map(|it| CompletionItem {
-                        label: it.label,
-                        kind: Some(slang_completion_kind_to_lsp(it.kind)),
-                        detail: it.detail,
-                        ..Default::default()
-                    })
-                    .collect();
-                debug!(count = items.len(), "slang member completion");
-                Some(CompletionResponse::Array(items))
-            }
-            Ok(_) => {
-                debug!("slang member completion: no items; falling back to syntax");
-                None
-            }
-            Err(e) => {
-                warn!(error = %e, "slang complete transport error; falling back to syntax");
-                None
-            }
+        let items = self
+            .slang_complete_request(uri, pos, kind, wire_prefix)
+            .await?;
+        if items.is_empty() {
+            debug!("slang member completion: no items; falling back to syntax");
+            return None;
         }
+        let prefix_lower = member_prefix.to_ascii_lowercase();
+        let filtered: Vec<SlangCompletionItem> = items
+            .into_iter()
+            .filter(|it| {
+                prefix_lower.is_empty()
+                    || it.label.to_ascii_lowercase().starts_with(&prefix_lower)
+            })
+            .collect();
+        debug!(count = filtered.len(), "slang member completion");
+        Some(slang_items_to_response(filtered))
     }
 
     /// Try slang-backed scope-aware identifier completion.
     ///
     /// Called when there is no `.` / `::` / `` ` `` trigger before the cursor
     /// — i.e. the user is typing a plain identifier. The sidecar walks the
-    /// enclosing scope chain and returns all visiblesymbols, inner scopes
+    /// enclosing scope chain and returns all visible symbols, inner scopes
     /// shadowing outer ones.
     ///
     /// Returns `Some` when slang resolves at least one candidate. Returns
@@ -605,57 +603,28 @@ impl Backend {
         uri: &Url,
         pos: MPosition,
     ) -> Option<CompletionResponse> {
-        let slang = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
-
         let text = {
             let docs = self.documents.read().await;
             docs.get(uri)?.document.text()
         };
         let rope = Rope::from_str(&text);
         let prefix = mimir_syntax::symbols::prefix_at(&rope, pos).unwrap_or_default();
+        let wire_prefix = (!prefix.is_empty()).then(|| prefix.to_owned());
 
-        let (def_params, _) =
-            build_definition_params(&project, &self.documents, uri, pos).await?;
-        let params = SlangCompleteParams {
-            files: def_params.files,
-            include_dirs: def_params.include_dirs,
-            defines: def_params.defines,
-            top: def_params.top,
-            target_path: def_params.target_path,
-            target_position: def_params.target_position,
-            kind: SlangCompletionRequestKind::Identifier,
-            prefix: if prefix.is_empty() {
-                None
-            } else {
-                Some(prefix.to_owned())
-            },
-        };
-
-        match slang.complete(&params).await {
-            Ok(result) if !result.items.is_empty() => {
-                let items: Vec<CompletionItem> = result
-                    .items
-                    .into_iter()
-                    .map(|it| CompletionItem {
-                        label: it.label,
-                        kind: Some(slang_completion_kind_to_lsp(it.kind)),
-                        detail: it.detail,
-                        ..Default::default()
-                    })
-                    .collect();
-                debug!(count = items.len(), "slang identifier completion");
-                Some(CompletionResponse::Array(items))
-            }
-            Ok(_) => {
-                debug!("slang identifier completion: no items; falling back to syntax");
-                None
-            }
-            Err(e) => {
-                warn!(error = %e, "slang identifier complete error; falling back to syntax");
-                None
-            }
+        let items = self
+            .slang_complete_request(
+                uri,
+                pos,
+                SlangCompletionRequestKind::Identifier,
+                wire_prefix,
+            )
+            .await?;
+        if items.is_empty() {
+            debug!("slang identifier completion: no items; falling back to syntax");
+            return None;
         }
+        debug!(count = items.len(), "slang identifier completion");
+        Some(slang_items_to_response(items))
     }
 
     /// Try slang-backed macro-name completion.
@@ -665,119 +634,114 @@ impl Backend {
     /// unit; the prefix (if any) is applied server-side.
     ///
     /// Returns `None` on transport error or no slang configured — the caller
-    /// falls through to `syntax_macro_completion`.
+    /// falls through to `syntax_macro_completion`. An empty successful result
+    /// returns `Some(empty)` so the route does *not* fall back to syntax
+    /// (the slang macro list is authoritative when slang is reachable).
     async fn try_slang_macro_completion(
         &self,
         uri: &Url,
         pos: MPosition,
         macro_prefix: &str,
     ) -> Option<CompletionResponse> {
-        let slang = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
+        let wire_prefix = (!macro_prefix.is_empty()).then(|| macro_prefix.to_owned());
+        let items = self
+            .slang_complete_request(uri, pos, SlangCompletionRequestKind::Macro, wire_prefix)
+            .await?;
+        debug!(count = items.len(), "slang macro completion");
+        Some(slang_items_to_response(items))
+    }
 
-        let (def_params, _) =
-            build_definition_params(&project, &self.documents, uri, pos).await?;
-        let params = SlangCompleteParams {
-            files: def_params.files,
-            include_dirs: def_params.include_dirs,
-            defines: def_params.defines,
-            top: def_params.top,
-            target_path: def_params.target_path,
-            target_position: def_params.target_position,
-            kind: SlangCompletionRequestKind::Macro,
-            prefix: if macro_prefix.is_empty() {
-                None
-            } else {
-                Some(macro_prefix.to_owned())
-            },
+    /// Gather syntax-side candidates for `uri`, split into same-file and
+    /// cross-file streams. Both are filtered by `keep`; **no prefix
+    /// prefilter** — fuzzy ranking happens in callers, and a starts_with
+    /// prefilter would hide legitimate subsequence matches (e.g. `cls`
+    /// → `my_class`).
+    ///
+    /// No deduplication — callers apply their own
+    /// (`syntax_completion` keys by `(name, url)`,
+    /// `syntax_macro_completion` keys by `name`). Returns `None` only when
+    /// `uri` is not in the document store.
+    async fn gather_syntax_candidates(
+        &self,
+        uri: &Url,
+        keep: impl Fn(&Symbol) -> bool,
+    ) -> Option<SyntaxCandidates> {
+        let same_file: Vec<Symbol> = {
+            let docs = self.documents.read().await;
+            let state = docs.get(uri)?;
+            state.index.iter().filter(|s| keep(s)).cloned().collect()
         };
 
-        match slang.complete(&params).await {
-            Ok(result) => {
-                let items: Vec<CompletionItem> = result
-                    .items
-                    .into_iter()
-                    .map(|it| CompletionItem {
-                        label: it.label,
-                        kind: Some(slang_completion_kind_to_lsp(it.kind)),
-                        detail: it.detail,
-                        ..Default::default()
-                    })
-                    .collect();
-                debug!(count = items.len(), "slang macro completion");
-                Some(CompletionResponse::Array(items))
-            }
-            Err(e) => {
-                warn!(error = %e, "slang macro complete error; falling back to syntax");
-                None
-            }
-        }
+        let cross_file: Vec<(Url, Symbol)> = {
+            let wi = self.workspace_index.read().await;
+            wi.entries()
+                .filter(|e| keep(&e.symbol))
+                .map(|e| (e.url.clone(), e.symbol.clone()))
+                .collect()
+        };
+
+        Some(SyntaxCandidates { same_file, cross_file })
     }
 
     /// Syntax-only macro completion for `uri` at `pos`.
     ///
     /// Fallback when slang is not configured. Gathers `` `define `` symbols
-    /// from the workspace index (indexed via `SymbolKind::Macro`) filtered
-    /// by `macro_prefix`.
+    /// from same-file + workspace index, fuzzy-scores each candidate
+    /// against `macro_prefix`, dedupes by name (a macro shadowed in the
+    /// current file shouldn't surface under another file), and orders the
+    /// popup best-first via `sort_text`.
     async fn syntax_macro_completion(
         &self,
         uri: &Url,
         macro_prefix: &str,
     ) -> Option<CompletionResponse> {
         const MAX_ITEMS: usize = 200;
-        let prefix_lower = macro_prefix.to_ascii_lowercase();
+        let candidates = self
+            .gather_syntax_candidates(uri, |s| s.kind == MSymbolKind::Macro)
+            .await?;
 
-        // Same-file macros first.
-        let same_file_macros: Vec<String> = {
-            let docs = self.documents.read().await;
-            let state = docs.get(uri)?;
-            state
-                .index
-                .iter()
-                .filter(|s| s.kind == MSymbolKind::Macro)
-                .filter(|s| s.name.to_ascii_lowercase().starts_with(&prefix_lower))
-                .map(|s| s.name.clone())
-                .collect()
-        };
-
+        let mut matcher = completion_score::matcher();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut items: Vec<CompletionItem> = Vec::new();
+        let mut scored: Vec<(u32, CompletionItem)> = Vec::new();
 
-        for name in same_file_macros {
-            if items.len() >= MAX_ITEMS {
-                break;
-            }
-            seen.insert(name.clone());
-            items.push(CompletionItem {
+        let make_item = |name: String, score: u32, data: Option<serde_json::Value>| {
+            CompletionItem {
                 label: name,
                 kind: Some(CompletionItemKind::CONSTANT),
                 detail: Some("`define".to_owned()),
+                sort_text: Some(completion_score::assign_sort_text(score)),
+                data,
                 ..Default::default()
-            });
-        }
-
-        // Cross-file macros from workspace index.
-        let workspace_macros: Vec<String> = {
-            let wi = self.workspace_index.read().await;
-            wi.lookup_prefix(macro_prefix, MAX_ITEMS)
-                .into_iter()
-                .filter(|e| e.symbol.kind == MSymbolKind::Macro)
-                .filter(|e| !seen.contains(&e.symbol.name))
-                .map(|e| e.symbol.name.clone())
-                .collect()
+            }
         };
-        for name in workspace_macros {
-            if items.len() >= MAX_ITEMS {
-                break;
+
+        // Same-file first; if a name comes back from the workspace as well,
+        // the dedup `seen` keeps the same-file entry which has the boost.
+        for sym in candidates.same_file {
+            let Some(s) = completion_score::score(&mut matcher, macro_prefix, &sym.name) else {
+                continue;
+            };
+            if !seen.insert(sym.name.clone()) {
+                continue;
             }
-            seen.insert(name.clone());
-            items.push(CompletionItem {
-                label: name,
-                kind: Some(CompletionItemKind::CONSTANT),
-                detail: Some("`define".to_owned()),
-                ..Default::default()
-            });
+            let total = s + completion_score::SAME_FILE_BOOST;
+            let data = make_resolve_data(uri, sym.name_range.start.line);
+            scored.push((total, make_item(sym.name, total, data)));
         }
+        for (entry_url, sym) in candidates.cross_file {
+            let Some(s) = completion_score::score(&mut matcher, macro_prefix, &sym.name) else {
+                continue;
+            };
+            if !seen.insert(sym.name.clone()) {
+                continue;
+            }
+            let data = make_resolve_data(&entry_url, sym.name_range.start.line);
+            scored.push((s, make_item(sym.name, s, data)));
+        }
+
+        scored.sort_by_key(|e| std::cmp::Reverse(e.0));
+        scored.truncate(MAX_ITEMS);
+        let items: Vec<CompletionItem> = scored.into_iter().map(|(_, it)| it).collect();
 
         debug!(count = items.len(), prefix = %macro_prefix, "syntax macro completion");
         Some(CompletionResponse::Array(items))
@@ -785,96 +749,93 @@ impl Backend {
 
     /// Syntax-only completion for `uri` at `pos`.
     ///
-    /// Merges three candidate sources (in priority order):
-    /// 1. Same-file symbol index — shown without `detail`. Macros are excluded
-    ///    (those come through the dedicated macro-completion path).
-    /// 2. Workspace index — cross-file symbols with filename as `detail`.
-    /// 3. SV keywords — appended last with `CompletionItemKind::KEYWORD`.
+    /// Merges three candidate sources, fuzzy-ranks them, and orders the
+    /// popup best-first via `sort_text`:
+    /// 1. Same-file symbols — boosted by [`completion_score::SAME_FILE_BOOST`]
+    ///    so a same-file fuzzy hit always beats a cross-file exact hit
+    ///    (matches the pre-fuzzy "your file wins" UX).
+    /// 2. Cross-file symbols from the workspace index — filename as `detail`.
+    /// 3. SV keywords — score divided by [`completion_score::KEYWORD_DIVIDE`]
+    ///    so even a perfect keyword score sits below user symbols.
     ///
-    /// Deduplication key: `(name, url)` — same-file symbols win and are not
-    /// repeated from the workspace index even though both indices contain them.
-    /// Returns `None` only when `uri` is not in the document store.
+    /// Macros excluded — served by the dedicated macro path.
+    /// Deduplication key: `(name, url)`. Returns `None` only when `uri` is
+    /// not in the document store.
     async fn syntax_completion(&self, uri: &Url, pos: MPosition) -> Option<CompletionResponse> {
         const MAX_ITEMS: usize = 200;
 
-        // Snapshot same-file state under the read lock; release before
-        // touching the workspace index (different lock).
-        let (text, same_file_index) = {
+        let text = {
             let docs = self.documents.read().await;
-            let state = docs.get(uri)?;
-            (state.document.text(), state.index.clone())
+            docs.get(uri)?.document.text()
         };
-
         let rope = Rope::from_str(&text);
         let prefix = mimir_syntax::symbols::prefix_at(&rope, pos).unwrap_or_default();
-        let prefix_lower = prefix.to_ascii_lowercase();
 
-        // Dedup set: (name, url). Populated as we add items so cross-file
-        // entries skip symbols the current file already provides.
+        let candidates = self
+            .gather_syntax_candidates(uri, |s| s.kind != MSymbolKind::Macro)
+            .await?;
+
+        let mut matcher = completion_score::matcher();
         let mut seen: HashSet<(String, Url)> = HashSet::new();
-        let mut items: Vec<CompletionItem> = Vec::new();
+        let mut scored: Vec<(u32, CompletionItem)> = Vec::new();
 
-        // --- 1. Same-file symbols (no detail, shown first) ------------------
-        // Macros are excluded — they're served by the dedicated macro path.
-        for sym in &same_file_index {
-            if items.len() >= MAX_ITEMS {
-                break;
-            }
-            if sym.kind == MSymbolKind::Macro {
+        for sym in candidates.same_file {
+            let Some(s) = completion_score::score(&mut matcher, &prefix, &sym.name) else {
+                continue;
+            };
+            if !seen.insert((sym.name.clone(), uri.clone())) {
                 continue;
             }
-            if sym.name.to_ascii_lowercase().starts_with(&prefix_lower) {
-                seen.insert((sym.name.clone(), uri.clone()));
-                items.push(CompletionItem {
+            let total = s + completion_score::SAME_FILE_BOOST;
+            scored.push((
+                total,
+                CompletionItem {
                     label: sym.name.clone(),
                     kind: Some(symbol_kind_to_completion_kind(sym.kind)),
+                    sort_text: Some(completion_score::assign_sort_text(total)),
+                    data: make_resolve_data(uri, sym.name_range.start.line),
                     ..Default::default()
-                });
-            }
+                },
+            ));
         }
 
-        // --- 2. Workspace symbols (cross-file, with filename as detail) ------
-        // Macros excluded — served by the dedicated macro path.
-        let workspace_hits: Vec<(Url, Symbol)> = {
-            let wi = self.workspace_index.read().await;
-            wi.lookup_prefix(&prefix, MAX_ITEMS)
-                .into_iter()
-                .filter(|e| e.symbol.kind != MSymbolKind::Macro)
-                .map(|e| (e.url.clone(), e.symbol.clone()))
-                .collect()
-        };
-        for (entry_url, sym) in workspace_hits {
-            if items.len() >= MAX_ITEMS {
-                break;
-            }
-            let key = (sym.name.clone(), entry_url.clone());
-            if seen.contains(&key) {
+        for (entry_url, sym) in candidates.cross_file {
+            let Some(s) = completion_score::score(&mut matcher, &prefix, &sym.name) else {
+                continue;
+            };
+            if !seen.insert((sym.name.clone(), entry_url.clone())) {
                 continue;
             }
-            seen.insert(key);
             let detail = entry_url
                 .path_segments()
                 .and_then(|mut segs| segs.next_back())
                 .map(str::to_owned);
-            items.push(CompletionItem {
-                label: sym.name.clone(),
-                kind: Some(symbol_kind_to_completion_kind(sym.kind)),
-                detail,
-                ..Default::default()
-            });
+            scored.push((
+                s,
+                CompletionItem {
+                    label: sym.name.clone(),
+                    kind: Some(symbol_kind_to_completion_kind(sym.kind)),
+                    detail,
+                    sort_text: Some(completion_score::assign_sort_text(s)),
+                    data: make_resolve_data(&entry_url, sym.name_range.start.line),
+                    ..Default::default()
+                },
+            ));
         }
 
-        // --- 3. Keywords (appended last, after user symbols) ----------------
-        for kw in mimir_syntax::keywords::matches_prefix(&prefix) {
-            if items.len() >= MAX_ITEMS {
-                break;
-            }
-            items.push(CompletionItem {
-                label: kw.to_owned(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                ..Default::default()
-            });
+        for kw in mimir_syntax::keywords::KEYWORDS.iter().copied() {
+            let Some(s) = completion_score::score(&mut matcher, &prefix, kw) else {
+                continue;
+            };
+            let demoted = s / completion_score::KEYWORD_DIVIDE;
+            let mut item = keyword_completion_item(kw);
+            item.sort_text = Some(completion_score::assign_sort_text(demoted));
+            scored.push((demoted, item));
         }
+
+        scored.sort_by_key(|e| std::cmp::Reverse(e.0));
+        scored.truncate(MAX_ITEMS);
+        let items: Vec<CompletionItem> = scored.into_iter().map(|(_, it)| it).collect();
 
         debug!(count = items.len(), prefix = %prefix, "syntax completion");
         Some(CompletionResponse::Array(items))
@@ -985,7 +946,11 @@ impl LanguageServer for Backend {
                 // (system task/function names).
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".into(), "`".into(), "$".into()]),
-                    resolve_provider: Some(false),
+                    // Lazy enrichment via `completionItem/resolve` — every
+                    // syntax-side item ships a `data` payload that the
+                    // resolve handler turns into a markdown documentation
+                    // block (the declaration line) on demand.
+                    resolve_provider: Some(true),
                     ..Default::default()
                 }),
                 // We publish diagnostics as a *push* (via the `Client`) on
@@ -1253,6 +1218,57 @@ impl LanguageServer for Backend {
             return Ok(Some(resp));
         }
         Ok(self.syntax_completion(&uri, target).await)
+    }
+
+    /// Lazily enrich a completion item with the declaration line as
+    /// markdown documentation. Items without a [`CompletionResolveData`]
+    /// payload (keywords, slang-sourced items) are returned unchanged.
+    ///
+    /// Cheap path: one rope slice on the document text — no parser run,
+    /// no workspace scan. If the document isn't open and isn't on disk,
+    /// the documentation is left empty.
+    #[instrument(level = "debug", skip_all, fields(label = %item.label))]
+    async fn completion_resolve(&self, item: CompletionItem) -> LspResult<CompletionItem> {
+        let Some(data) = item.data.clone() else {
+            return Ok(item);
+        };
+        let resolve: CompletionResolveData = match serde_json::from_value(data) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(error = %e, "completionItem/resolve: malformed data, returning unchanged");
+                return Ok(item);
+            }
+        };
+
+        // Try the open-doc store first; fall back to a disk read so
+        // cross-file items resolve even when the user hasn't opened the
+        // declaring file yet.
+        let line_text: Option<String> = {
+            let docs = self.documents.read().await;
+            docs.get(&resolve.url).and_then(|state| {
+                let rope = Rope::from_str(&state.document.text());
+                read_line_trimmed(&rope, resolve.line)
+            })
+        }
+        .or_else(|| {
+            resolve
+                .url
+                .to_file_path()
+                .ok()
+                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .and_then(|text| read_line_trimmed(&Rope::from_str(&text), resolve.line))
+        });
+
+        if let Some(line) = line_text {
+            let mut item = item;
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```systemverilog\n{line}\n```"),
+            }));
+            Ok(item)
+        } else {
+            Ok(item)
+        }
     }
 }
 
@@ -1986,6 +2002,118 @@ fn detect_macro_trigger(rope: &Rope, pos: MPosition) -> Option<String> {
     }
 
     None
+}
+
+/// Payload stored in `CompletionItem.data` so a later
+/// `completionItem/resolve` request can re-locate the symbol cheaply
+/// (no re-parse, no workspace re-scan) and read its declaration line
+/// out of the rope.
+///
+/// Only attached to syntax-side user-symbol items (same-file + cross-file
+/// from the workspace index). Keywords and slang-sourced items leave
+/// `data` empty — keywords have no declaration to read, and the slang
+/// sidecar doesn't yet return ranges (a follow-up).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CompletionResolveData {
+    /// URL of the file the declaration lives in.
+    url: Url,
+    /// Zero-based line of the declaration (`Symbol::name_range.start.line`).
+    line: u32,
+}
+
+/// Build the `data` JSON payload that pairs with a syntax-side
+/// completion item. The result is `None` only on serde failure (which
+/// shouldn't happen for our shape) — the route then ships an item with
+/// no resolve data and the resolve handler treats it as a no-op.
+fn make_resolve_data(url: &Url, name_line: u32) -> Option<serde_json::Value> {
+    serde_json::to_value(CompletionResolveData {
+        url: url.clone(),
+        line: name_line,
+    })
+    .ok()
+}
+
+/// Read a line from `rope`, dropping any trailing CR/LF and the
+/// surrounding whitespace. Returns `None` for an out-of-bounds line so
+/// the resolve path can degrade gracefully if the rope drifted.
+fn read_line_trimmed(rope: &Rope, line: u32) -> Option<String> {
+    let idx = line as usize;
+    if idx >= rope.len_lines() {
+        return None;
+    }
+    let raw: String = rope.line(idx).chars().collect();
+    Some(raw.trim_end_matches(['\r', '\n']).trim().to_owned())
+}
+
+/// Build a `CompletionItem` for a SystemVerilog keyword.
+///
+/// When the keyword has a registered snippet body in
+/// [`mimir_syntax::keywords::KEYWORD_SNIPPETS`] (e.g. `module`, `class`,
+/// `always_ff`), the item carries `insert_text` + `Snippet` format and a
+/// `"snippet"` detail so the popup distinguishes it. Otherwise it's a
+/// bare keyword item — the editor inserts `label` verbatim.
+fn keyword_completion_item(kw: &'static str) -> CompletionItem {
+    match mimir_syntax::keywords::snippet_for(kw) {
+        Some(body) => CompletionItem {
+            label: kw.to_owned(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            detail: Some("snippet".to_owned()),
+            insert_text: Some(body.to_owned()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        },
+        None => CompletionItem {
+            label: kw.to_owned(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            ..Default::default()
+        },
+    }
+}
+
+/// Same-file vs cross-file syntax-side completion candidates.
+///
+/// Returned by [`Backend::gather_syntax_candidates`]. Streams are kept
+/// separate so callers can prioritise same-file hits in their dedup pass.
+struct SyntaxCandidates {
+    same_file: Vec<Symbol>,
+    cross_file: Vec<(Url, Symbol)>,
+}
+
+/// Build a [`SlangCompleteParams`] by lifting the six wire fields out of a
+/// resolved [`SlangDefinitionParams`] and stamping in the request `kind` /
+/// `prefix`. Centralises the field-shuffle that the three slang completion
+/// routes used to repeat verbatim.
+fn into_complete_params(
+    def: SlangDefinitionParams,
+    kind: SlangCompletionRequestKind,
+    prefix: Option<String>,
+) -> SlangCompleteParams {
+    SlangCompleteParams {
+        files: def.files,
+        include_dirs: def.include_dirs,
+        defines: def.defines,
+        top: def.top,
+        target_path: def.target_path,
+        target_position: def.target_position,
+        kind,
+        prefix,
+    }
+}
+
+/// Convert a vector of sidecar [`SlangCompletionItem`]s into an LSP
+/// [`CompletionResponse::Array`]. Single-source mapping for the three
+/// slang routes; keeps the field-by-field translation in one place.
+fn slang_items_to_response(items: Vec<SlangCompletionItem>) -> CompletionResponse {
+    let mapped: Vec<CompletionItem> = items
+        .into_iter()
+        .map(|it| CompletionItem {
+            label: it.label,
+            kind: Some(slang_completion_kind_to_lsp(it.kind)),
+            detail: it.detail,
+            ..Default::default()
+        })
+        .collect();
+    CompletionResponse::Array(mapped)
 }
 
 /// Map a sidecar numeric `kind` code to an LSP [`CompletionItemKind`].
@@ -3071,6 +3199,62 @@ mod tests {
             symbol_kind_to_completion_kind(MSymbolKind::Parameter),
             CompletionItemKind::CONSTANT,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // keyword_completion_item
+    // ------------------------------------------------------------------
+
+    /// `module` has a registered snippet → item carries `Snippet` format.
+    #[test]
+    fn keyword_with_snippet_emits_snippet_item() {
+        let item = keyword_completion_item("module");
+        assert_eq!(item.kind, Some(CompletionItemKind::KEYWORD));
+        assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        assert!(item.insert_text.as_deref().unwrap_or("").contains("endmodule"));
+        assert_eq!(item.detail.as_deref(), Some("snippet"));
+    }
+
+    /// A keyword without a snippet stays a bare keyword item.
+    #[test]
+    fn keyword_without_snippet_is_plain() {
+        let item = keyword_completion_item("if");
+        assert_eq!(item.kind, Some(CompletionItemKind::KEYWORD));
+        assert!(item.insert_text.is_none());
+        assert!(item.insert_text_format.is_none());
+        assert!(item.detail.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // CompletionResolveData / read_line_trimmed
+    // ------------------------------------------------------------------
+
+    /// `make_resolve_data` round-trips through serde back into a
+    /// `CompletionResolveData` matching the inputs.
+    #[test]
+    fn resolve_data_round_trips() {
+        let url = Url::parse("file:///tmp/a.sv").unwrap();
+        let value = make_resolve_data(&url, 42).expect("serializes");
+        let back: CompletionResolveData = serde_json::from_value(value).unwrap();
+        assert_eq!(back.url, url);
+        assert_eq!(back.line, 42);
+    }
+
+    /// `read_line_trimmed` returns the line text minus surrounding
+    /// whitespace and the trailing newline.
+    #[test]
+    fn read_line_trimmed_strips_whitespace_and_newline() {
+        let rope = ropey::Rope::from_str("module foo;\n  class bar;\nendmodule\n");
+        assert_eq!(read_line_trimmed(&rope, 0).as_deref(), Some("module foo;"));
+        assert_eq!(read_line_trimmed(&rope, 1).as_deref(), Some("class bar;"));
+        assert_eq!(read_line_trimmed(&rope, 2).as_deref(), Some("endmodule"));
+    }
+
+    /// Out-of-bounds line returns `None`, not a panic.
+    #[test]
+    fn read_line_trimmed_oob_returns_none() {
+        let rope = ropey::Rope::from_str("only one line\n");
+        assert_eq!(read_line_trimmed(&rope, 99), None);
     }
 
     // ------------------------------------------------------------------

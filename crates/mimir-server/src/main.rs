@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tower_lsp::{LspService, Server};
 
 mod backend;
+mod completion_score;
 mod project;
 mod workspace_index;
 

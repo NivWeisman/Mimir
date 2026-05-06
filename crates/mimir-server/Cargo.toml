@@ -30,6 +30,7 @@ toml               = { workspace = true }
 thiserror          = { workspace = true }
 anyhow             = { workspace = true }
 ropey              = { workspace = true }
+nucleo-matcher     = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

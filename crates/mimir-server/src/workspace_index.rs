@@ -111,30 +111,14 @@ impl WorkspaceIndex {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// All entries whose name starts with `prefix` (case-insensitive), up
-    /// to `limit` total results.
+    /// Iterate every entry in the index, no filtering or ordering.
     ///
-    /// Linear scan over `by_name` keys — O(total_symbols). Fine for the
-    /// ~10K symbols typical of a mid-size UVM project; a trie is only
-    /// warranted if profiling shows this path hot.
-    ///
-    /// Order is HashMap iteration order (i.e. arbitrary but stable within
-    /// a session). The editor's popup re-sorts by best match anyway.
-    #[must_use]
-    pub fn lookup_prefix(&self, prefix: &str, limit: usize) -> Vec<&Entry> {
-        let prefix_lower = prefix.to_ascii_lowercase();
-        let mut out: Vec<&Entry> = Vec::new();
-        'outer: for (name, entries) in &self.by_name {
-            if name.to_ascii_lowercase().starts_with(&prefix_lower) {
-                for entry in entries {
-                    out.push(entry);
-                    if out.len() >= limit {
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        out
+    /// Used by the fuzzy-scoring completion path which needs to consider
+    /// all candidates (subsequence matches that aren't prefix matches).
+    /// Order is HashMap iteration order — arbitrary but stable in-session;
+    /// callers that need ranking apply their own sort.
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.by_name.values().flatten()
     }
 }
 
@@ -301,67 +285,28 @@ mod tests {
             .any(|s| s.name == "b" && s.kind == SymbolKind::Class));
     }
 
-    /// `lookup_prefix` returns all entries whose name starts with the prefix
-    /// (case-insensitive) across all registered URLs.
+    /// `entries()` yields every registered entry across all URLs.
+    /// Order is unspecified (HashMap iteration), but every entry must
+    /// appear exactly once.
     #[test]
-    fn lookup_prefix_finds_matching_entries() {
+    fn entries_yields_every_registered_entry() {
         let mut idx = WorkspaceIndex::new();
         idx.update(
             url("file:///a.sv"),
             &[
                 sym("my_class", SymbolKind::Class, 0),
                 sym("my_module", SymbolKind::Module, 1),
-                sym("other", SymbolKind::Package, 2),
             ],
         );
-        let hits = idx.lookup_prefix("my_", 100);
-        assert_eq!(hits.len(), 2);
-        let names: Vec<&str> = hits.iter().map(|e| e.symbol.name.as_str()).collect();
+        idx.update(
+            url("file:///b.sv"),
+            &[sym("other", SymbolKind::Package, 2)],
+        );
+        let names: Vec<&str> = idx.entries().map(|e| e.symbol.name.as_str()).collect();
+        assert_eq!(names.len(), 3);
         assert!(names.contains(&"my_class"));
         assert!(names.contains(&"my_module"));
-    }
-
-    /// `lookup_prefix` is case-insensitive: `"MY_"` matches `"my_class"`.
-    #[test]
-    fn lookup_prefix_is_case_insensitive() {
-        let mut idx = WorkspaceIndex::new();
-        idx.update(
-            url("file:///a.sv"),
-            &[sym("my_class", SymbolKind::Class, 0)],
-        );
-        assert_eq!(idx.lookup_prefix("MY_", 100).len(), 1);
-    }
-
-    /// `lookup_prefix` with an empty prefix returns all entries (up to
-    /// `limit`).
-    #[test]
-    fn lookup_prefix_empty_prefix_matches_all() {
-        let mut idx = WorkspaceIndex::new();
-        idx.update(
-            url("file:///a.sv"),
-            &[
-                sym("alpha", SymbolKind::Module, 0),
-                sym("beta", SymbolKind::Class, 1),
-            ],
-        );
-        let hits = idx.lookup_prefix("", 100);
-        assert_eq!(hits.len(), 2);
-    }
-
-    /// `limit` caps the returned slice length.
-    #[test]
-    fn lookup_prefix_respects_limit() {
-        let mut idx = WorkspaceIndex::new();
-        idx.update(
-            url("file:///a.sv"),
-            &[
-                sym("foo_a", SymbolKind::Module, 0),
-                sym("foo_b", SymbolKind::Class, 1),
-                sym("foo_c", SymbolKind::Task, 2),
-            ],
-        );
-        let hits = idx.lookup_prefix("foo", 2);
-        assert_eq!(hits.len(), 2);
+        assert!(names.contains(&"other"));
     }
 
     /// Paths the reader can't satisfy are skipped (no panic, no entry).
