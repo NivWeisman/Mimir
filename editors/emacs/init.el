@@ -12,6 +12,45 @@
 ;;
 ;; ---------------------------------------------------------------------------
 
+;;; ---------- use-package bootstrap -----------------------------------------
+;;
+;; Ensures use-package is available. Built into Emacs 29+; install it from
+;; MELPA on older versions. Place this before any `use-package' call.
+
+(unless (package-installed-p 'use-package)
+  (require 'package)
+  (add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
+  (package-refresh-contents)
+  (package-install 'use-package))
+
+(require 'use-package)
+(setq use-package-always-ensure t)  ; treat :ensure t as the default
+
+
+;;; ---------- Option 0: evil-mode (Vim keybindings) -------------------------
+;;
+;; Uncomment to enable evil-mode for Vim-style editing. Requires:
+;;   M-x package-install RET evil RET
+;; Or with use-package:
+
+(use-package evil
+  :ensure t
+  :init
+  (setq evil-want-integration t
+        evil-want-keybinding nil)  ; set to t if not using evil-collection
+  :config
+  (evil-mode 1))
+
+;; Optionally pair with evil-collection for consistent bindings in other modes:
+;;   M-x package-install RET evil-collection RET
+
+(use-package evil-collection
+  :after evil
+  :ensure t
+  :config
+  (evil-collection-init))
+
+
 ;;; ---------- Option 1: eglot (built-in, minimal) ---------------------------
 
 (with-eval-after-load 'eglot
