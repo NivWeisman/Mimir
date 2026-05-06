@@ -573,7 +573,18 @@ impl Backend {
             .slang_complete_request(uri, pos, kind, wire_prefix)
             .await?;
         if items.is_empty() {
-            debug!("slang member completion: no items; falling back to syntax");
+            // Route 2 (`completion` LSP method) returns an empty array when
+            // a `.` / `::` trigger is present and slang yields nothing —
+            // no syntax fallback for member-access (would surface unrelated
+            // workspace symbols, the "workspace dump" anti-pattern). Make
+            // the log say what actually happens so the user can diagnose
+            // (usually: type or package not in elaboration unit; check the
+            // `.mimir.toml` filelist and `+incdir+`).
+            debug!(
+                is_pkg_scope,
+                prefix = %member_prefix,
+                "slang member completion: 0 items; popup will be empty (no syntax fallback for member-access)",
+            );
             return None;
         }
         let prefix_lower = member_prefix.to_ascii_lowercase();
@@ -910,10 +921,12 @@ impl LanguageServer for Backend {
                     // lands (e.g. server shuts down first), F12 just
                     // degrades to same-file resolution, which is fine.
                     let paths = resolved.files.clone();
+                    let include_dirs = resolved.include_dirs.clone();
                     let parser = self.parser.clone();
                     let workspace_index = self.workspace_index.clone();
                     tokio::spawn(async move {
-                        hydrate_workspace_index(paths, parser, workspace_index).await;
+                        hydrate_workspace_index(paths, include_dirs, parser, workspace_index)
+                            .await;
                     });
                     *self.project.write().await = Some(resolved);
                 }
@@ -955,10 +968,17 @@ impl LanguageServer for Backend {
                 // cursor on class → all direct subclasses.
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 // Syntax-only for stages 1–4; slang takes over for stages 5–6.
-                // Trigger characters: `.` (member access), `` ` `` (macros), `$`
-                // (system task/function names).
+                // Trigger characters: `.` (member access), `` ` `` (macros),
+                // `$` (system task/function names), `:` (the first half of
+                // `::`; the handler runs again on the second colon, where
+                // `detect_member_access` recognises the package-scope trigger).
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".into(), "`".into(), "$".into()]),
+                    trigger_characters: Some(vec![
+                        ".".into(),
+                        "`".into(),
+                        "$".into(),
+                        ":".into(),
+                    ]),
                     // Lazy enrichment via `completionItem/resolve` — every
                     // syntax-side item ships a `data` payload that the
                     // resolve handler turns into a markdown documentation
@@ -1352,13 +1372,14 @@ fn workspace_root_path(params: &InitializeParams) -> Option<PathBuf> {
 /// large generated headers we may revisit.
 async fn hydrate_workspace_index(
     paths: Vec<PathBuf>,
+    include_dirs: Vec<PathBuf>,
     parser: Arc<Mutex<SyntaxParser>>,
     workspace_index: Arc<RwLock<WorkspaceIndex>>,
 ) {
     let count_requested = paths.len();
     let entries = {
         let mut p = parser.lock().await;
-        workspace_index::hydrate_from_paths(&paths, &mut p, |path| {
+        workspace_index::hydrate_from_paths(&paths, &include_dirs, &mut p, |path| {
             std::fs::read_to_string(path).ok()
         })
     };
@@ -1459,6 +1480,44 @@ fn assemble_elaborate_params(
             });
             files_in_request.push(url.clone());
         }
+    }
+
+    // Follow `` `include`` directives recursively so unsaved edits in any
+    // included file reach slang and so the request matches the on-disk
+    // header set even when the user's `.f` only lists umbrella files
+    // (e.g. `uvm.sv` that itself `` `include`` s `uvm_pkg.sv`). The
+    // expansion uses an open-buffer-aware reader: open documents win
+    // over disk, exactly as for the seed list above.
+    let seeds: Vec<PathBuf> = files.iter().map(|sf| PathBuf::from(&sf.path)).collect();
+    let combined_read = |path: &std::path::Path| -> Option<String> {
+        if let Some((_, text)) = open_text.get(path) {
+            return Some(text.clone());
+        }
+        read_disk(path)
+    };
+    let expanded = crate::includes::expand_includes(&seeds, &project.include_dirs, combined_read);
+    for path in expanded {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let (url, text) = match open_text.get(&path) {
+            Some((url, text)) => (url.clone(), text.clone()),
+            None => {
+                let text = read_disk(&path).unwrap_or_default();
+                let url = Url::from_file_path(&path)
+                    .unwrap_or_else(|()| placeholder_url(&path));
+                (url, text)
+            }
+        };
+        files.push(SourceFile {
+            path: path.display().to_string(),
+            text,
+            // Includees are headers, not roots — let slang's preprocessor
+            // pull them in via `include` rather than wrapping each as a
+            // standalone compilation unit.
+            is_compilation_unit: false,
+        });
+        files_in_request.push(url);
     }
 
     let include_dirs = project
@@ -2510,7 +2569,7 @@ mod tests {
     // --- Stage 3: elaborate-params assembly + publish planning ----------
 
     use crate::project::ResolvedProject;
-    use mimir_slang::{ElaborateResult, SourceFile};
+    use mimir_slang::ElaborateResult;
     use std::path::PathBuf;
 
     /// Helper: a `ResolvedProject` with `n` files, `top` set, default
@@ -2617,6 +2676,81 @@ mod tests {
 
         assert_eq!(params.files.len(), 1);
         assert_eq!(files_in_request.len(), 1);
+    }
+
+    /// `assemble_elaborate_params` follows `` `include`` directives so
+    /// `uvm_pkg.sv` reaches slang via the `files` array even though only
+    /// the umbrella `uvm.sv` is in the project filelist. Includees come
+    /// in marked `is_compilation_unit = false` so slang treats them as
+    /// headers rather than roots.
+    #[test]
+    fn assemble_inlines_included_files() {
+        let umbrella = PathBuf::from("/proj/uvm.sv");
+        let mut project = project_with_files(vec![umbrella.clone()]);
+        project.include_dirs = vec![PathBuf::from("/uvm/src")];
+
+        let pkg = PathBuf::from("/uvm/src/uvm_pkg.sv");
+        let texts: HashMap<PathBuf, String> = HashMap::from([
+            (umbrella.clone(), "`include \"uvm_pkg.sv\"\n".into()),
+            (pkg.clone(), "package uvm_pkg; endpackage\n".into()),
+        ]);
+
+        let (params, files_in_request) =
+            assemble_elaborate_params(&project, &HashMap::new(), |p| texts.get(p).cloned());
+
+        let paths: Vec<&str> = params.files.iter().map(|sf| sf.path.as_str()).collect();
+        assert!(paths.contains(&"/proj/uvm.sv"), "{paths:?}");
+        assert!(paths.contains(&"/uvm/src/uvm_pkg.sv"), "{paths:?}");
+        let pkg_entry = params
+            .files
+            .iter()
+            .find(|sf| sf.path == "/uvm/src/uvm_pkg.sv")
+            .expect("uvm_pkg.sv in request");
+        assert!(
+            !pkg_entry.is_compilation_unit,
+            "includee should not be a compilation unit"
+        );
+        assert_eq!(pkg_entry.text, "package uvm_pkg; endpackage\n");
+        // files_in_request mirrors the new file count.
+        assert_eq!(files_in_request.len(), params.files.len());
+    }
+
+    /// When an `` `include`` d file is open in the editor, the assembler
+    /// uses the open-buffer text instead of the disk text. Without this,
+    /// unsaved edits to `uvm_pkg.sv` would never reach slang.
+    #[test]
+    fn assemble_inlines_included_files_open_buffer_wins() {
+        let umbrella = PathBuf::from("/proj/uvm.sv");
+        let mut project = project_with_files(vec![umbrella.clone()]);
+        project.include_dirs = vec![PathBuf::from("/uvm/src")];
+
+        let pkg = PathBuf::from("/uvm/src/uvm_pkg.sv");
+        let pkg_url = Url::from_file_path(&pkg).unwrap();
+        let mut open_text = HashMap::new();
+        open_text.insert(
+            pkg.clone(),
+            (pkg_url.clone(), "package uvm_pkg; /* edited */ endpackage\n".into()),
+        );
+
+        let disk: HashMap<PathBuf, String> = HashMap::from([
+            (umbrella.clone(), "`include \"uvm_pkg.sv\"\n".into()),
+            (pkg.clone(), "package uvm_pkg; /* on disk */ endpackage\n".into()),
+        ]);
+
+        let (params, _) =
+            assemble_elaborate_params(&project, &open_text, |p| disk.get(p).cloned());
+
+        let pkg_entry = params
+            .files
+            .iter()
+            .find(|sf| sf.path == "/uvm/src/uvm_pkg.sv")
+            .expect("uvm_pkg.sv in request");
+        assert!(
+            pkg_entry.text.contains("edited"),
+            "open buffer text should win: {:?}",
+            pkg_entry.text
+        );
+        assert!(!pkg_entry.is_compilation_unit);
     }
 
     /// Plan: every requested file gets a publish, including files with
@@ -3156,11 +3290,47 @@ mod tests {
     #[test]
     fn completion_options_trigger_characters() {
         let opts = CompletionOptions {
-            trigger_characters: Some(vec![".".into(), "`".into(), "$".into()]),
+            trigger_characters: Some(vec![
+                ".".into(),
+                "`".into(),
+                "$".into(),
+                ":".into(),
+            ]),
             resolve_provider: Some(false),
             ..Default::default()
         };
-        assert_eq!(opts.trigger_characters.unwrap().len(), 3);
+        assert_eq!(opts.trigger_characters.unwrap().len(), 4);
+    }
+
+    /// `initialize` must advertise `:` as a trigger character so the editor
+    /// fires `textDocument/completion` after the second colon of `pkg::`.
+    /// Without this, package-scope completion silently never runs (no
+    /// request, no log).
+    #[tokio::test]
+    async fn initialize_advertises_colon_trigger() {
+        let (service, _socket) =
+            tower_lsp::LspService::new(|client| Backend::new(client, None));
+        #[allow(deprecated)]
+        let init = InitializeParams {
+            root_uri: None,
+            workspace_folders: None,
+            ..Default::default()
+        };
+        let result = service
+            .inner()
+            .initialize(init)
+            .await
+            .expect("initialize ok");
+        let triggers = result
+            .capabilities
+            .completion_provider
+            .expect("completion provider")
+            .trigger_characters
+            .expect("trigger chars");
+        assert!(triggers.iter().any(|s| s == ":"), "expected `:` in {triggers:?}");
+        assert!(triggers.iter().any(|s| s == "."), "expected `.` in {triggers:?}");
+        assert!(triggers.iter().any(|s| s == "`"), "expected backtick in {triggers:?}");
+        assert!(triggers.iter().any(|s| s == "$"), "expected `$` in {triggers:?}");
     }
 
     // ------------------------------------------------------------------

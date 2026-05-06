@@ -122,12 +122,20 @@ impl WorkspaceIndex {
     }
 }
 
-/// Parse every path in `paths` and build a `(Url, Vec<Symbol>)` pair for
-/// each one we could read.
+/// Parse every path in `paths` (plus everything they `` `include`` ,
+/// transitively) and build a `(Url, Vec<Symbol>)` pair for each one we
+/// could read.
+///
+/// `include_dirs` is consulted by [`crate::includes::expand_includes`] when
+/// resolving relative `` `include`` filenames; the file's own directory is
+/// tried first, mirroring slang's preprocessor.
 ///
 /// `read_disk` is the disk-read seam — production passes
 /// `|p| std::fs::read_to_string(p).ok()`; tests pass an in-memory map.
-/// Mirrors the pattern at `assemble_elaborate_params`.
+/// Mirrors the pattern at `assemble_elaborate_params`. The closure is
+/// invoked twice per file in the worst case (once during include
+/// expansion, once during parsing) — fine for the one-shot eager hydration
+/// at startup.
 ///
 /// Paths that the reader returns `None` for are skipped with a `warn!` log
 /// — usually means a stale filelist entry pointing at a deleted file.
@@ -140,11 +148,13 @@ impl WorkspaceIndex {
 #[must_use]
 pub fn hydrate_from_paths(
     paths: &[PathBuf],
+    include_dirs: &[PathBuf],
     parser: &mut SyntaxParser,
     mut read_disk: impl FnMut(&Path) -> Option<String>,
 ) -> Vec<(Url, Vec<Symbol>)> {
-    let mut out: Vec<(Url, Vec<Symbol>)> = Vec::with_capacity(paths.len());
-    for path in paths {
+    let all_paths = crate::includes::expand_includes(paths, include_dirs, &mut read_disk);
+    let mut out: Vec<(Url, Vec<Symbol>)> = Vec::with_capacity(all_paths.len());
+    for path in &all_paths {
         let Some(text) = read_disk(path) else {
             warn!(path = %path.display(), "workspace index: file unreadable; skipping");
             continue;
@@ -171,7 +181,8 @@ pub fn hydrate_from_paths(
     }
     debug!(
         parsed = out.len(),
-        requested = paths.len(),
+        seeds = paths.len(),
+        expanded = all_paths.len(),
         "hydrate_from_paths done"
     );
     out
@@ -266,9 +277,12 @@ mod tests {
             (p2.clone(), "class b; endclass\n".to_string()),
         ]);
 
-        let result = hydrate_from_paths(&[p1.clone(), p2.clone()], &mut parser, |p| {
-            texts.get(p).cloned()
-        });
+        let result = hydrate_from_paths(
+            &[p1.clone(), p2.clone()],
+            &[],
+            &mut parser,
+            |p| texts.get(p).cloned(),
+        );
 
         assert_eq!(result.len(), 2);
         // a.sv -> module 'a'
@@ -318,11 +332,54 @@ mod tests {
         let texts: HashMap<PathBuf, String> =
             HashMap::from([(ok.clone(), "module ok; endmodule\n".to_string())]);
 
-        let result = hydrate_from_paths(&[ok.clone(), missing], &mut parser, |p| {
-            texts.get(p).cloned()
-        });
+        let result = hydrate_from_paths(
+            &[ok.clone(), missing],
+            &[],
+            &mut parser,
+            |p| texts.get(p).cloned(),
+        );
 
         assert_eq!(result.len(), 1, "missing path should be dropped silently");
         assert_eq!(result[0].0, Url::from_file_path(&ok).unwrap());
+    }
+
+    /// `hydrate_from_paths` follows `` `include`` directives, so a single
+    /// seed file can pull `uvm_pkg.sv` (and its content) into the workspace
+    /// index even though only `uvm.sv` is in the filelist.
+    #[test]
+    fn hydrate_from_paths_follows_includes() {
+        let mut parser = SyntaxParser::new().unwrap();
+        let umbrella = PathBuf::from("/proj/uvm.sv");
+        let pkg = PathBuf::from("/uvm/src/uvm_pkg.sv");
+        let texts: HashMap<PathBuf, String> = HashMap::from([
+            (umbrella.clone(), "`include \"uvm_pkg.sv\"\n".to_string()),
+            (
+                pkg.clone(),
+                "package uvm_pkg; class uvm_object; endclass endpackage\n".to_string(),
+            ),
+        ]);
+
+        let result = hydrate_from_paths(
+            &[umbrella.clone()],
+            &[PathBuf::from("/uvm/src")],
+            &mut parser,
+            |p| texts.get(p).cloned(),
+        );
+
+        // Both files end up in the index — uvm.sv from the seed, uvm_pkg.sv
+        // from the include expansion.
+        assert_eq!(result.len(), 2);
+        let names: Vec<String> = result
+            .iter()
+            .flat_map(|(_, syms)| syms.iter().map(|s| s.name.clone()))
+            .collect();
+        assert!(
+            names.contains(&"uvm_pkg".to_string()),
+            "expected uvm_pkg in {names:?}"
+        );
+        assert!(
+            names.contains(&"uvm_object".to_string()),
+            "expected uvm_object in {names:?}"
+        );
     }
 }

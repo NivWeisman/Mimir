@@ -411,9 +411,8 @@ mod tests {
             let mut closes = 0;
             // Count `}` that aren't part of `${`. A simple state-walk
             // suffices: we don't have nested braces in our snippets.
-            let mut chars = body.chars().peekable();
             let mut prev = ' ';
-            while let Some(c) = chars.next() {
+            for c in body.chars() {
                 if c == '}' && prev != '$' {
                     closes += 1;
                 }

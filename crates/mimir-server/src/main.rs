@@ -20,6 +20,7 @@ use tower_lsp::{LspService, Server};
 
 mod backend;
 mod completion_score;
+mod includes;
 mod project;
 mod workspace_index;
 
