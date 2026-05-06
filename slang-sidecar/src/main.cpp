@@ -1352,12 +1352,13 @@ static bool ci_starts_with(std::string_view name, std::string_view prefix) {
 }
 
 // LSP CompletionItemKind codes used by the sidecar.
-// 2=Method, 5=Field, 6=Variable, 20=EnumMember, 21=Constant.
+// 2=Method, 5=Field, 6=Variable, 9=Module, 20=EnumMember, 21=Constant.
 static uint8_t member_kind_code(slang::ast::SymbolKind k) {
     using K = slang::ast::SymbolKind;
     switch (k) {
         case K::Subroutine:    return 2;   // Method
         case K::Field:         return 5;   // Field
+        case K::Package:       return 9;   // Module (closest LSP kind for a package)
         case K::EnumValue:     return 20;  // EnumMember
         case K::Parameter:
         case K::TypeParameter: return 21;  // Constant
@@ -1463,7 +1464,16 @@ static json handle_complete(const json& params) {
 
         std::string_view lhs_name = text.substr(name_start, scope_end - name_start);
 
-        // Search for a Package or ClassType with this name in the compilation root.
+        // Try by package name first — packages live in the compilation's package
+        // map, not as direct root scope members, so iterating getRoot().members()
+        // alone misses them (they're nested inside CompilationUnitSymbol children).
+        if (const auto* pkg = compilation.getPackage(lhs_name)) {
+            enumerate_scope_members(*pkg, prefix, result["items"]);
+            return result;
+        }
+
+        // Fall back to root direct members for anything else (e.g. top-level
+        // class types accessed via ClassName::).
         for (const auto& member : compilation.getRoot().members()) {
             if (member.name != lhs_name) continue;
             if (auto* scope = member.as_if<Scope>()) {
@@ -1506,6 +1516,21 @@ static json handle_complete(const json& params) {
             }
             const slang::ast::Symbol& sym = scope->asSymbol();
             scope = sym.getParentScope();
+        }
+
+        // Packages are globally visible but live in CompilationUnitSymbol children,
+        // not in the syntactic scope chain. Emit them separately so the user can
+        // type a package prefix (e.g. "uvm_pk") and have "uvm_pkg" appear.
+        for (const auto* pkg : compilation.getPackages()) {
+            if (result["items"].size() >= IDENT_CAP) break;
+            if (!pkg || pkg->name.empty()) continue;
+            if (!prefix.empty() && !ci_starts_with(pkg->name, prefix)) continue;
+            auto name = std::string(pkg->name);
+            if (!seen.insert(name).second) continue;
+            json item;
+            item["label"] = name;
+            item["kind"]  = 9;  // Module (closest LSP kind for a package)
+            result["items"].push_back(std::move(item));
         }
         return result;
     }

@@ -1210,15 +1210,16 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
 
-        // Route 1: `` ` `` trigger — macro-name completion.
-        // The text says e.g. `` `MY_ ``, we detect the backtick and prefix.
+        // Read the document text once; used by both trigger-detection paths below.
         let text = {
             let docs = self.documents.read().await;
             docs.get(&uri).map(|s| s.document.text())
         };
-        if let Some(text) = text {
-            let rope = Rope::from_str(&text);
-            if let Some(macro_prefix) = detect_macro_trigger(&rope, target) {
+        let rope = text.as_deref().map(Rope::from_str);
+
+        // Route 1: `` ` `` trigger — macro-name completion.
+        if let Some(rope) = &rope {
+            if let Some(macro_prefix) = detect_macro_trigger(rope, target) {
                 if let Some(resp) =
                     self.try_slang_macro_completion(&uri, target, &macro_prefix).await
                 {
@@ -1230,9 +1231,20 @@ impl LanguageServer for Backend {
         }
 
         // Route 2: `.` or `::` trigger — member / package-scope completion.
-        // Slang-only; no syntax fallback (without types, guessing is unhelpful).
+        // Slang-only: without type information, any fallback would suggest
+        // unrelated workspace symbols (the "workspace dump" anti-pattern).
+        // If the trigger is present but slang can't resolve it, return empty
+        // rather than polluting the popup with irrelevant candidates.
+        let has_member_trigger = rope
+            .as_ref()
+            .map(|r| detect_member_access(r, target).is_some())
+            .unwrap_or(false);
+
         if let Some(resp) = self.try_slang_member_completion(&uri, target).await {
             return Ok(Some(resp));
+        }
+        if has_member_trigger {
+            return Ok(Some(CompletionResponse::Array(vec![])));
         }
 
         // Route 3: plain identifier — scope-aware completion.
