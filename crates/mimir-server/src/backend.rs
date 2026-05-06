@@ -1471,6 +1471,12 @@ fn assemble_elaborate_params(
     // `SyntaxTree` (which would be wrong: an includee out of its
     // `package` context produces spurious errors, and the buffer
     // collides with the one the preprocessor pulled in via include).
+    //
+    // Headers that aren't open in the editor are intentionally NOT
+    // pulled in here — slang's preprocessor reads them straight from
+    // disk via `+incdir+`. Inlining the full include closure (e.g. all
+    // of UVM) would balloon every request to multi-MB and pay no
+    // dividend the preprocessor can't already deliver.
     for (path, (url, text)) in open_text {
         if seen.insert(path.clone()) {
             files.push(SourceFile {
@@ -1480,44 +1486,6 @@ fn assemble_elaborate_params(
             });
             files_in_request.push(url.clone());
         }
-    }
-
-    // Follow `` `include`` directives recursively so unsaved edits in any
-    // included file reach slang and so the request matches the on-disk
-    // header set even when the user's `.f` only lists umbrella files
-    // (e.g. `uvm.sv` that itself `` `include`` s `uvm_pkg.sv`). The
-    // expansion uses an open-buffer-aware reader: open documents win
-    // over disk, exactly as for the seed list above.
-    let seeds: Vec<PathBuf> = files.iter().map(|sf| PathBuf::from(&sf.path)).collect();
-    let combined_read = |path: &std::path::Path| -> Option<String> {
-        if let Some((_, text)) = open_text.get(path) {
-            return Some(text.clone());
-        }
-        read_disk(path)
-    };
-    let expanded = crate::includes::expand_includes(&seeds, &project.include_dirs, combined_read);
-    for path in expanded {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let (url, text) = match open_text.get(&path) {
-            Some((url, text)) => (url.clone(), text.clone()),
-            None => {
-                let text = read_disk(&path).unwrap_or_default();
-                let url = Url::from_file_path(&path)
-                    .unwrap_or_else(|()| placeholder_url(&path));
-                (url, text)
-            }
-        };
-        files.push(SourceFile {
-            path: path.display().to_string(),
-            text,
-            // Includees are headers, not roots — let slang's preprocessor
-            // pull them in via `include` rather than wrapping each as a
-            // standalone compilation unit.
-            is_compilation_unit: false,
-        });
-        files_in_request.push(url);
     }
 
     let include_dirs = project
@@ -2678,13 +2646,14 @@ mod tests {
         assert_eq!(files_in_request.len(), 1);
     }
 
-    /// `assemble_elaborate_params` follows `` `include`` directives so
-    /// `uvm_pkg.sv` reaches slang via the `files` array even though only
-    /// the umbrella `uvm.sv` is in the project filelist. Includees come
-    /// in marked `is_compilation_unit = false` so slang treats them as
-    /// headers rather than roots.
+    /// `assemble_elaborate_params` does NOT inline transitively
+    /// `` `include`` d files into the slang request. Headers reach the
+    /// sidecar via slang's own preprocessor (`+incdir+` lookup); inlining
+    /// the full closure (e.g. all of UVM) would balloon every request to
+    /// multi-megabytes for no behavioural gain. The "open header" case is
+    /// already covered by `assemble_appends_open_docs_not_in_filelist`.
     #[test]
-    fn assemble_inlines_included_files() {
+    fn assemble_does_not_expand_includes_into_request() {
         let umbrella = PathBuf::from("/proj/uvm.sv");
         let mut project = project_with_files(vec![umbrella.clone()]);
         project.include_dirs = vec![PathBuf::from("/uvm/src")];
@@ -2695,62 +2664,11 @@ mod tests {
             (pkg.clone(), "package uvm_pkg; endpackage\n".into()),
         ]);
 
-        let (params, files_in_request) =
+        let (params, _) =
             assemble_elaborate_params(&project, &HashMap::new(), |p| texts.get(p).cloned());
 
         let paths: Vec<&str> = params.files.iter().map(|sf| sf.path.as_str()).collect();
-        assert!(paths.contains(&"/proj/uvm.sv"), "{paths:?}");
-        assert!(paths.contains(&"/uvm/src/uvm_pkg.sv"), "{paths:?}");
-        let pkg_entry = params
-            .files
-            .iter()
-            .find(|sf| sf.path == "/uvm/src/uvm_pkg.sv")
-            .expect("uvm_pkg.sv in request");
-        assert!(
-            !pkg_entry.is_compilation_unit,
-            "includee should not be a compilation unit"
-        );
-        assert_eq!(pkg_entry.text, "package uvm_pkg; endpackage\n");
-        // files_in_request mirrors the new file count.
-        assert_eq!(files_in_request.len(), params.files.len());
-    }
-
-    /// When an `` `include`` d file is open in the editor, the assembler
-    /// uses the open-buffer text instead of the disk text. Without this,
-    /// unsaved edits to `uvm_pkg.sv` would never reach slang.
-    #[test]
-    fn assemble_inlines_included_files_open_buffer_wins() {
-        let umbrella = PathBuf::from("/proj/uvm.sv");
-        let mut project = project_with_files(vec![umbrella.clone()]);
-        project.include_dirs = vec![PathBuf::from("/uvm/src")];
-
-        let pkg = PathBuf::from("/uvm/src/uvm_pkg.sv");
-        let pkg_url = Url::from_file_path(&pkg).unwrap();
-        let mut open_text = HashMap::new();
-        open_text.insert(
-            pkg.clone(),
-            (pkg_url.clone(), "package uvm_pkg; /* edited */ endpackage\n".into()),
-        );
-
-        let disk: HashMap<PathBuf, String> = HashMap::from([
-            (umbrella.clone(), "`include \"uvm_pkg.sv\"\n".into()),
-            (pkg.clone(), "package uvm_pkg; /* on disk */ endpackage\n".into()),
-        ]);
-
-        let (params, _) =
-            assemble_elaborate_params(&project, &open_text, |p| disk.get(p).cloned());
-
-        let pkg_entry = params
-            .files
-            .iter()
-            .find(|sf| sf.path == "/uvm/src/uvm_pkg.sv")
-            .expect("uvm_pkg.sv in request");
-        assert!(
-            pkg_entry.text.contains("edited"),
-            "open buffer text should win: {:?}",
-            pkg_entry.text
-        );
-        assert!(!pkg_entry.is_compilation_unit);
+        assert_eq!(paths, vec!["/proj/uvm.sv"]);
     }
 
     /// Plan: every requested file gets a publish, including files with
