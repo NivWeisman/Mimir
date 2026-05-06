@@ -529,10 +529,30 @@ impl Backend {
         kind: SlangCompletionRequestKind,
         prefix: Option<String>,
     ) -> Option<Vec<SlangCompletionItem>> {
+        self.slang_complete_request_with_patch(uri, pos, kind, prefix, None)
+            .await
+    }
+
+    /// Variant of [`slang_complete_request`] that lets the caller patch the
+    /// target file's text and adjust the cursor before the request leaves
+    /// the server. Used by member-access completion to insert a placeholder
+    /// identifier after the trigger `.` so slang's parser produces a valid
+    /// `MemberAccessExpression` (instead of bailing on the dangling dot).
+    async fn slang_complete_request_with_patch(
+        &self,
+        uri: &Url,
+        pos: MPosition,
+        kind: SlangCompletionRequestKind,
+        prefix: Option<String>,
+        patch: Option<TargetTextPatch>,
+    ) -> Option<Vec<SlangCompletionItem>> {
         let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
-        let (def_params, _) =
+        let (mut def_params, _) =
             build_definition_params(&project, &self.documents, uri, pos).await?;
+        if let Some(patch) = patch {
+            apply_target_text_patch(&mut def_params, &patch);
+        }
         let params = into_complete_params(def_params, kind, prefix);
         match slang.complete(&params).await {
             Ok(result) => Some(result.items),
@@ -569,8 +589,27 @@ impl Backend {
         };
         let wire_prefix = (!member_prefix.is_empty()).then(|| member_prefix.clone());
 
+        // For member-access (`.` trigger) with no member typed yet, the
+        // buffer reads `a.|` — slang's parser sees an incomplete expression
+        // and produces no `NamedValueExpression` for `a`, so the sidecar's
+        // type lookup at the LHS returns null and we get zero items. Insert
+        // a placeholder identifier at the cursor so the line parses as
+        // `a.<sentinel>`: the AST then has a real `NamedValueExpression(a)`
+        // the sidecar can resolve, and the unknown sentinel member name is
+        // harmless (it just doesn't match any real member, so it never
+        // surfaces in the result list).
+        //
+        // Skipped for package-scope (`pkg::|`) because the sidecar's
+        // package-scope handler walks the text backward from the cursor to
+        // pull the LHS name and looks it up by name — it doesn't need a
+        // parsed RHS.
+        let patch = (!is_pkg_scope && member_prefix.is_empty())
+            .then(|| build_member_completion_sentinel(&rope, pos))
+            .flatten();
+        let send_pos = patch.as_ref().map_or(pos, |p| p.adjusted_position);
+
         let items = self
-            .slang_complete_request(uri, pos, kind, wire_prefix)
+            .slang_complete_request_with_patch(uri, send_pos, kind, wire_prefix, patch)
             .await?;
         if items.is_empty() {
             // Route 2 (`completion` LSP method) returns an empty array when
@@ -2119,6 +2158,55 @@ struct SyntaxCandidates {
     cross_file: Vec<(Url, Symbol)>,
 }
 
+/// Patch applied to a slang request so the sidecar sees a parseable
+/// version of the buffer. The completion-sentinel inserts a dummy
+/// identifier at the cursor; the LSP buffer is unchanged.
+#[derive(Debug, Clone)]
+struct TargetTextPatch {
+    /// Byte offset (UTF-8) at which `insert` is spliced into the file
+    /// identified by `SlangDefinitionParams::target_path`.
+    insert_byte_offset: usize,
+    /// Text inserted at `insert_byte_offset`.
+    insert: &'static str,
+    /// Cursor position to send to slang AFTER the splice — i.e. the
+    /// post-insert location of the original cursor (shifted right by
+    /// `insert.encode_utf16().count()`). LSP positions are UTF-16 units.
+    adjusted_position: MPosition,
+}
+
+/// Reserved identifier inserted by [`build_member_completion_sentinel`].
+/// Chosen to be unlikely to collide with any real symbol in user code:
+/// double underscores plus a `mimir_` prefix.
+const COMPLETION_SENTINEL: &str = "__mimir_complete__";
+
+/// Build a [`TargetTextPatch`] that inserts [`COMPLETION_SENTINEL`] at the
+/// cursor so a `.`-triggered completion produces a parseable
+/// `MemberAccessExpression`. Returns `None` only when the cursor position
+/// can't be turned into a byte offset (out-of-bounds line/character —
+/// shouldn't happen for a position the editor sent us, but we degrade
+/// gracefully rather than panic).
+fn build_member_completion_sentinel(rope: &Rope, pos: MPosition) -> Option<TargetTextPatch> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let utf16_shift = COMPLETION_SENTINEL.encode_utf16().count() as u32;
+    Some(TargetTextPatch {
+        insert_byte_offset: byte,
+        insert: COMPLETION_SENTINEL,
+        adjusted_position: MPosition::new(pos.line, pos.character + utf16_shift),
+    })
+}
+
+/// Splice `patch.insert` into the request's target file at the recorded
+/// byte offset. The target file is identified by `def.target_path`.
+fn apply_target_text_patch(def: &mut SlangDefinitionParams, patch: &TargetTextPatch) {
+    let target = def.target_path.clone();
+    for sf in def.files.iter_mut() {
+        if sf.path == target && patch.insert_byte_offset <= sf.text.len() {
+            sf.text.insert_str(patch.insert_byte_offset, patch.insert);
+            break;
+        }
+    }
+}
+
 /// Build a [`SlangCompleteParams`] by lifting the six wire fields out of a
 /// resolved [`SlangDefinitionParams`] and stamping in the request `kind` /
 /// `prefix`. Centralises the field-shuffle that the three slang completion
@@ -3201,6 +3289,62 @@ mod tests {
     fn route_implementation_returns_empty_when_slang_not_run() {
         let route = route_implementation(None);
         assert_eq!(route, ImplementationRoute::UseEmpty);
+    }
+
+    /// `build_member_completion_sentinel` inserts the sentinel at the
+    /// cursor's byte offset and shifts the LSP position right by the
+    /// sentinel's UTF-16 length. Without this, slang would see an
+    /// incomplete `a.` expression and fail to resolve the LHS type.
+    #[test]
+    fn member_completion_sentinel_inserts_at_cursor() {
+        // Single-line buffer "  a." with the cursor right after the dot
+        // (UTF-16 column 4).
+        let rope = Rope::from_str("  a.");
+        let pos = MPosition::new(0, 4);
+        let patch =
+            build_member_completion_sentinel(&rope, pos).expect("cursor in bounds");
+        assert_eq!(patch.insert, COMPLETION_SENTINEL);
+        assert_eq!(patch.insert_byte_offset, 4);
+        assert_eq!(patch.adjusted_position.line, 0);
+        assert_eq!(
+            patch.adjusted_position.character,
+            4 + COMPLETION_SENTINEL.encode_utf16().count() as u32,
+        );
+    }
+
+    /// `apply_target_text_patch` only patches the file matching the
+    /// request's `target_path` — sibling files in `files` keep their
+    /// original text.
+    #[test]
+    fn apply_target_text_patch_only_touches_target() {
+        let mut def = SlangDefinitionParams {
+            files: vec![
+                SourceFile {
+                    path: "/proj/a.sv".into(),
+                    text: "module a; endmodule".into(),
+                    is_compilation_unit: true,
+                },
+                SourceFile {
+                    path: "/proj/b.sv".into(),
+                    text: "module b; endmodule".into(),
+                    is_compilation_unit: true,
+                },
+            ],
+            include_dirs: vec![],
+            defines: vec![],
+            top: None,
+            target_path: "/proj/b.sv".into(),
+            target_position: MPosition::new(0, 9),
+        };
+        let patch = TargetTextPatch {
+            insert_byte_offset: 9,
+            insert: COMPLETION_SENTINEL,
+            adjusted_position: MPosition::new(0, 9),
+        };
+        apply_target_text_patch(&mut def, &patch);
+        assert_eq!(def.files[0].text, "module a; endmodule");
+        assert!(def.files[1].text.contains(COMPLETION_SENTINEL));
+        assert!(def.files[1].text.starts_with("module b;"));
     }
 
     /// `CompletionOptions` can be constructed with the trigger characters
