@@ -742,7 +742,12 @@ impl Backend {
         scored.truncate(MAX_ITEMS);
         let items: Vec<CompletionItem> = scored.into_iter().map(|(_, it)| it).collect();
 
-        debug!(count = items.len(), prefix = %macro_prefix, "syntax macro completion");
+        debug!(
+            count = items.len(),
+            prefix = %macro_prefix,
+            labels = ?items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            "syntax macro completion",
+        );
         Some(CompletionResponse::Array(items))
     }
 
@@ -840,7 +845,12 @@ impl Backend {
         scored.truncate(MAX_ITEMS);
         let items: Vec<CompletionItem> = scored.into_iter().map(|(_, it)| it).collect();
 
-        debug!(count = items.len(), prefix = %prefix, "syntax completion");
+        debug!(
+            count = items.len(),
+            prefix = %prefix,
+            labels = ?items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            "syntax completion",
+        );
         Some(CompletionResponse::Array(items))
     }
 }
@@ -2121,6 +2131,11 @@ fn slang_items_to_response(items: Vec<SlangCompletionItem>) -> CompletionRespons
             ..Default::default()
         })
         .collect();
+    debug!(
+        count = mapped.len(),
+        labels = ?mapped.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+        "slang completion response",
+    );
     CompletionResponse::Array(mapped)
 }
 
