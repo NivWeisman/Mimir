@@ -18,6 +18,10 @@
 //! 5. **IEEE 1800-2017 keyword list.** [`keywords::KEYWORDS`] and
 //!    [`keywords::matches_prefix`] provide a static list of all SV reserved
 //!    words for completion (no tree required).
+//! 6. **Foldable region extraction.** [`folding::folding_ranges`] walks the
+//!    tree and emits one [`FoldRange`] per top-level construct (module,
+//!    class, function, task, package, …). Powers `textDocument/foldingRange`
+//!    in `mimir-server`.
 //!
 //! ## Why tree-sitter?
 //!
@@ -37,10 +41,12 @@
 #![warn(rust_2018_idioms)]
 
 pub mod diagnostics;
+pub mod folding;
 pub mod keywords;
 pub mod parser;
 pub mod symbols;
 
 pub use diagnostics::{Diagnostic, DiagnosticSeverity};
+pub use folding::FoldRange;
 pub use parser::{SyntaxParser, SyntaxParserError, SyntaxTree};
 pub use symbols::{Symbol, SymbolKind};

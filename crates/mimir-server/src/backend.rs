@@ -1025,6 +1025,10 @@ impl LanguageServer for Backend {
                     resolve_provider: Some(true),
                     ..Default::default()
                 }),
+                // Pure tree-sitter feature: walk the SV tree and emit one
+                // foldable range per top-level construct (module, class,
+                // function, …). No semantic info, no symbol table needed.
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 // We publish diagnostics as a *push* (via the `Client`) on
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
@@ -1232,6 +1236,42 @@ impl LanguageServer for Backend {
         let symbols = nest_symbols(&index);
         debug!(count = symbols.len(), "document_symbol returned");
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    /// Pure tree-sitter feature: parse the document and emit foldable line
+    /// ranges for each module/class/function/task/package/etc. We re-parse
+    /// here rather than reading the cached `index` because folding cares
+    /// about the full tree shape, not just declarations.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> LspResult<Option<Vec<FoldingRange>>> {
+        let uri = params.text_document.uri;
+        let text = {
+            let docs = self.documents.read().await;
+            let Some(state) = docs.get(&uri) else {
+                debug!("folding_range for unknown URI");
+                return Ok(None);
+            };
+            state.document.text()
+        };
+        let tree = {
+            let mut parser = self.parser.lock().await;
+            match parser.parse(&text, None) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "parse failed during folding_range");
+                    return Ok(None);
+                }
+            }
+        };
+        let ranges: Vec<FoldingRange> = mimir_syntax::folding::folding_ranges(&tree)
+            .into_iter()
+            .map(m_fold_to_lsp)
+            .collect();
+        debug!(count = ranges.len(), "folding_range returned");
+        Ok(Some(ranges))
     }
 
     #[instrument(
@@ -1927,6 +1967,22 @@ fn m_range_to_lsp(r: MRange) -> Range {
             line: r.end.line,
             character: r.end.character,
         },
+    }
+}
+
+/// Convert a `mimir_syntax::FoldRange` into the `lsp_types` shape.
+///
+/// Whole-line folds — `start_character` / `end_character` are `None` so the
+/// editor decides the exact column. `kind: Region` is the closest LSP fit
+/// for SV constructs; the other choices (`Comment`, `Imports`) don't apply.
+fn m_fold_to_lsp(f: mimir_syntax::FoldRange) -> FoldingRange {
+    FoldingRange {
+        start_line: f.start_line,
+        start_character: None,
+        end_line: f.end_line,
+        end_character: None,
+        kind: Some(FoldingRangeKind::Region),
+        collapsed_text: None,
     }
 }
 

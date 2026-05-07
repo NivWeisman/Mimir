@@ -437,7 +437,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 - ⬜ `textDocument/signatureHelp`
 - ✅ `textDocument/documentSymbol` (flat, from the tree-sitter symbol index)
 - ⬜ `workspace/symbol`
-- ⬜ `textDocument/foldingRange`
+- ✅ `textDocument/foldingRange` — pure tree-sitter walk. Emits one foldable line range per top-level construct (modules, classes, functions, tasks, packages, interfaces, programs, properties, sequences, covergroups). Nested folds are emitted (a class's methods fold inside the class's own fold). Single-line constructs are skipped — there's nothing to collapse. `kind: Region` in the LSP response. Comment folding is deferred (comments are invisible to tree-sitter).
 - ⬜ `textDocument/documentHighlight`
 - ⬜ `textDocument/inlayHint`
 - ⬜ `textDocument/codeLens`

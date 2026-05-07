@@ -1,71 +1,55 @@
-# Plan — sidecar member-completion fallback for bad-statement contexts
+# Plan — `textDocument/foldingRange`
 
-## Bug
+## Goal
 
-Triggering completion at `obj.|` returned 0 items whenever the *enclosing
-statement* failed to bind — i.e. exactly the case the recent
-`8287f01` "completion sentinel" commit was meant to fix. Reproduced
-end-to-end in `examples/uvm-1.2/examples/integrated/apb` with a buffer like
-`uvm_pkg::uvm_object a; a.` (cursor at the dot): popup empty, even though
-slang's elaborator clearly resolves `a` to `uvm_object` (it emits a
-`UnknownMember` diagnostic on the spliced sentinel).
+Implement `textDocument/foldingRange` as a pure tree-sitter feature: walk
+the SV syntax tree and emit one foldable line range per top-level
+construct so editors can collapse modules, classes, functions, etc.
 
-## Root cause
+## What landed in this commit
 
-The sentinel splice (`a.` → `a.__mimir_complete__`) gets the *parser* past
-the bare dot, but slang's *binder* still rejects the resulting expression
-statement (a member access alone isn't a valid statement, the unknown
-member adds a hard error, etc.). When that happens slang collapses
-`ProceduralBlockSymbol::getBody()` to a `Statement` of kind `Invalid`
-(`bad()==1`) with no children. The bound `MemberAccessExpression` and
-`NamedValueExpression(a)` exist transiently during diagnostic emission
-but are not preserved as the procedural body — `TypeAtCursorFinder`
-walks the AST and never reaches them, so `found_type` stays null and
-`enumerate_scope_members` is never called.
+- `crates/mimir-syntax/src/folding.rs` — new module. Defines
+  `FoldRange { start_line, end_line }` (internal mirror of
+  `lsp_types::FoldingRange`), a `FOLDABLE_KINDS` const list of
+  tree-sitter node kinds, and `folding_ranges(&SyntaxTree) -> Vec<FoldRange>`
+  that walks the tree pre-order and emits one range per matching node.
+- `crates/mimir-syntax/src/lib.rs` — registers the module and re-exports
+  `FoldRange` at the crate root.
+- `crates/mimir-server/src/backend.rs` — adds
+  `folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true))`
+  to `ServerCapabilities`, the `m_fold_to_lsp` boundary helper, and the
+  `folding_range` `LanguageServer` handler. The handler reuses the existing
+  lock-then-clone pattern from `syntax_definition`: read the doc text
+  under the read lock, parse outside the lock, walk, convert.
+- `README.md` — feature checklist flipped from ⬜ to ✅ with a one-line
+  description of the kinds covered.
+- `Cargo.toml` — workspace version bumped 0.6.12 → 0.6.13.
 
-`VisitBad=true` on the visitor doesn't help: the InvalidStatement has no
-descendants to visit.
+## Decisions baked in
 
-## Fix
-
-`slang-sidecar/src/main.cpp::handle_complete` (memberAccess branch):
-
-1. **Fast path (unchanged):** run `TypeAtCursorFinder` against the bound
-   AST. Wins for valid expressions like `obj.method().|` inside an
-   assignment.
-2. **New fallback** (only when the fast path returns null): extract the
-   LHS identifier name by walking back from the dot over identifier
-   chars in the buffer text; find the innermost lexical scope at the
-   cursor with the existing `EnclosingScopeFinder`; resolve the name via
-   `slang::ast::Lookup::unqualified`; if the resolved symbol is a
-   `ValueSymbol`, take its type and enumerate its scope members.
-
-Single-identifier LHS only (`a.`, `this.` later — not yet). Chained access
-(`obj.field.subfield.|`) still requires the AST-bound finder to win;
-that's the same coverage we had before, just no longer dropping the
-single-ident case on the floor.
+- **Kinds covered:** `module_declaration`, `class_declaration`,
+  `function_body_declaration`, `task_body_declaration`,
+  `package_declaration`, `interface_declaration`, `program_declaration`,
+  `property_declaration`, `sequence_declaration`, `covergroup_declaration`.
+  We match `*_body_declaration` (not the wrapper `*_declaration`) for
+  functions and tasks, mirroring the disambiguation already used in
+  `symbols.rs` to avoid double-emitting.
+- **Comments deliberately skipped.** Tree-sitter strips comments before
+  building the tree, so folding them would need a separate text scan.
+  Deferred until requested.
+- **Whole-line folds.** `start_character` / `end_character` are `None` —
+  the editor decides exact column placement.
+- **Skip threshold.** `end_line > start_line` only; `module m; endmodule`
+  on one line emits nothing.
+- **`kind: Region`.** The other LSP folding kinds (`Comment`, `Imports`)
+  don't fit SV constructs.
 
 ## Verification
 
-| Case | Before | After |
-|---|---|---|
-| End-to-end LSP, `uvm_pkg::uvm_object a; a.` in apb workspace | 0 items | 52 items (`get_name`, `print`, `compare`, `pack`, …) |
-| Direct sidecar, `a.__mimir_complete__()` against `my_class` | 0 items | 11 items |
-| Direct sidecar, `a.compute(7)` (valid expression — fast path) | 12 items | 12 items |
-| `cargo test --workspace` | 214 pass | 214 pass |
-
-## Files touched
-
-- `slang-sidecar/src/main.cpp` — added `Lookup.h` include; rewired
-  `handle_complete`'s memberAccess branch to fall back to lexical
-  lookup when the bound AST has no expression at the cursor.
-
-No protocol change → no `crates/mimir-slang` or `crates/mimir-server`
-changes; no sidecar version bump.
-
-## Out of scope (follow-ups)
-
-- Chained LHS (`a.b.|`) when the surrounding statement is bad.
-- `this.|` / `super.|` in the fallback path.
-- Same recovery for `goto_definition` on the LHS identifier (its finder
-  pattern has the same blind spot — the user just hasn't hit it yet).
+- `cargo test -p mimir-syntax folding` — 8 new unit tests pass (single
+  module, class+method, package+class+method, body-only-not-wrapper,
+  task body, property/sequence/covergroup each fold, single-line skip,
+  empty source).
+- `cargo test --workspace` — 222 tests pass total, no regressions.
+- `cargo clippy --workspace -- -D warnings` — clean.
+- `cargo check --workspace` — clean.
