@@ -375,6 +375,68 @@ pub fn identifier_at<'a>(tree: &'a SyntaxTree, rope: &Rope, pos: Position) -> Op
 }
 
 // --------------------------------------------------------------------------
+// occurrences_of
+// --------------------------------------------------------------------------
+
+/// Return every occurrence of an identifier `name` in `tree`, as LSP ranges.
+///
+/// Powers `textDocument/documentHighlight`: when the cursor sits on an
+/// identifier, the server first calls [`identifier_at`] to grab the name,
+/// then this function to find every other place that name appears.
+///
+/// ## Matching policy
+///
+/// * **Token-level, not text-level.** We only consider tree-sitter nodes
+///   whose `kind()` is `"simple_identifier"` or `"system_tf_identifier"`.
+///   String hits inside comments, string literals, or keywords are *not*
+///   returned. (Comments aren't in the tree, so they couldn't be even if
+///   we wanted; string literals are their own node kind.)
+/// * **Full-string equality.** A query for `"foo"` does not match `"foo_bar"`
+///   or `"my_foo"` — only the identifier `foo` itself.
+/// * **No scoping.** Variables named `x` declared in two different scopes
+///   both return. v1 is text-based; future work can add scope-aware
+///   matching by routing through a semantic backend.
+///
+/// Returns an empty `Vec` for an empty `name` (defensive — saves the walk).
+#[must_use]
+pub fn occurrences_of(tree: &SyntaxTree, rope: &Rope, name: &str) -> Vec<Range> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk_for_occurrences(tree.tree.root_node(), tree.source(), rope, name, &mut out);
+    trace!(
+        name,
+        count = out.len(),
+        "collected identifier occurrences"
+    );
+    out
+}
+
+/// Pre-order DFS collector for [`occurrences_of`]. Pushes a range when
+/// we hit an identifier-kind node whose source slice equals `name`.
+fn walk_for_occurrences(
+    node: Node<'_>,
+    source: &str,
+    rope: &Rope,
+    name: &str,
+    out: &mut Vec<Range>,
+) {
+    if matches!(node.kind(), "simple_identifier" | "system_tf_identifier") {
+        if source.get(node.byte_range()) == Some(name) {
+            out.push(node_range(node, rope));
+        }
+        // Identifier nodes are leaves — no point descending. Returning
+        // here is also a small perf win on long files.
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_occurrences(child, source, rope, name, out);
+    }
+}
+
+// --------------------------------------------------------------------------
 // prefix_at
 // --------------------------------------------------------------------------
 
@@ -739,5 +801,104 @@ mod tests {
     fn prefix_at_start_of_line_returns_empty() {
         // Cursor at column 0 → nothing before it.
         assert_eq!(pfx("class foo;", 0, 0), Some("".into()));
+    }
+
+    // ----------------------------------------------------------------------
+    // occurrences_of
+    // ----------------------------------------------------------------------
+
+    /// Helper: parse `src` and return all occurrences of `name`.
+    fn occ(src: &str, name: &str) -> Vec<Range> {
+        init_for_tests();
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        occurrences_of(&tree, &Rope::from_str(src), name)
+    }
+
+    #[test]
+    fn occurrences_finds_all_uses() {
+        // `W` appears 3 times: declaration, in `[W-1:0]`, and on the RHS
+        // of `assign`.
+        let src = "\
+module m;
+  parameter int W = 8;
+  logic [W-1:0] x;
+  initial x = W;
+endmodule
+";
+        let hits = occ(src, "W");
+        assert_eq!(hits.len(), 3, "expected 3 W occurrences, got {hits:#?}");
+    }
+
+    #[test]
+    fn occurrences_full_token_only() {
+        // A query for "foo" must not match the identifier "foo_bar".
+        let src = "\
+module m;
+  logic foo;
+  logic foo_bar;
+  initial foo = 1;
+endmodule
+";
+        let foo_hits = occ(src, "foo");
+        let foo_bar_hits = occ(src, "foo_bar");
+        assert_eq!(
+            foo_hits.len(),
+            2,
+            "expected only the two `foo` (decl + use), got {foo_hits:#?}",
+        );
+        assert_eq!(foo_bar_hits.len(), 1, "exactly one `foo_bar` decl");
+    }
+
+    #[test]
+    fn occurrences_unknown_returns_empty() {
+        let src = "module m; logic x; endmodule\n";
+        assert!(occ(src, "no_such_name").is_empty());
+    }
+
+    #[test]
+    fn occurrences_empty_name_returns_empty() {
+        let src = "module m; logic x; endmodule\n";
+        assert!(occ(src, "").is_empty());
+    }
+
+    #[test]
+    fn occurrences_in_different_scopes_all_match() {
+        // v1 is text-based — `x` in two functions both come back.
+        // When semantic scoping lands, this test will need to be revised.
+        let src = "\
+package p;
+  function void f();
+    int x;
+    x = 1;
+  endfunction
+  function void g();
+    int x;
+    x = 2;
+  endfunction
+endpackage
+";
+        let hits = occ(src, "x");
+        assert_eq!(
+            hits.len(),
+            4,
+            "expected 4 x occurrences (2 decls + 2 assigns), got {hits:#?}",
+        );
+    }
+
+    #[test]
+    fn occurrences_system_tf_identifier() {
+        // `$display` is a `system_tf_identifier`, not a `simple_identifier`.
+        // Confirm our walk includes that kind.
+        let src = "\
+module m;
+  initial begin
+    $display(\"a\");
+    $display(\"b\");
+  end
+endmodule
+";
+        let hits = occ(src, "$display");
+        assert_eq!(hits.len(), 2, "expected 2 $display calls, got {hits:#?}");
     }
 }

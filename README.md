@@ -438,7 +438,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 - ✅ `textDocument/documentSymbol` (flat, from the tree-sitter symbol index)
 - ⬜ `workspace/symbol`
 - ✅ `textDocument/foldingRange` — pure tree-sitter walk. Emits one foldable line range per top-level construct (modules, classes, functions, tasks, packages, interfaces, programs, properties, sequences, covergroups). Nested folds are emitted (a class's methods fold inside the class's own fold). Single-line constructs are skipped — there's nothing to collapse. `kind: Region` in the LSP response. Comment folding is deferred (comments are invisible to tree-sitter).
-- ⬜ `textDocument/documentHighlight`
+- ✅ `textDocument/documentHighlight` — text-based intra-file highlighter. Uses the existing `identifier_at` lookup to grab the name under the cursor, then walks the tree-sitter parse and emits a `DocumentHighlight { kind: TEXT }` for every `simple_identifier` / `system_tf_identifier` whose source slice matches that name. Full-token equality (no prefix matches), no scoping yet — variables named `x` in two different scopes both highlight together. Cursor on whitespace / keyword / non-identifier returns nothing. Semantic-aware scoping is future work atop slang.
 - ⬜ `textDocument/inlayHint`
 - ⬜ `textDocument/codeLens`
 

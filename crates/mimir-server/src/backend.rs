@@ -1006,6 +1006,11 @@ impl LanguageServer for Backend {
                 // Slang-only: cursor on virtual method → all overrides;
                 // cursor on class → all direct subclasses.
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+                // Tree-sitter-only for now: highlight every occurrence of the
+                // identifier under the cursor in the same file. v1 is text-
+                // based (no scope/shadowing); semantic-aware scoping is
+                // future work atop slang.
+                document_highlight_provider: Some(OneOf::Left(true)),
                 // Syntax-only for stages 1–4; slang takes over for stages 5–6.
                 // Trigger characters: `.` (member access), `` ` `` (macros),
                 // `$` (system task/function names), `:` (the first half of
@@ -1213,6 +1218,62 @@ impl LanguageServer for Backend {
             }
             ImplementationRoute::UseEmpty => Ok(None),
         }
+    }
+
+    /// Highlight every occurrence of the identifier under the cursor in
+    /// the same document. Text-based v1: no scoping, no shadowing —
+    /// `simple_identifier` and `system_tf_identifier` tokens that match
+    /// the cursor name are returned. Cursor on whitespace, a keyword, or
+    /// a non-identifier returns `None`.
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> LspResult<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        let text = {
+            let docs = self.documents.read().await;
+            let Some(state) = docs.get(&uri) else {
+                debug!("document_highlight for unknown URI");
+                return Ok(None);
+            };
+            state.document.text()
+        };
+        let tree = {
+            let mut parser = self.parser.lock().await;
+            match parser.parse(&text, None) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "parse failed during document_highlight");
+                    return Ok(None);
+                }
+            }
+        };
+        let rope = Rope::from_str(&text);
+        let Some(name) = mimir_syntax::symbols::identifier_at(&tree, &rope, target) else {
+            debug!("document_highlight: cursor not on identifier");
+            return Ok(None);
+        };
+        // `identifier_at` borrows `tree.source()`; cloning lets us call
+        // `occurrences_of` which also borrows the tree.
+        let name = name.to_owned();
+        let highlights: Vec<DocumentHighlight> =
+            mimir_syntax::symbols::occurrences_of(&tree, &rope, &name)
+                .into_iter()
+                .map(|r| DocumentHighlight {
+                    range: m_range_to_lsp(r),
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect();
+        debug!(name = %name, count = highlights.len(), "document_highlight returned");
+        Ok(Some(highlights))
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
