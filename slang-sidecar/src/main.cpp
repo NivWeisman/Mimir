@@ -46,6 +46,7 @@
 
 #include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
+#include <slang/ast/Lookup.h>
 #include <slang/ast/Symbol.h>
 #include <slang/ast/expressions/CallExpression.h>
 #include <slang/ast/expressions/MiscExpressions.h>
@@ -1428,16 +1429,52 @@ static json handle_complete(const json& params) {
         uint32_t dot_offset = p - 1;
         if (dot_offset == 0) return result;
 
-        // Run TypeAtCursorFinder just before the '.'.
-        TypeAtCursorFinder finder;
-        finder.sm            = &sm;
-        finder.target_path   = target_path;
-        finder.target_offset = dot_offset - 1;
-        compilation.getRoot().visit(finder);
+        // Fast path: ask the bound AST what's just before the '.'. This
+        // succeeds when the enclosing statement bound cleanly (e.g.
+        // `obj.method().|` inside a valid assignment).
+        const Type* lhs_type = nullptr;
+        {
+            TypeAtCursorFinder finder;
+            finder.sm            = &sm;
+            finder.target_path   = target_path;
+            finder.target_offset = dot_offset - 1;
+            compilation.getRoot().visit(finder);
+            lhs_type = finder.found_type;
+        }
 
-        if (!finder.found_type) return result;
+        // Fallback: when the surrounding statement failed to bind (which
+        // collapses `ProceduralBlockSymbol::getBody()` to an
+        // InvalidStatement, hiding the bound LHS expression from the
+        // visitor), recover by extracting the LHS identifier name from
+        // the buffer text and looking it up by name in the lexical scope
+        // at the cursor. Handles the common `a.|` case where `a` is a
+        // local variable, field, or class property visible from the
+        // enclosing scope chain.
+        if (lhs_type == nullptr) {
+            uint32_t lhs_end = dot_offset;
+            uint32_t lhs_start = lhs_end;
+            while (lhs_start > 0 && is_ident(text[lhs_start - 1])) --lhs_start;
+            if (lhs_start < lhs_end) {
+                std::string_view lhs_name = text.substr(lhs_start, lhs_end - lhs_start);
+                EnclosingScopeFinder scope_finder;
+                scope_finder.sm            = &sm;
+                scope_finder.target_path   = target_path;
+                scope_finder.target_offset = dot_offset - 1;
+                compilation.getRoot().visit(scope_finder);
 
-        auto& canonical = finder.found_type->getCanonicalType();
+                if (scope_finder.found_scope != nullptr) {
+                    if (const auto* sym = slang::ast::Lookup::unqualified(
+                            *scope_finder.found_scope, lhs_name)) {
+                        if (const auto* vs = sym->as_if<slang::ast::ValueSymbol>())
+                            lhs_type = &vs->getType();
+                    }
+                }
+            }
+        }
+
+        if (lhs_type == nullptr) return result;
+
+        auto& canonical = lhs_type->getCanonicalType();
         if (auto* scope = canonical.as_if<Scope>()) {
             enumerate_scope_members(*scope, prefix, result["items"]);
         }
