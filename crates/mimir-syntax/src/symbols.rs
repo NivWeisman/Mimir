@@ -437,6 +437,169 @@ fn walk_for_occurrences(
 }
 
 // --------------------------------------------------------------------------
+// occurrences_of_at  (scope-aware)
+// --------------------------------------------------------------------------
+
+/// Return every occurrence of the identifier under the cursor that
+/// resolves to the *same lexical scope* as the cursor's identifier.
+///
+/// Powers `textDocument/documentHighlight`. Compared to [`occurrences_of`]
+/// — which is text-only and matches every token of the same name across
+/// the file — this variant climbs the parse tree from `pos` to find the
+/// narrowest enclosing scope that locally declares the identifier (e.g.
+/// the function body declaring it as a formal argument), then collects
+/// only the occurrences inside that scope. Nested scopes that re-declare
+/// the same name are skipped, so a `phase` parameter in `build_phase`
+/// does not light up alongside an unrelated `phase` parameter in
+/// `connect_phase`.
+///
+/// Falls back to whole-file matching when no enclosing scope declares
+/// `name` — that's the right answer for free-standing references whose
+/// declaration isn't in the visible structure (e.g. a class's `super.x`
+/// where `x` lives in the parent class), and matches the previous
+/// text-based behaviour.
+///
+/// Returns an empty `Vec` when the cursor is not on an identifier.
+#[must_use]
+pub fn occurrences_of_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> Vec<Range> {
+    let Some(name) = identifier_at(tree, rope, pos) else {
+        return Vec::new();
+    };
+    let name = name.to_owned();
+    let Ok(byte) = pos.to_byte_offset(rope) else {
+        return Vec::new();
+    };
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte).unwrap_or(root);
+
+    // Walk up: pick the narrowest scope ancestor that declares `name`
+    // locally. If none does, search the whole file (matches the legacy
+    // text-based behaviour for cross-scope references).
+    let mut scope = root;
+    let mut cur = Some(leaf);
+    while let Some(n) = cur {
+        if is_scope_kind(n.kind()) && declares_locally(n, tree.source(), &name) {
+            scope = n;
+            break;
+        }
+        cur = n.parent();
+    }
+
+    let mut out = Vec::new();
+    walk_for_occurrences_scoped(scope, tree.source(), rope, &name, &mut out, true);
+    trace!(
+        name = %name,
+        scope = scope.kind(),
+        count = out.len(),
+        "collected scope-aware identifier occurrences",
+    );
+    out
+}
+
+/// Tree-sitter node kinds that introduce a new lexical scope in
+/// SystemVerilog. Used by [`occurrences_of_at`] both to find the search
+/// root and to prune nested scopes that re-declare the same name.
+///
+/// Both `function_declaration` and `function_body_declaration` are listed:
+/// the former wraps the latter in tree-sitter-verilog, and walking up
+/// from a leaf inside the body hits the (narrower) body first. Listing
+/// both keeps the shadowing-prune step consistent regardless of which
+/// the search root happens to be.
+fn is_scope_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_body_declaration"
+            | "task_body_declaration"
+            | "function_declaration"
+            | "task_declaration"
+            | "class_declaration"
+            | "module_declaration"
+            | "interface_declaration"
+            | "program_declaration"
+            | "package_declaration"
+            | "seq_block"
+            | "initial_construct"
+            | "always_construct"
+            | "generate_block"
+    )
+}
+
+/// Does `scope` directly declare an identifier named `name`?
+///
+/// "Directly" means not via a *nested* scope — a `phase` parameter in an
+/// inner function does not count as a declaration inside the outer
+/// class. We DFS through `scope`, but stop descending whenever we cross
+/// another scope boundary.
+fn declares_locally(scope: Node<'_>, source: &str, name: &str) -> bool {
+    declares_locally_inner(scope, source, name, true)
+}
+
+fn declares_locally_inner(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+    is_root: bool,
+) -> bool {
+    if !is_root && is_scope_kind(node.kind()) {
+        return false;
+    }
+    if declaration_name_text(node, source) == Some(name) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if declares_locally_inner(child, source, name, false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// If `node` is a declaration that introduces an identifier into the
+/// surrounding scope, return that identifier's text. Covers the kinds
+/// [`name_node_of`] already handles plus `tf_port_item` /
+/// `tf_port_item1` (function/task formal arguments — these aren't
+/// emitted as `documentSymbol`s but they *are* binders that shadow
+/// outer-scope names).
+fn declaration_name_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let name_node = match node.kind() {
+        "tf_port_item" | "tf_port_item1" => {
+            let id = first_named_child_of_kind(node, "port_identifier")?;
+            first_descendant_of_kind(id, "simple_identifier")?
+        }
+        _ => name_node_of(node)?,
+    };
+    name_node.utf8_text(source.as_bytes()).ok()
+}
+
+/// Like [`walk_for_occurrences`] but prunes nested scopes that
+/// re-declare `name` (proper shadowing). The root invocation must pass
+/// `is_root = true` so the search root itself isn't pruned even when
+/// it's the very scope that declares `name`.
+fn walk_for_occurrences_scoped(
+    node: Node<'_>,
+    source: &str,
+    rope: &Rope,
+    name: &str,
+    out: &mut Vec<Range>,
+    is_root: bool,
+) {
+    if !is_root && is_scope_kind(node.kind()) && declares_locally(node, source, name) {
+        return;
+    }
+    if matches!(node.kind(), "simple_identifier" | "system_tf_identifier") {
+        if source.get(node.byte_range()) == Some(name) {
+            out.push(node_range(node, rope));
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_occurrences_scoped(child, source, rope, name, out, false);
+    }
+}
+
+// --------------------------------------------------------------------------
 // prefix_at
 // --------------------------------------------------------------------------
 
@@ -815,6 +978,17 @@ mod tests {
         occurrences_of(&tree, &Rope::from_str(src), name)
     }
 
+    /// Helper: parse `src` and return scope-aware occurrences for the
+    /// identifier under `(line, col)`. Mirrors what
+    /// `Backend::document_highlight` does on the wire.
+    fn occ_at(src: &str, line: u32, col: u32) -> Vec<Range> {
+        init_for_tests();
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let rope = Rope::from_str(src);
+        occurrences_of_at(&tree, &rope, Position::new(line, col))
+    }
+
     #[test]
     fn occurrences_finds_all_uses() {
         // `W` appears 3 times: declaration, in `[W-1:0]`, and on the RHS
@@ -883,6 +1057,90 @@ endpackage
             hits.len(),
             4,
             "expected 4 x occurrences (2 decls + 2 assigns), got {hits:#?}",
+        );
+    }
+
+    #[test]
+    fn occurrences_at_class_field_spans_whole_class() {
+        // `cfg` is a class field. Cursor on the `cfg` reference inside
+        // `f` must light up every `cfg` in the class — the field decl
+        // and both method uses — because no enclosing function declares
+        // `cfg` locally.
+        let src = "\
+class c;
+  int cfg;
+  function void f();
+    cfg = 1;
+  endfunction
+  function void g();
+    cfg = 2;
+  endfunction
+endclass
+";
+        // Line 3, column 5 is inside `cfg` on the `cfg = 1;` line.
+        let hits = occ_at(src, 3, 5);
+        assert_eq!(
+            hits.len(),
+            3,
+            "expected 3 cfg occurrences (decl + 2 uses), got {hits:#?}",
+        );
+    }
+
+    #[test]
+    fn occurrences_at_skips_shadowing_inner_scope() {
+        // `x` is declared at function scope and re-declared inside a
+        // begin/end block. With the cursor on the outer `x`, the inner
+        // block's `x` (decl + assignment) must be excluded — they bind
+        // a different variable.
+        let src = "\
+module m;
+  initial begin
+    int x;
+    x = 1;
+    begin
+      int x;
+      x = 2;
+    end
+    x = 3;
+  end
+endmodule
+";
+        // Line 3 is `    x = 1;` — column 4 is the `x`.
+        let hits = occ_at(src, 3, 4);
+        assert_eq!(
+            hits.len(),
+            3,
+            "expected outer `x` decl + 2 outer assigns; inner `x` shadow \
+             must be pruned. got {hits:#?}",
+        );
+    }
+
+    #[test]
+    fn occurrences_scope_aware_to_enclosing_function() {
+        // Regression for the apb_monitor.sv UVM example: `phase` appears as
+        // a parameter in both `build_phase` and `connect_phase`. With the
+        // cursor on the `phase` parameter inside `build_phase`, document-
+        // highlight must only mark the two references inside that function
+        // (the parameter declaration and its assignment), not the
+        // unrelated `phase` parameter living in `connect_phase`.
+        let src = "\
+class c;
+  function void build_phase(int phase);
+    phase = 1;
+  endfunction
+  function void connect_phase(int phase);
+    phase = 2;
+  endfunction
+endclass
+";
+        // Line 1, column 33 is the `h` inside `phase` in `build_phase`'s
+        // signature: `  function void build_phase(int phase);`.
+        let hits = occ_at(src, 1, 33);
+        assert_eq!(
+            hits.len(),
+            2,
+            "expected only the 2 `phase` refs inside build_phase \
+             (decl + assignment), got {hits:#?}",
         );
     }
 

@@ -1221,10 +1221,14 @@ impl LanguageServer for Backend {
     }
 
     /// Highlight every occurrence of the identifier under the cursor in
-    /// the same document. Text-based v1: no scoping, no shadowing —
-    /// `simple_identifier` and `system_tf_identifier` tokens that match
-    /// the cursor name are returned. Cursor on whitespace, a keyword, or
-    /// a non-identifier returns `None`.
+    /// the same document. Scope-aware: when the cursor sits on a name
+    /// that's declared in an enclosing function/task/class/module/etc.,
+    /// only references inside that declaring scope come back, and inner
+    /// scopes that re-declare the same name are pruned (proper
+    /// shadowing). For free-standing references whose declaration isn't
+    /// visible (e.g. `super.x`), falls back to whole-file matching.
+    /// Cursor on whitespace, a keyword, or a non-identifier returns
+    /// `None`.
     #[instrument(
         level = "debug",
         skip_all,
@@ -1257,22 +1261,23 @@ impl LanguageServer for Backend {
             }
         };
         let rope = Rope::from_str(&text);
-        let Some(name) = mimir_syntax::symbols::identifier_at(&tree, &rope, target) else {
+        // Bail early if the cursor isn't on an identifier — `occurrences_of_at`
+        // would also return an empty `Vec`, but probing here lets us
+        // signal "no result" (`None`) versus "result, but empty"
+        // distinctly to the editor.
+        if mimir_syntax::symbols::identifier_at(&tree, &rope, target).is_none() {
             debug!("document_highlight: cursor not on identifier");
             return Ok(None);
-        };
-        // `identifier_at` borrows `tree.source()`; cloning lets us call
-        // `occurrences_of` which also borrows the tree.
-        let name = name.to_owned();
+        }
         let highlights: Vec<DocumentHighlight> =
-            mimir_syntax::symbols::occurrences_of(&tree, &rope, &name)
+            mimir_syntax::symbols::occurrences_of_at(&tree, &rope, target)
                 .into_iter()
                 .map(|r| DocumentHighlight {
                     range: m_range_to_lsp(r),
                     kind: Some(DocumentHighlightKind::TEXT),
                 })
                 .collect();
-        debug!(name = %name, count = highlights.len(), "document_highlight returned");
+        debug!(count = highlights.len(), "document_highlight returned");
         Ok(Some(highlights))
     }
 
