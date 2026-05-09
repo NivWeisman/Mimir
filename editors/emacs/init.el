@@ -17,11 +17,17 @@
 ;; Ensures use-package is available. Built into Emacs 29+; install it from
 ;; MELPA on older versions. Place this before any `use-package' call.
 
+(require 'package)
+(unless (assoc "melpa" package-archives)
+  (add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t))
+;; Defensive: users with (setq package-enable-at-startup nil) in early-init.el
+;; skip Emacs 27+'s implicit init, which would make `package-installed-p' lie.
+(package-initialize)
 (unless (package-installed-p 'use-package)
-  (require 'package)
-  (add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
-  (package-refresh-contents)
-  (package-install 'use-package))
+  (condition-case err
+      (progn (package-refresh-contents)
+             (package-install 'use-package))
+    (error (message "mimir-init: failed to install use-package: %S" err))))
 
 (require 'use-package)
 (setq use-package-always-ensure t)  ; treat :ensure t as the default
@@ -29,7 +35,8 @@
 
 ;;; ---------- Option 0: evil-mode (Vim keybindings) -------------------------
 ;;
-;; Uncomment to enable evil-mode for Vim-style editing. Requires:
+;; Enabled by default. Comment out the `use-package evil' block to disable.
+;; Requires:
 ;;   M-x package-install RET evil RET
 ;; Or with use-package:
 
@@ -37,7 +44,7 @@
   :ensure t
   :init
   (setq evil-want-integration t
-        evil-want-keybinding nil)  ; set to t if not using evil-collection
+        evil-want-keybinding nil)  ; set to nil if pairing with evil-collection
   :config
   (evil-mode 1))
 

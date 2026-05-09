@@ -51,6 +51,11 @@ pub struct FoldRange {
 /// `task_declaration`) just wrap them. We match only the body form so a
 /// single function doesn't produce two folds, mirroring the same
 /// disambiguation in [`crate::symbols`].
+///
+/// `seq_block` is the `begin ... end` block. It covers the body of `if`,
+/// `else`, `for`, `while`, `forever`, `fork`, and any other statement that
+/// uses explicit delimiters. Adding it here means every multi-line
+/// `if (cond) begin ... end` cluster becomes its own fold region.
 const FOLDABLE_KINDS: &[&str] = &[
     "module_declaration",
     "class_declaration",
@@ -62,6 +67,7 @@ const FOLDABLE_KINDS: &[&str] = &[
     "property_declaration",
     "sequence_declaration",
     "covergroup_declaration",
+    "seq_block",
 ];
 
 /// Walk `tree` and return one [`FoldRange`] per foldable construct.
@@ -225,4 +231,58 @@ endmodule
         init_for_tests();
         assert!(fold("").is_empty());
     }
+
+    #[test]
+    fn if_begin_end_yields_a_fold() {
+        init_for_tests();
+        // An if-statement whose body uses begin...end should produce a fold
+        // for the seq_block, nested inside the enclosing function fold.
+        let src = "\
+module m;
+  function void f();
+    if (cond) begin
+      a = 1;
+      b = 2;
+    end
+  endfunction
+endmodule
+";
+        let ranges = fold(src);
+        // module + function + seq_block inside if = 3
+        assert_eq!(
+            ranges.len(),
+            3,
+            "expected module + function + if-begin-end fold, got {:?}",
+            ranges
+        );
+        let seq = ranges.iter().find(|r| r.start_line == 2).expect("seq_block fold at line 2");
+        assert_eq!(seq.end_line, 5, "seq_block should end at 'end' line");
+    }
+
+    #[test]
+    fn single_line_begin_end_skipped() {
+        init_for_tests();
+        // begin...end on one line produces no fold.
+        let src = "module m;\n  function void f();\n    if (c) begin x = 1; end\n  endfunction\nendmodule\n";
+        let ranges = fold(src);
+        // module + function only; no seq_block fold (start==end)
+        assert_eq!(ranges.len(), 2, "single-line begin-end must not fold: {:?}", ranges);
+    }
+
+    #[test]
+    fn define_at_top_level_does_not_break_class_fold() {
+        init_for_tests();
+        // `define at the top level (a flag guard define with no value) must not
+        // prevent class folding. `ifndef/`endif are blanked by preprocessing;
+        // `define is kept so the macro symbol is available.
+        let src = "`define MY_FLAG\nclass C;\n  function void f();\n    return;\n  endfunction\nendclass\n";
+        let ranges = fold(src);
+        assert!(
+            ranges.iter().any(|r| r.start_line == 1),
+            "class fold must survive a top-level `define, got {:?}",
+            ranges
+        );
+    }
+
+
 }

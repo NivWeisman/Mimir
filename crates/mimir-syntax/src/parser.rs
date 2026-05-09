@@ -14,6 +14,8 @@
 //! cannot be shared across threads. The LSP server keeps one `SyntaxParser`
 //! per worker task and serializes parse calls per document.
 
+use std::borrow::Cow;
+
 use thiserror::Error;
 use tracing::{debug, instrument, trace};
 use tree_sitter::{Parser, Tree};
@@ -66,6 +68,74 @@ impl SyntaxTree {
     }
 }
 
+/// Replace whole-line backtick tokens with spaces of the same byte length.
+///
+/// tree-sitter-verilog has two categories of backtick lines that collapse the
+/// parse tree into a single ERROR root, killing every structural LSP feature:
+///
+/// 1. **Compiler guard directives** (`\`ifdef`, `\`ifndef`, `\`endif`,
+///    `\`include`, `\`timescale`, …) — tree-sitter doesn't model conditional
+///    compilation as a top-level construct, so a guarded file wraps entirely in
+///    an ERROR node.
+///
+/// 2. **Standalone macro calls** (`\`uvm_fatal`, `\`uvm_info`,
+///    `\`uvm_component_utils_begin`, …) — when one of these appears inside an
+///    `if-begin-end` block inside a class method the grammar completely loses
+///    its parse context and produces an ERROR root.
+///
+/// **Exception**: `\`define` lines are left intact. Macro definitions carry
+/// symbol names (`MY_MACRO`, `ANOTHER_MACRO`, …) that the symbol indexer reads
+/// from `SyntaxTree::source`; blanking them would make those symbols invisible.
+///
+/// Because we only replace characters *within* a line — keeping every newline
+/// in place and maintaining the exact byte count — every byte offset and line
+/// number that tree-sitter emits maps verbatim back to the original source.
+///
+/// Inline backtick references (`x = \`MY_MACRO + y;`) are NOT blanked: the
+/// first non-whitespace character of those lines is not a backtick.
+///
+/// Returns `Cow::Borrowed(source)` when the source contains no backtick
+/// characters at all (fast path).
+fn blank_backtick_lines(source: &str) -> Cow<'_, str> {
+    if !source.contains('`') {
+        return Cow::Borrowed(source);
+    }
+
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+
+    while !rest.is_empty() {
+        let (line, nl, tail) = match rest.find('\n') {
+            Some(p) => (&rest[..p], "\n", &rest[p + 1..]),
+            None => (rest, "", ""),
+        };
+
+        let trimmed = line.trim_start();
+        // Blank every backtick line EXCEPT `define — macro definitions carry
+        // symbol names that the symbol indexer reads from SyntaxTree::source.
+        let should_blank = trimmed.starts_with('`') && {
+            let after = &trimmed[1..];
+            let kw = after
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            kw != "define"
+        };
+        if should_blank {
+            // Spaces of identical byte length so all byte offsets are preserved.
+            for _ in 0..line.len() {
+                out.push(' ');
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push_str(nl);
+        rest = tail;
+    }
+
+    Cow::Owned(out)
+}
+
 /// Owns a `tree_sitter::Parser` configured for SystemVerilog.
 pub struct SyntaxParser {
     parser: Parser,
@@ -95,15 +165,25 @@ impl SyntaxParser {
     /// that didn't change.
     ///
     /// If `previous` is `None` you get a full parse.
+    ///
+    /// Before handing the text to tree-sitter, whole-line backtick tokens are
+    /// replaced with spaces of the same byte length (see
+    /// `blank_backtick_lines`). This prevents compiler directives and
+    /// standalone macro calls from collapsing the file into a single ERROR
+    /// root node. `\`define` lines are left intact so the symbol indexer can
+    /// still find macro names. All byte offsets and line numbers are preserved.
     #[instrument(level = "debug", skip(self, source, previous), fields(bytes = source.len()))]
     pub fn parse(
         &mut self,
         source: &str,
         previous: Option<&Tree>,
     ) -> Result<SyntaxTree, SyntaxParserError> {
+        let preprocessed = blank_backtick_lines(source);
+        let src = preprocessed.as_ref();
+
         let tree = self
             .parser
-            .parse(source, previous)
+            .parse(src, previous)
             .ok_or(SyntaxParserError::NoTree)?;
 
         debug!(
@@ -115,7 +195,7 @@ impl SyntaxParser {
 
         Ok(SyntaxTree {
             tree,
-            source: source.to_owned(),
+            source: preprocessed.into_owned(),
         })
     }
 }
@@ -167,6 +247,43 @@ mod tests {
         assert_eq!(
             first.tree.root_node().to_sexp(),
             second.tree.root_node().to_sexp(),
+        );
+    }
+
+    /// Guard directives (`ifdef/`ifndef/`endif) and standalone UVM macro calls
+    /// on their own lines are blanked so the parser can see clean SV structure.
+    /// `define lines are left intact so symbol names remain accessible.
+    #[test]
+    fn backtick_lines_blanked_except_define() {
+        init_for_tests();
+        // File with: an include guard, a flag-define, a UVM macro call, and a class.
+        // After preprocessing, the ifndef and uvm_fatal lines become spaces;
+        // the `define line stays. The class must be parseable.
+        let src = "\
+`ifndef GUARD_SV
+`define GUARD_SV
+class C;
+  function void f();
+    `uvm_fatal(\"TAG\", \"msg\")
+  endfunction
+endclass
+`endif
+";
+        let mut parser = SyntaxParser::new().expect("grammar must load");
+        let tree = parser.parse(src, None).expect("parse");
+        // Root must be source_file, not ERROR.
+        assert_eq!(
+            tree.tree.root_node().kind(),
+            "source_file",
+            "expected source_file root, got {}",
+            tree.tree.root_node().kind()
+        );
+        // The `define line is kept verbatim so its byte range is readable.
+        let define_line = tree.source.lines().nth(1).unwrap_or("");
+        assert!(
+            define_line.starts_with('`'),
+            "`define line should be preserved in source: {:?}",
+            define_line
         );
     }
 }
