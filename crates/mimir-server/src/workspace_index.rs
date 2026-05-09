@@ -206,6 +206,7 @@ mod tests {
             kind,
             name_range: Range::new(Position::new(line, 0), Position::new(line, 1)),
             full_range: Range::new(Position::new(line, 0), Position::new(line, 10)),
+            params: None,
         }
     }
 

@@ -36,6 +36,19 @@ use tree_sitter::Node;
 
 use crate::SyntaxTree;
 
+/// A formal parameter of a callable symbol (function, task, method, macro).
+///
+/// For macro parameters `ty` is always `None` — macros are textual
+/// substitution and carry no SV type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    /// Parameter name, e.g. `"phase"`.
+    pub name: String,
+    /// Declared type text, e.g. `"int"`, `"string"`, `"uvm_phase"`.
+    /// `None` for macro parameters or when the type is implicit.
+    pub ty: Option<String>,
+}
+
 /// Kind of declaration a [`Symbol`] represents.
 ///
 /// Mirrors the subset of `lsp_types::SymbolKind` we actually emit. The
@@ -101,6 +114,9 @@ pub struct Symbol {
     /// `module … endmodule` span). Used as `documentSymbol`'s
     /// `selectionRange`/`range`.
     pub full_range: Range,
+    /// Formal parameters for callable declarations (functions, tasks, methods,
+    /// macros). `None` for non-callable symbols (modules, classes, variables…).
+    pub params: Option<Vec<Param>>,
 }
 
 /// Walk `tree` and return every declaration we can recognise.
@@ -163,12 +179,102 @@ fn symbol_for(
     }
     let name_node = name_node_of(node)?;
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
+    let params = extract_callable_params(node, source);
     Some(Symbol {
         name,
         kind,
         name_range: node_range(name_node, rope),
         full_range: node_range(node, rope),
+        params,
     })
+}
+
+/// Extract formal parameters for callable declarations, or `None` for
+/// non-callable symbols. Called from [`symbol_for`].
+fn extract_callable_params(node: Node<'_>, source: &str) -> Option<Vec<Param>> {
+    match node.kind() {
+        "function_body_declaration" | "task_body_declaration" => {
+            Some(collect_tf_port_params(node, source))
+        }
+        "text_macro_definition" => Some(collect_macro_params(node, source)),
+        _ => None,
+    }
+}
+
+/// Collect `Param` entries from `tf_port_list` inside a function/task body.
+fn collect_tf_port_params(node: Node<'_>, source: &str) -> Vec<Param> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "tf_port_list" {
+            let mut c2 = child.walk();
+            for item in child.named_children(&mut c2) {
+                if matches!(item.kind(), "tf_port_item" | "tf_port_item1") {
+                    if let Some(p) = param_from_port_item(item, source) {
+                        out.push(p);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// Build a single `Param` from a `tf_port_item` or `tf_port_item1` node.
+fn param_from_port_item(item: Node<'_>, source: &str) -> Option<Param> {
+    let port_id = first_named_child_of_kind(item, "port_identifier")?;
+    let name_node = first_descendant_of_kind(port_id, "simple_identifier")?;
+    let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
+
+    let ty = {
+        let mut cursor = item.walk();
+        let mut found = None;
+        for child in item.named_children(&mut cursor) {
+            match child.kind() {
+                "data_type_or_implicit1" | "data_type" | "implicit_data_type1"
+                | "data_type_or_implicit" => {
+                    found = child
+                        .utf8_text(source.as_bytes())
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        found
+    };
+
+    Some(Param { name, ty })
+}
+
+/// Collect `Param` entries (name-only, no types) from a macro definition.
+fn collect_macro_params(node: Node<'_>, source: &str) -> Vec<Param> {
+    let macro_name = match first_named_child_of_kind(node, "text_macro_name") {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let formal_list = match first_named_child_of_kind(macro_name, "list_of_formal_arguments") {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut cursor = formal_list.walk();
+    for arg in formal_list.named_children(&mut cursor) {
+        if arg.kind() == "formal_argument" {
+            if let Some(ident) = first_named_child_of_kind(arg, "simple_identifier") {
+                if let Ok(name) = ident.utf8_text(source.as_bytes()) {
+                    out.push(Param {
+                        name: name.to_string(),
+                        ty: None,
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 impl SymbolKind {
@@ -336,7 +442,7 @@ fn first_descendant_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> 
 }
 
 /// Convert a tree-sitter node's byte span to an LSP range.
-fn node_range(node: Node<'_>, rope: &Rope) -> Range {
+pub(crate) fn node_range(node: Node<'_>, rope: &Rope) -> Range {
     Range::new(
         Position::from_byte_offset(rope, node.start_byte()),
         Position::from_byte_offset(rope, node.end_byte()),

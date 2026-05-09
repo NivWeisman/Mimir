@@ -40,13 +40,19 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod calls;
 pub mod diagnostics;
 pub mod folding;
+pub mod inlay;
 pub mod keywords;
 pub mod parser;
+pub mod signature;
 pub mod symbols;
 
+pub use calls::{ArgSpan, CallKind, CallSite};
 pub use diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use folding::FoldRange;
+pub use inlay::InlayLabel;
 pub use parser::{SyntaxParser, SyntaxParserError, SyntaxTree};
-pub use symbols::{Symbol, SymbolKind};
+pub use signature::{ParamInfo, SignatureInfo};
+pub use symbols::{Param, Symbol, SymbolKind};

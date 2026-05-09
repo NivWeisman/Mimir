@@ -51,6 +51,7 @@ pub use client::{Client, ClientError, Connection, ConnectionError};
 pub use protocol::{
     CompleteParams, CompleteResult, CompletionRequestKind, DefinitionLocation, DefinitionParams,
     DefinitionResult, Diagnostic, ElaborateParams, ElaborateResult, ImplementationLocation,
-    ImplementationParams, ImplementationResult, MacroDefine, Severity, SlangCompletionItem,
-    SourceFile, TypeDefinitionLocation, TypeDefinitionParams, TypeDefinitionResult,
+    ImplementationParams, ImplementationResult, MacroDefine, Severity, SignatureHelpParams,
+    SignatureHelpResult, SignatureItem, SignatureParam, SlangCompletionItem, SourceFile,
+    TypeDefinitionLocation, TypeDefinitionParams, TypeDefinitionResult,
 };

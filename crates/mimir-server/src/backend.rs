@@ -39,12 +39,16 @@ use mimir_slang::{
     Diagnostic as SlangDiagnostic, ElaborateParams, ElaborateResult,
     ImplementationLocation as SlangImplementationLocation,
     ImplementationParams as SlangImplementationParams, Severity as SlangSeverity, SlangCompletionItem,
-    SourceFile, TypeDefinitionLocation as SlangTypeDefinitionLocation,
+    SignatureHelpParams as SlangSignatureHelpParams, SourceFile,
+    TypeDefinitionLocation as SlangTypeDefinitionLocation,
     TypeDefinitionParams as SlangTypeDefinitionParams,
 };
 use mimir_syntax::{
-    Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity, Symbol, SymbolKind as MSymbolKind,
-    SyntaxParser,
+    calls::{call_site_at, active_arg_index, call_sites_in, CallKind},
+    inlay::hints_for,
+    signature::signature_for,
+    Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity,
+    Symbol, SymbolKind as MSymbolKind, SyntaxParser,
 };
 use ropey::Rope;
 use tokio::sync::{Mutex, RwLock};
@@ -701,6 +705,46 @@ impl Backend {
         Some(slang_items_to_response(items))
     }
 
+    /// Try slang-backed signature help.
+    ///
+    /// Returns `Some` when slang is configured and the sidecar returns at
+    /// least one signature. Returns `None` on transport error, empty result,
+    /// or no slang configured — the caller falls through to tree-sitter.
+    async fn try_slang_signature_help(
+        &self,
+        uri: &Url,
+        pos: MPosition,
+    ) -> Option<Vec<mimir_slang::SignatureItem>> {
+        let client = self.slang.read().await.clone()?;
+        let project = self.project.read().await.clone()?;
+
+        let (def_params, _) =
+            build_definition_params(&project, &self.documents, uri, pos).await?;
+        let params = SlangSignatureHelpParams {
+            files: def_params.files,
+            include_dirs: def_params.include_dirs,
+            defines: def_params.defines,
+            top: def_params.top,
+            target_path: def_params.target_path,
+            target_position: def_params.target_position,
+        };
+
+        match client.signature_help(&params).await {
+            Ok(result) if !result.signatures.is_empty() => {
+                debug!(count = result.signatures.len(), "slang signature help returned");
+                Some(result.signatures)
+            }
+            Ok(_) => {
+                debug!("slang signature help: empty — falling back to tree-sitter");
+                None
+            }
+            Err(e) => {
+                debug!(error = %e, "slang signature help transport error — falling back");
+                None
+            }
+        }
+    }
+
     /// Gather syntax-side candidates for `uri`, split into same-file and
     /// cross-file streams. Both are filtered by `keep`; **no prefix
     /// prefilter** — fuzzy ranking happens in callers, and a starts_with
@@ -1034,6 +1078,19 @@ impl LanguageServer for Backend {
                 // foldable range per top-level construct (module, class,
                 // function, …). No semantic info, no symbol table needed.
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                // Slang-first, then tree-sitter fallback for signature popup.
+                // Trigger on `(` so the popup appears immediately when the user
+                // opens a function's argument list; `,` keeps it updated as the
+                // cursor moves between arguments.
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".into(), ",".into()]),
+                    retrigger_characters: None,
+                    work_done_progress_options: Default::default(),
+                }),
+                // Tree-sitter-only inlay hints: show `param: type` labels before
+                // each argument. Only for calls whose callee is in the syntax
+                // index; method calls (unknown receiver type) are silently skipped.
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 // We publish diagnostics as a *push* (via the `Client`) on
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
@@ -1338,6 +1395,175 @@ impl LanguageServer for Backend {
             .collect();
         debug!(count = ranges.len(), "folding_range returned");
         Ok(Some(ranges))
+    }
+
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> LspResult<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        // --- slang path ---
+        if let Some(sigs) = self.try_slang_signature_help(&uri, target).await {
+            let result = slang_signatures_to_lsp(sigs, 0);
+            return Ok(Some(result));
+        }
+
+        // --- tree-sitter fallback ---
+        let (text, index) = {
+            let docs = self.documents.read().await;
+            let Some(state) = docs.get(&uri) else {
+                debug!("signature_help for unknown URI");
+                return Ok(None);
+            };
+            (state.document.text(), state.index.clone())
+        };
+        let rope = Rope::from_str(&text);
+        let tree = {
+            let mut parser = self.parser.lock().await;
+            match parser.parse(&text, None) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "parse failed during signature_help");
+                    return Ok(None);
+                }
+            }
+        };
+
+        let Some(call) = call_site_at(&tree, &rope, target) else {
+            debug!("signature_help: no call site at cursor");
+            return Ok(None);
+        };
+        debug!(name = %call.name, kind = ?call.kind, "signature_help: call site found");
+
+        // Look up the symbol in the same-file index, then workspace index.
+        let sym: Option<Symbol> = match index.iter().find(|s| s.name == call.name).cloned() {
+            Some(s) => Some(s),
+            None => {
+                let wi = self.workspace_index.read().await;
+                let found = wi
+                    .entries()
+                    .find(|e| e.symbol.name == call.name)
+                    .map(|e| e.symbol.clone());
+                drop(wi);
+                found
+            }
+        };
+
+        let Some(sym) = sym else {
+            debug!(name = %call.name, "signature_help: symbol not found in index");
+            return Ok(None);
+        };
+
+        let Some(sig_info) = signature_for(&sym) else {
+            debug!(name = %call.name, "signature_help: symbol not callable");
+            return Ok(None);
+        };
+
+        let active = active_arg_index(&call, &rope, target);
+        let lsp_params: Vec<ParameterInformation> = sig_info
+            .params
+            .iter()
+            .map(|p| ParameterInformation {
+                label: ParameterLabel::LabelOffsets([p.label_offset.0, p.label_offset.1]),
+                documentation: None,
+            })
+            .collect();
+
+        let result = SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: sig_info.label,
+                documentation: None,
+                parameters: Some(lsp_params),
+                active_parameter: Some(active as u32),
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(active as u32),
+        };
+        Ok(Some(result))
+    }
+
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document.uri),
+    )]
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> LspResult<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let vp = params.range;
+        let vp_range = MRange::new(
+            MPosition::new(vp.start.line, vp.start.character),
+            MPosition::new(vp.end.line, vp.end.character),
+        );
+
+        let (text, index) = {
+            let docs = self.documents.read().await;
+            let Some(state) = docs.get(&uri) else {
+                debug!("inlay_hint for unknown URI");
+                return Ok(None);
+            };
+            (state.document.text(), state.index.clone())
+        };
+        let rope = Rope::from_str(&text);
+        let tree = {
+            let mut parser = self.parser.lock().await;
+            match parser.parse(&text, None) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "parse failed during inlay_hint");
+                    return Ok(None);
+                }
+            }
+        };
+
+        let call_sites = call_sites_in(&tree, &rope, vp_range);
+        debug!(count = call_sites.len(), "inlay_hint: call sites in viewport");
+
+        let wi = self.workspace_index.read().await;
+        let mut hints: Vec<InlayHint> = Vec::new();
+
+        for call in &call_sites {
+            // Skip method calls — receiver type unknown without slang.
+            if matches!(call.kind, CallKind::Method { .. }) {
+                continue;
+            }
+            // Look up symbol: same-file first, then workspace.
+            let sym = index.iter().find(|s| s.name == call.name).cloned();
+            let sym = if sym.is_none() {
+                wi.entries()
+                    .find(|e| e.symbol.name == call.name)
+                    .map(|e| e.symbol.clone())
+            } else {
+                sym
+            };
+            let Some(sym) = sym else { continue };
+
+            for label in hints_for(call, &sym) {
+                hints.push(InlayHint {
+                    position: Position::new(label.position.line, label.position.character),
+                    label: InlayHintLabel::String(label.text),
+                    kind: Some(InlayHintKind::PARAMETER),
+                    text_edits: None,
+                    tooltip: None,
+                    padding_left: None,
+                    padding_right: Some(true),
+                    data: None,
+                });
+            }
+        }
+
+        debug!(count = hints.len(), "inlay_hint returned");
+        Ok(Some(hints))
     }
 
     #[instrument(
@@ -2352,6 +2578,47 @@ fn into_complete_params(
 
 /// Convert a vector of sidecar [`SlangCompletionItem`]s into an LSP
 /// [`CompletionResponse::Array`]. Single-source mapping for the three
+/// Convert a list of slang `SignatureItem`s into LSP's `SignatureHelp`.
+///
+/// `active_sig` is the index of the currently active overload (0 for the
+/// first — we don't yet do overload resolution so it's always 0).
+fn slang_signatures_to_lsp(
+    sigs: Vec<mimir_slang::SignatureItem>,
+    active_sig: u32,
+) -> SignatureHelp {
+    let lsp_sigs: Vec<SignatureInformation> = sigs
+        .into_iter()
+        .map(|s| {
+            let lsp_params: Vec<ParameterInformation> = s
+                .params
+                .into_iter()
+                .map(|p| {
+                    let label_text = if let Some(ty) = p.ty {
+                        format!("{ty} {}", p.name)
+                    } else {
+                        p.name
+                    };
+                    ParameterInformation {
+                        label: ParameterLabel::Simple(label_text),
+                        documentation: None,
+                    }
+                })
+                .collect();
+            SignatureInformation {
+                label: s.label,
+                documentation: None,
+                parameters: Some(lsp_params),
+                active_parameter: None,
+            }
+        })
+        .collect();
+    SignatureHelp {
+        signatures: lsp_sigs,
+        active_signature: Some(active_sig),
+        active_parameter: None,
+    }
+}
+
 /// slang routes; keeps the field-by-field translation in one place.
 ///
 /// Dedupes by `label` (first-wins) so a symbol visible through multiple
@@ -2974,6 +3241,7 @@ mod tests {
             kind,
             name_range: MRange::new(MPosition::new(line, 0), MPosition::new(line, 1)),
             full_range: MRange::new(MPosition::new(line, 0), MPosition::new(line, 10)),
+            params: None,
         }
     }
 
@@ -3120,6 +3388,7 @@ mod tests {
             kind: MSymbolKind::Module,
             name_range: MRange::new(MPosition::new(0, 7), MPosition::new(0, 13)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 9)),
+            params: None,
         };
         let out = nest_symbols(&[s]);
         assert_eq!(out.len(), 1);
@@ -3137,18 +3406,21 @@ mod tests {
             kind: MSymbolKind::Class,
             name_range: MRange::new(MPosition::new(0, 6), MPosition::new(0, 7)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(6, 8)),
+            params: None,
         };
         let f = Symbol {
             name: "f".into(),
             kind: MSymbolKind::Method,
             name_range: MRange::new(MPosition::new(1, 18), MPosition::new(1, 19)),
             full_range: MRange::new(MPosition::new(1, 4), MPosition::new(2, 12)),
+            params: None,
         };
         let g = Symbol {
             name: "g".into(),
             kind: MSymbolKind::Method,
             name_range: MRange::new(MPosition::new(3, 9), MPosition::new(3, 10)),
             full_range: MRange::new(MPosition::new(3, 4), MPosition::new(4, 8)),
+            params: None,
         };
         let out = nest_symbols(&[class, f, g]);
         assert_eq!(out.len(), 1);
@@ -3172,12 +3444,14 @@ mod tests {
             kind: MSymbolKind::Module,
             name_range: MRange::new(MPosition::new(0, 7), MPosition::new(0, 8)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(1, 9)),
+            params: None,
         };
         let b = Symbol {
             name: "b".into(),
             kind: MSymbolKind::Module,
             name_range: MRange::new(MPosition::new(2, 7), MPosition::new(2, 8)),
             full_range: MRange::new(MPosition::new(2, 0), MPosition::new(3, 9)),
+            params: None,
         };
         let out = nest_symbols(&[a, b]);
         let names: Vec<&str> = out.iter().map(|n| n.name.as_str()).collect();
@@ -3192,18 +3466,21 @@ mod tests {
             kind: MSymbolKind::Package,
             name_range: MRange::new(MPosition::new(0, 8), MPosition::new(0, 9)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(8, 10)),
+            params: None,
         };
         let cls = Symbol {
             name: "c".into(),
             kind: MSymbolKind::Class,
             name_range: MRange::new(MPosition::new(1, 6), MPosition::new(1, 7)),
             full_range: MRange::new(MPosition::new(1, 0), MPosition::new(6, 8)),
+            params: None,
         };
         let m = Symbol {
             name: "f".into(),
             kind: MSymbolKind::Method,
             name_range: MRange::new(MPosition::new(2, 18), MPosition::new(2, 19)),
             full_range: MRange::new(MPosition::new(2, 4), MPosition::new(3, 12)),
+            params: None,
         };
         let out = nest_symbols(&[pkg, cls, m]);
         assert_eq!(out.len(), 1);

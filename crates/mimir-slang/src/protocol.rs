@@ -58,6 +58,11 @@ pub mod methods {
     /// Params: [`super::CompleteParams`]; result: [`super::CompleteResult`].
     pub const COMPLETE: &str = "complete";
 
+    /// Return the signature of the callable under the cursor, and which
+    /// parameter is active. Used to power LSP `textDocument/signatureHelp`.
+    /// Params: [`super::SignatureHelpParams`]; result: [`super::SignatureHelpResult`].
+    pub const SIGNATURE_HELP: &str = "signatureHelp";
+
     /// Politely ask the sidecar to exit. No params, no result.
     /// The client should still wait on the child after sending this.
     pub const SHUTDOWN: &str = "shutdown";
@@ -441,6 +446,66 @@ pub struct SlangCompletionItem {
     /// (e.g. the member's declared type).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+// --------------------------------------------------------------------------
+// `signatureHelp` method
+// --------------------------------------------------------------------------
+
+/// Params for [`methods::SIGNATURE_HELP`].
+///
+/// Same file-set / cursor shape as [`DefinitionParams`] — the sidecar resolves
+/// the callable at the cursor position and returns its declared signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureHelpParams {
+    /// Same shape as [`DefinitionParams::files`].
+    pub files: Vec<SourceFile>,
+    /// `+incdir+` paths.
+    #[serde(default)]
+    pub include_dirs: Vec<String>,
+    /// `+define+` macros.
+    #[serde(default)]
+    pub defines: Vec<MacroDefine>,
+    /// Optional top module/program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<String>,
+    /// Filesystem path of the file containing the cursor.
+    pub target_path: String,
+    /// LSP-coordinate cursor position (zero-based line, UTF-16 character).
+    pub target_position: Position,
+}
+
+/// Result for [`methods::SIGNATURE_HELP`].
+///
+/// An empty `signatures` vector means the cursor is not inside a callable's
+/// argument list — the server suppresses the signature popup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SignatureHelpResult {
+    /// The signatures of the callable(s) visible at the cursor position.
+    /// Typically one entry; overloaded functions may produce several.
+    #[serde(default)]
+    pub signatures: Vec<SignatureItem>,
+}
+
+/// One overload of a callable returned by [`SignatureHelpResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureItem {
+    /// Full human-readable signature label, e.g.
+    /// `"function bit check(int actual, int expected)"`.
+    pub label: String,
+    /// Parameters declared by this overload, in order.
+    #[serde(default)]
+    pub params: Vec<SignatureParam>,
+}
+
+/// One parameter within a [`SignatureItem`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureParam {
+    /// Parameter name.
+    pub name: String,
+    /// Declared type, if known (e.g. `"int"`, `"string"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ty: Option<String>,
 }
 
 // --------------------------------------------------------------------------
@@ -915,5 +980,62 @@ mod tests {
         };
         let s = serde_json::to_string(&item).unwrap();
         assert!(!s.contains("detail"), "expected `detail` to be omitted: {s}");
+    }
+
+    /// `SignatureHelpParams` round-trips with all fields.
+    #[test]
+    fn signature_help_params_roundtrip() {
+        let p = SignatureHelpParams {
+            files: vec![SourceFile {
+                path: "/proj/a.sv".into(),
+                text: "function int add(int a, int b); endfunction".into(),
+                is_compilation_unit: true,
+            }],
+            include_dirs: vec![],
+            defines: vec![],
+            top: None,
+            target_path: "/proj/a.sv".into(),
+            target_position: Position::new(0, 20),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: SignatureHelpParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_path, "/proj/a.sv");
+        assert_eq!(back.target_position.character, 20);
+    }
+
+    /// `SignatureHelpResult` with one signature and two params round-trips.
+    #[test]
+    fn signature_help_result_roundtrip() {
+        let r = SignatureHelpResult {
+            signatures: vec![SignatureItem {
+                label: "function int add(int a, int b)".into(),
+                params: vec![
+                    SignatureParam { name: "a".into(), ty: Some("int".into()) },
+                    SignatureParam { name: "b".into(), ty: Some("int".into()) },
+                ],
+            }],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: SignatureHelpResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.signatures.len(), 1);
+        assert_eq!(back.signatures[0].label, "function int add(int a, int b)");
+        assert_eq!(back.signatures[0].params.len(), 2);
+        assert_eq!(back.signatures[0].params[0].name, "a");
+        assert_eq!(back.signatures[0].params[0].ty.as_deref(), Some("int"));
+    }
+
+    /// `SignatureHelpResult` with empty signatures decodes from `{}`.
+    #[test]
+    fn signature_help_result_empty_roundtrip() {
+        let from_empty: SignatureHelpResult = serde_json::from_str("{}").unwrap();
+        assert!(from_empty.signatures.is_empty());
+    }
+
+    /// `SignatureParam` omits `ty` when absent.
+    #[test]
+    fn signature_param_omits_null_ty() {
+        let p = SignatureParam { name: "x".into(), ty: None };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("ty"), "expected `ty` to be omitted: {s}");
     }
 }

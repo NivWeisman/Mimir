@@ -45,7 +45,7 @@ use tracing::{debug, instrument, warn, trace};
 use crate::protocol::{
     methods, CompleteParams, CompleteResult, DefinitionParams, DefinitionResult, ElaborateParams,
     ElaborateResult, ImplementationParams, ImplementationResult, Request, Response, ResponseError,
-    TypeDefinitionParams, TypeDefinitionResult,
+    SignatureHelpParams, SignatureHelpResult, TypeDefinitionParams, TypeDefinitionResult,
 };
 
 // --------------------------------------------------------------------------
@@ -296,6 +296,14 @@ where
     ) -> Result<CompleteResult, ConnectionError> {
         self.request(methods::COMPLETE, params).await
     }
+
+    /// Convenience wrapper for the [`methods::SIGNATURE_HELP`] method.
+    pub async fn signature_help(
+        &mut self,
+        params: &SignatureHelpParams,
+    ) -> Result<SignatureHelpResult, ConnectionError> {
+        self.request(methods::SIGNATURE_HELP, params).await
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -435,6 +443,21 @@ impl Client {
     ) -> Result<CompleteResult, ClientError> {
         let mut conn = self.connection.lock().await;
         Ok(conn.complete(params).await?)
+    }
+
+    /// Run a `signatureHelp` request against the sidecar.
+    ///
+    /// Returns the declared signature(s) of the callable at the cursor
+    /// position and the list of its formal parameters. An empty `signatures`
+    /// vector means the cursor is not inside a call's argument list or the
+    /// callable could not be resolved — the server falls back to the
+    /// tree-sitter index in that case.
+    pub async fn signature_help(
+        &self,
+        params: &SignatureHelpParams,
+    ) -> Result<SignatureHelpResult, ClientError> {
+        let mut conn = self.connection.lock().await;
+        Ok(conn.signature_help(params).await?)
     }
 
     /// Send the `shutdown` request, then wait for the child to exit.

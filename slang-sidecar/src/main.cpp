@@ -1634,6 +1634,11 @@ int main() {
                 resp["result"] = handle_implementation(req.value("params", json::object()));
             } else if (method == "complete") {
                 resp["result"] = handle_complete(req.value("params", json::object()));
+            } else if (method == "signatureHelp") {
+                // Stub: full slang-backed implementation is a future slice.
+                // Returning an empty signatures array causes the server to fall
+                // back to the tree-sitter syntax index.
+                resp["result"] = {{"signatures", json::array()}};
             } else if (method == "shutdown") {
                 // Acknowledge, flush, exit. Keeps the client from seeing
                 // a "Closed" before its shutdown response lands.
