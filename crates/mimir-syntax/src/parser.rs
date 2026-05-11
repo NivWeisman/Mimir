@@ -153,10 +153,16 @@ fn blank_backtick_lines(source: &str) -> Cow<'_, str> {
 /// We rewrite the `#(...)::` middle into underscores so the parser sees
 /// a single fused identifier (`uvm_config_db_______________get`). That
 /// parses cleanly as a `tf_call` token; the surrounding method body
-/// parses normally and the class structure is preserved. Signature
-/// resolution against the *original* `uvm_config_db::get` is lost on
-/// the tree-sitter fallback path (the fused name doesn't match any
-/// declaration); slang handles those calls when configured.
+/// parses normally and the class structure is preserved.
+///
+/// **Why fuse instead of keeping `::`?** Tried it; tree-sitter-verilog
+/// reaches for `let_expression` (which takes formal args) when it sees
+/// `IDENT::IDENT(args)` in an expression slot, and the actual call args
+/// land in an ERROR subtree. The fused `IDENT(args)` shape produces a
+/// clean `tf_call` with no error, at the cost of the call's symbol
+/// resolution: the mangled name doesn't match any declaration so
+/// tree-sitter signature_help on the call site returns None. Slang
+/// handles those calls correctly when configured.
 ///
 /// **Byte preservation**: identical to `blank_backtick_lines`. We only
 /// substitute characters within a single line and replace each byte 1:1
@@ -218,7 +224,9 @@ fn blank_parameterized_scopes(source: &str) -> Cow<'_, str> {
             i += 2;
             continue;
         }
-        // `j` is the closing `)`. Must be followed by `::IDENT`.
+        // `j` is the closing `)`. Must be followed by `::IDENT` for
+        // this to be the parameterized-scope pattern (vs an instance's
+        // parameter-value assignment like `fifo #(.WIDTH(8)) u_fifo(...)`).
         if j + 3 >= bytes.len()
             || bytes[j + 1] != b':'
             || bytes[j + 2] != b':'
