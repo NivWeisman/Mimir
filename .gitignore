@@ -22,5 +22,9 @@ editors/vscode/*.vsix
 .claude/settings.local.json
 current-plan.md
 
+# Python bytecode cache from the integration test suite (tests/)
+__pycache__/
+*.pyc
+
 # Other generated files
 examples/
