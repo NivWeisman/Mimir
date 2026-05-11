@@ -193,7 +193,9 @@ fn symbol_for(
 /// non-callable symbols. Called from [`symbol_for`].
 fn extract_callable_params(node: Node<'_>, source: &str) -> Option<Vec<Param>> {
     match node.kind() {
-        "function_body_declaration" | "task_body_declaration" => {
+        "function_body_declaration"
+        | "task_body_declaration"
+        | "class_constructor_declaration" => {
             Some(collect_tf_port_params(node, source))
         }
         "text_macro_definition" => Some(collect_macro_params(node, source)),
@@ -292,6 +294,9 @@ impl SymbolKind {
             "package_declaration" => SymbolKind::Package,
             "class_declaration" => SymbolKind::Class,
             "function_body_declaration" => SymbolKind::Function,
+            // Tagged `Function` here; the walker retags it to `Method`
+            // because constructors only appear inside a class.
+            "class_constructor_declaration" => SymbolKind::Function,
             "task_body_declaration" => SymbolKind::Task,
             "type_declaration" => SymbolKind::Typedef,
             "param_assignment" => SymbolKind::Parameter,
@@ -350,6 +355,20 @@ fn name_node_of<'a>(decl: Node<'a>) -> Option<Node<'a>> {
         "function_body_declaration" => {
             let id = first_named_child_of_kind(decl, "function_identifier")?;
             first_descendant_of_kind(id, "simple_identifier")
+        }
+        // SV constructors are `function new(...)`. The `new` keyword is
+        // an anonymous child token (tree-sitter exposes anonymous tokens
+        // via `Node::kind` equal to the literal string), so we return
+        // that token directly. Its `utf8_text` yields `"new"` — exactly
+        // the symbol name we want, and its byte range is where
+        // go-to-definition should land.
+        "class_constructor_declaration" => {
+            let mut cursor = decl.walk();
+            // Bind to a local so the cursor (borrowed by the iterator) is
+            // dropped before this block returns — the resulting `Node`
+            // only borrows from the tree, not from the cursor.
+            let new_kw = decl.children(&mut cursor).find(|c| c.kind() == "new");
+            new_kw
         }
         "task_body_declaration" => {
             let id = first_named_child_of_kind(decl, "task_identifier")?;
@@ -838,6 +857,69 @@ mod tests {
         assert_eq!(methods[0].name, "f");
         // No bare `Function` should slip through.
         assert!(!s.iter().any(|sy| sy.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn class_constructor_is_indexed_as_method_named_new() {
+        // SV constructors are spelled `function new(...)`. `new` is a
+        // keyword token, not a `function_identifier`, so the symbol
+        // indexer needs to synthesise the name from the keyword node.
+        let s = idx(
+            "class c;\n   function new(string name, int n = 0);\n   endfunction\nendclass\n",
+        );
+        let methods: Vec<&Symbol> =
+            s.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        assert_eq!(methods.len(), 1, "expected one method symbol, got {methods:#?}");
+        assert_eq!(methods[0].name, "new");
+        // No bare `Function` should slip through — constructors get
+        // remapped to `Method` because they're always inside a class.
+        assert!(!s.iter().any(|sy| sy.kind == SymbolKind::Function));
+        // Params extracted from the constructor's `tf_port_list`.
+        let params = methods[0]
+            .params
+            .as_ref()
+            .expect("constructor must carry params");
+        assert_eq!(params.len(), 2, "got {params:#?}");
+        assert_eq!(params[0].name, "name");
+        assert_eq!(params[1].name, "n");
+    }
+
+    /// The UVM-shaped fixture that motivated the rewrite: a class with
+    /// methods whose body contains a parameterized scope call. After
+    /// the preprocessor rewrites the `#(T)::method` glue, the class
+    /// declaration parses cleanly and all methods (including the
+    /// constructor) end up in the index as `Method`.
+    #[test]
+    fn uvm_style_class_methods_all_indexed() {
+        let src = "\
+class apb_monitor;
+   int sigs;
+   function new(string name);
+   endfunction
+   virtual function void build_phase(int phase);
+      int tmp;
+      if (!uvm_config_db#(apb_vif)::get(this, \"\", \"vif\", tmp)) begin
+      end
+   endfunction
+   virtual task run_phase(int phase);
+   endtask
+endclass
+";
+        let s = idx(src);
+        let method_names: Vec<&str> = s
+            .iter()
+            .filter(|sy| sy.kind == SymbolKind::Method)
+            .map(|sy| sy.name.as_str())
+            .collect();
+        assert!(method_names.contains(&"new"), "missing `new` in {method_names:?}");
+        assert!(
+            method_names.contains(&"build_phase"),
+            "missing `build_phase` in {method_names:?}",
+        );
+        assert!(
+            method_names.contains(&"run_phase"),
+            "missing `run_phase` in {method_names:?}",
+        );
     }
 
     #[test]

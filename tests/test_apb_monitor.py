@@ -104,15 +104,13 @@ class ApbMonitorTest(unittest.TestCase):
         starts = {f["startLine"] for f in folds}
         self.assertIn(29, starts, f"missing fold for `apb_monitor_cbs`; got {sorted(starts)}")
 
-    @unittest.expectedFailure
     def test_folding_covers_inner_apb_monitor_class(self) -> None:
-        """XFAIL: tree-sitter-verilog can't recover the `class_declaration`
-        wrapper for `apb_monitor` because the parameterized scope access
-        `uvm_config_db#(apb_vif)::get(...)` inside `build_phase` puts the
-        tree into an ERROR root. The body fragments survive as loose
-        `class_item` nodes, but the class envelope is gone, so the folder
-        doesn't emit a fold for it. Same root cause as the missing class
-        methods in `test_document_symbol_includes_inner_class_methods`."""
+        """The `class apb_monitor extends uvm_monitor;` declaration on
+        line 36 (0-indexed 35) gets a fold. This used to XFAIL because
+        the parameterized scope `uvm_config_db#(T)::get(...)` inside
+        `build_phase` put the entire class body into an ERROR root —
+        the preprocessor now rewrites the `#(T)::` glue so the class
+        parses cleanly."""
         folds = self.lsp.request(
             "textDocument/foldingRange", {"textDocument": {"uri": self.uri}}
         )
@@ -139,17 +137,12 @@ class ApbMonitorTest(unittest.TestCase):
         # Macro definition at the top of the file.
         self.assertIn("APB_MONITOR__SV", names)
 
-    @unittest.expectedFailure
     def test_document_symbol_includes_inner_class_methods(self) -> None:
-        """XFAIL: methods inside `apb_monitor` (`new`, `build_phase`,
-        `run_phase`, `trans_observed`) are not indexed because the
-        enclosing `class_declaration` parse fails (see comment on
-        `test_folding_covers_inner_apb_monitor_class`). The constructor
-        `new` survives as a free-standing `class_constructor_declaration`
-        but our `SymbolKind::from_node_kind` doesn't recognize that
-        node kind, and the other methods lose their
-        `function_body_declaration`/`task_body_declaration` wrapping in
-        the ERROR-recovery tree shape."""
+        """All four methods on `apb_monitor` show up. The constructor
+        `new` is recognised via `class_constructor_declaration`; the
+        other three (`build_phase`, `run_phase`, inner `trans_observed`)
+        come back once the parameterized-scope rewrite lets the class
+        body parse normally."""
         symbols = self.lsp.request(
             "textDocument/documentSymbol", {"textDocument": {"uri": self.uri}}
         )
@@ -214,11 +207,11 @@ class ApbMonitorTest(unittest.TestCase):
             for hl in result:
                 self.assertIn("range", hl)
 
-    @unittest.expectedFailure
     def test_document_highlight_sigs_finds_all_uses(self) -> None:
-        """XFAIL: same root cause — `sigs` is the class field, and the
-        scope walk can't find the enclosing `class_declaration`. Of the
-        ~10 actual uses, only 2-3 surface."""
+        """`sigs` is the class field on line 37 (0-indexed 36). The
+        scope-aware highlighter now finds the enclosing
+        `class_declaration` because the parameterized-scope rewrite
+        keeps that envelope intact — all ~10 uses light up."""
         result = self.lsp.request(
             "textDocument/documentHighlight",
             {

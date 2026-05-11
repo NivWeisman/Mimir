@@ -365,7 +365,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (254 today)
+cargo test   --workspace                    # run all unit tests (265 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
 make integration                            # python LSP tests against the local UVM example
