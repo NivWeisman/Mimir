@@ -43,7 +43,11 @@ pub enum SyntaxParserError {
 /// We keep the source alongside because tree-sitter `Node`s store byte
 /// offsets and you usually want to slice the source to extract the
 /// underlying text.
-#[derive(Debug)]
+///
+/// Cloning is cheap: `tree_sitter::Tree` is `Arc`-internal, and the source
+/// `String` is the only owned-heap allocation copied. Callers cache a
+/// `SyntaxTree` and hand out clones per LSP request.
+#[derive(Debug, Clone)]
 pub struct SyntaxTree {
     /// The tree-sitter parse tree. Cheap to clone (it's an `Arc` internally).
     pub tree: Tree,

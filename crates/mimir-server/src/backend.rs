@@ -48,7 +48,7 @@ use mimir_syntax::{
     inlay::hints_for,
     signature::signature_for,
     Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity,
-    Symbol, SymbolKind as MSymbolKind, SyntaxParser,
+    Symbol, SymbolKind as MSymbolKind, SyntaxParser, SyntaxTree,
 };
 use ropey::Rope;
 use tokio::sync::{Mutex, RwLock};
@@ -64,11 +64,12 @@ use crate::workspace_index::{self, WorkspaceIndex};
 
 /// Per-document state held inside the store.
 ///
-/// We keep the parser-side data (last `tree`) here so the next parse can be
-/// incremental. *Right now we don't actually feed the previous tree into
-/// the next parse* because we'd also need to apply `Tree::edit` for each
-/// change first; that's the next slice. The plumbing is here so we don't
-/// have to refactor the store later.
+/// We keep the last parsed `tree` here so LSP feature handlers
+/// (`folding_range`, `document_highlight`, `signature_help`, `inlay_hint`,
+/// `syntax_definition`) can reuse it instead of re-parsing on every
+/// request. `Tree::edit`-driven incremental reparse on `did_change` is
+/// still a future slice — for now every parse is full, but at least we
+/// only do it once per edit.
 #[derive(Debug)]
 struct DocumentState {
     document: TextDocument,
@@ -81,10 +82,16 @@ struct DocumentState {
     /// the document hasn't been parsed yet or the last parse failed.
     /// Powers same-file `goto_definition` and `documentSymbol`.
     index: Vec<Symbol>,
-    /// Document version the `index` was built from. Used to detect a
-    /// stale write — `reparse_and_publish` may finish after a fresh
-    /// `did_change` has bumped the version, in which case we must not
-    /// overwrite the live `index` with the stale parse's results.
+    /// Parse tree from the most recent successful parse. `None` between
+    /// `did_open` and the first parse completing. On a parse error we
+    /// deliberately leave the previous tree in place — serving slightly
+    /// stale results mid-keystroke is strictly better than serving none.
+    /// `SyntaxTree` clones cheaply (`tree_sitter::Tree` is `Arc` inside).
+    tree: Option<SyntaxTree>,
+    /// Document version the `index` and `tree` were built from. Used to
+    /// detect a stale write — `reparse_and_publish` may finish after a
+    /// fresh `did_change` has bumped the version, in which case we must
+    /// not overwrite the live cache with the stale parse's results.
     index_version: i32,
 }
 
@@ -193,30 +200,34 @@ impl Backend {
             parser.parse(&text, None)
         };
 
-        let (diags, new_index) = match parse_result {
+        let (diags, new_state) = match parse_result {
             Ok(tree) => {
                 let rope = Rope::from_str(&text);
                 let diags = mimir_syntax::diagnostics::collect(&tree, &rope);
                 let index = mimir_syntax::symbols::index(&tree, &rope);
-                (diags, Some(index))
+                (diags, Some((index, tree)))
             }
             Err(e) => {
+                // Deliberately leave `state.tree` and `state.index`
+                // untouched here — a failed parse mid-keystroke should
+                // not erase last-known-good results.
                 error!(error = %e, "parser returned error; publishing empty diagnostics");
                 (Vec::new(), None)
             }
         };
 
-        // Write the fresh index back into the doc store, but only if the
-        // version we parsed is still the live one — otherwise a `did_change`
-        // landed mid-parse and our index is already stale. When the write
-        // does happen, also fold the new symbols into the workspace index
-        // so cross-file F12 sees them.
-        if let Some(index) = new_index {
+        // Write the fresh index + tree back into the doc store, but only if
+        // the version we parsed is still the live one — otherwise a
+        // `did_change` landed mid-parse and our results are already stale.
+        // When the write does happen, also fold the new symbols into the
+        // workspace index so cross-file F12 sees them.
+        if let Some((index, tree)) = new_state {
             let updated = {
                 let mut docs = self.documents.write().await;
                 match docs.get_mut(&uri) {
                     Some(state) if state.document.version() == version => {
                         state.index = index.clone();
+                        state.tree = Some(tree);
                         state.index_version = version;
                         true
                     }
@@ -245,6 +256,72 @@ impl Backend {
         self.client
             .publish_diagnostics(uri, lsp_diags, Some(version))
             .await;
+    }
+
+    /// Snapshot the cached parse tree for `uri`.
+    ///
+    /// Returns `None` when the document isn't open. When the document
+    /// *is* open but the cache hasn't been populated yet (rare — only
+    /// between `did_open` and the first `reparse_and_publish` finishing,
+    /// or after every parse so far has errored) we fall back to a
+    /// synchronous full parse so the caller always gets a tree if the
+    /// document exists.
+    async fn cached_tree(&self, uri: &Url) -> Option<SyntaxTree> {
+        let (cached, fallback_text) = {
+            let docs = self.documents.read().await;
+            let state = docs.get(uri)?;
+            match &state.tree {
+                Some(t) => (Some(t.clone()), None),
+                None => (None, Some(state.document.text())),
+            }
+        };
+        if let Some(t) = cached {
+            return Some(t);
+        }
+        let text = fallback_text?;
+        let mut parser = self.parser.lock().await;
+        match parser.parse(&text, None) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                error!(error = %e, "fallback parse failed");
+                None
+            }
+        }
+    }
+
+    /// Snapshot the cached tree *and* symbol index for `uri` together.
+    ///
+    /// Acquires the doc-store read lock once for both. Falls back to a
+    /// synchronous parse if the tree cache is empty; the returned
+    /// `index` may be empty in that case (it's only populated by
+    /// `reparse_and_publish`).
+    async fn cached_tree_and_index(&self, uri: &Url) -> Option<(SyntaxTree, Vec<Symbol>)> {
+        let (cached, fallback_text, index) = {
+            let docs = self.documents.read().await;
+            let state = docs.get(uri)?;
+            let cached = state.tree.clone();
+            let fallback_text = if cached.is_none() {
+                Some(state.document.text())
+            } else {
+                None
+            };
+            (cached, fallback_text, state.index.clone())
+        };
+        let tree = match cached {
+            Some(t) => t,
+            None => {
+                let text = fallback_text?;
+                let mut parser = self.parser.lock().await;
+                match parser.parse(&text, None) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(error = %e, "fallback parse failed");
+                        return None;
+                    }
+                }
+            }
+        };
+        Some((tree, index))
     }
 
     /// Schedule a debounced slang elaborate. Called from `did_open` and
@@ -464,30 +541,8 @@ impl Backend {
         uri: &Url,
         target: MPosition,
     ) -> Option<GotoDefinitionResponse> {
-        // Snapshot text + index under the read lock; release before any
-        // re-parsing happens (lock-then-clone).
-        let (text, index) = {
-            let docs = self.documents.read().await;
-            let state = docs.get(uri)?;
-            (state.document.text(), state.index.clone())
-        };
-
-        // Re-parse so we can resolve `identifier_at`. The cached `index`
-        // already gives us declarations, but to find the *reference*
-        // under the cursor we need the tree itself. Tree-sitter parses
-        // are fast (~ms) and this happens only on user-initiated F12,
-        // so we don't bother caching the tree.
-        let tree = {
-            let mut parser = self.parser.lock().await;
-            match parser.parse(&text, None) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "parse failed during syntax_definition");
-                    return None;
-                }
-            }
-        };
-        let rope = Rope::from_str(&text);
+        let (tree, index) = self.cached_tree_and_index(uri).await?;
+        let rope = Rope::from_str(tree.source());
         let name = mimir_syntax::symbols::identifier_at(&tree, &rope, target)?;
 
         // Workspace fallback: clone the slice for `name` under the read
@@ -1131,6 +1186,7 @@ impl LanguageServer for Backend {
                     document: TextDocument::new(&text, version),
                     language_id,
                     index: Vec::new(),
+                    tree: None,
                     index_version: i32::MIN,
                 },
             );
@@ -1299,25 +1355,11 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
 
-        let text = {
-            let docs = self.documents.read().await;
-            let Some(state) = docs.get(&uri) else {
-                debug!("document_highlight for unknown URI");
-                return Ok(None);
-            };
-            state.document.text()
+        let Some(tree) = self.cached_tree(&uri).await else {
+            debug!("document_highlight: no tree available");
+            return Ok(None);
         };
-        let tree = {
-            let mut parser = self.parser.lock().await;
-            match parser.parse(&text, None) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "parse failed during document_highlight");
-                    return Ok(None);
-                }
-            }
-        };
-        let rope = Rope::from_str(&text);
+        let rope = Rope::from_str(tree.source());
         // Bail early if the cursor isn't on an identifier — `occurrences_of_at`
         // would also return an empty `Vec`, but probing here lets us
         // signal "no result" (`None`) versus "result, but empty"
@@ -1361,33 +1403,19 @@ impl LanguageServer for Backend {
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
-    /// Pure tree-sitter feature: parse the document and emit foldable line
-    /// ranges for each module/class/function/task/package/etc. We re-parse
-    /// here rather than reading the cached `index` because folding cares
-    /// about the full tree shape, not just declarations.
+    /// Pure tree-sitter feature: read the cached parse tree and emit
+    /// foldable line ranges for each module/class/function/task/package/etc.
+    /// Folding cares about the full tree shape, not just the symbol
+    /// `index`, so we read `state.tree` rather than `state.index`.
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn folding_range(
         &self,
         params: FoldingRangeParams,
     ) -> LspResult<Option<Vec<FoldingRange>>> {
         let uri = params.text_document.uri;
-        let text = {
-            let docs = self.documents.read().await;
-            let Some(state) = docs.get(&uri) else {
-                debug!("folding_range for unknown URI");
-                return Ok(None);
-            };
-            state.document.text()
-        };
-        let tree = {
-            let mut parser = self.parser.lock().await;
-            match parser.parse(&text, None) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "parse failed during folding_range");
-                    return Ok(None);
-                }
-            }
+        let Some(tree) = self.cached_tree(&uri).await else {
+            debug!("folding_range: no tree available");
+            return Ok(None);
         };
         let ranges: Vec<FoldingRange> = mimir_syntax::folding::folding_ranges(&tree)
             .into_iter()
@@ -1417,25 +1445,11 @@ impl LanguageServer for Backend {
         }
 
         // --- tree-sitter fallback ---
-        let (text, index) = {
-            let docs = self.documents.read().await;
-            let Some(state) = docs.get(&uri) else {
-                debug!("signature_help for unknown URI");
-                return Ok(None);
-            };
-            (state.document.text(), state.index.clone())
+        let Some((tree, index)) = self.cached_tree_and_index(&uri).await else {
+            debug!("signature_help: no tree available");
+            return Ok(None);
         };
-        let rope = Rope::from_str(&text);
-        let tree = {
-            let mut parser = self.parser.lock().await;
-            match parser.parse(&text, None) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "parse failed during signature_help");
-                    return Ok(None);
-                }
-            }
-        };
+        let rope = Rope::from_str(tree.source());
 
         let Some(call) = call_site_at(&tree, &rope, target) else {
             debug!("signature_help: no call site at cursor");
@@ -1506,25 +1520,11 @@ impl LanguageServer for Backend {
             MPosition::new(vp.end.line, vp.end.character),
         );
 
-        let (text, index) = {
-            let docs = self.documents.read().await;
-            let Some(state) = docs.get(&uri) else {
-                debug!("inlay_hint for unknown URI");
-                return Ok(None);
-            };
-            (state.document.text(), state.index.clone())
+        let Some((tree, index)) = self.cached_tree_and_index(&uri).await else {
+            debug!("inlay_hint: no tree available");
+            return Ok(None);
         };
-        let rope = Rope::from_str(&text);
-        let tree = {
-            let mut parser = self.parser.lock().await;
-            match parser.parse(&text, None) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "parse failed during inlay_hint");
-                    return Ok(None);
-                }
-            }
-        };
+        let rope = Rope::from_str(tree.source());
 
         let call_sites = call_sites_in(&tree, &rope, vp_range);
         debug!(count = call_sites.len(), "inlay_hint: call sites in viewport");
@@ -4047,5 +4047,74 @@ mod tests {
     #[test]
     fn slang_completion_kind_to_lsp_unknown_falls_back_to_variable() {
         assert_eq!(slang_completion_kind_to_lsp(99), CompletionItemKind::VARIABLE);
+    }
+
+    // ------------------------------------------------------------------
+    // Parse-tree cache on DocumentState
+    // ------------------------------------------------------------------
+
+    /// `did_open` should populate `state.tree` so subsequent LSP feature
+    /// handlers (`folding_range`, `document_highlight`, `inlay_hint`,
+    /// `signature_help`, `syntax_definition`) can read it instead of
+    /// re-parsing on every request.
+    #[tokio::test]
+    async fn did_open_populates_tree_cache() {
+        let (service, _socket) =
+            tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/cache-test.sv").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "systemverilog".to_string(),
+                    version: 1,
+                    text: "module foo;\nendmodule\n".to_string(),
+                },
+            })
+            .await;
+
+        let docs = backend.documents.read().await;
+        let state = docs.get(&uri).expect("doc inserted by did_open");
+        let tree = state.tree.as_ref().expect("tree cached after did_open");
+        assert_eq!(tree.tree.root_node().kind(), "source_file");
+        assert_eq!(state.index_version, 1, "version reflects the parse");
+    }
+
+    /// `cached_tree` returns the cached `SyntaxTree` on the happy path
+    /// without touching the parser lock. (We can't directly observe lock
+    /// acquisition, so this just exercises the cached read path.)
+    #[tokio::test]
+    async fn cached_tree_returns_populated_entry() {
+        let (service, _socket) =
+            tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/cache-helper.sv").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "systemverilog".to_string(),
+                    version: 1,
+                    text: "module bar; endmodule\n".to_string(),
+                },
+            })
+            .await;
+
+        let tree = backend.cached_tree(&uri).await.expect("tree cached");
+        assert_eq!(tree.tree.root_node().kind(), "source_file");
+        assert!(tree.source().contains("module bar"));
+    }
+
+    /// Cache miss (unknown URI) returns `None` rather than panicking or
+    /// synthesising an empty tree.
+    #[tokio::test]
+    async fn cached_tree_unknown_uri_returns_none() {
+        let (service, _socket) =
+            tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/never-opened.sv").unwrap();
+        assert!(backend.cached_tree(&uri).await.is_none());
+        assert!(backend.cached_tree_and_index(&uri).await.is_none());
     }
 }
