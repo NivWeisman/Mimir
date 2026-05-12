@@ -223,23 +223,25 @@ mod tests {
         );
     }
 
-    /// A parser unwind that would otherwise produce one ERROR spanning many
-    /// lines must instead surface narrower nested ERRORs. Regression for
-    /// the case where a UVM file's parse failure painted the whole file
-    /// red, with the snippet starting at the leading comment.
+    /// When a file has a comment header followed by invalid SV, diagnostics
+    /// must point to the error location, not to the comment line.
     #[test]
     fn nested_errors_are_preferred_over_outer_span() {
+        // The new grammar (tree-sitter-systemverilog) handles UVM scope-access
+        // like `x::type_id::create(...)` correctly, so the original snippet no
+        // longer produces errors. Use an unambiguously invalid token sequence that
+        // forces an ERROR node somewhere inside the class, not on line 0.
         let src = "\
 // header comment
-class c extends base;
+class c;
    function void f();
-      x::type_id::create(\"y\", this);
+      @@@invalid@@@;
    endfunction
 endclass
 ";
         let d = diags(src);
         assert!(!d.is_empty(), "expected at least one diagnostic");
-        // No diagnostic should start on the comment line — that was the bug.
+        // No diagnostic should start on the comment line.
         for diag in &d {
             assert!(
                 diag.range.start.line > 0,

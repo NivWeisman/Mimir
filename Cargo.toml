@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.6.19"
+version      = "0.6.20"
 edition      = "2021"
 rust-version = "1.75"
 license      = "MIT OR Apache-2.0"
@@ -45,10 +45,9 @@ ropey = "1.6"
 
 # --- Parser ----------------------------------------------------------------
 # tree-sitter gives us incremental reparsing and error recovery. The grammar
-# crate `tree-sitter-verilog` exposes a `language()` function that returns the
-# compiled grammar; we feed it into `tree_sitter::Parser`.
-tree-sitter         = "0.24"
-tree-sitter-verilog = "1.0"
+# crate exposes a `LANGUAGE` constant that we feed into `tree_sitter::Parser`.
+tree-sitter               = "0.25"
+tree-sitter-systemverilog = "0.3.1"
 
 # --- Observability ---------------------------------------------------------
 # `tracing` is the structured-logging standard. `tracing-subscriber` is the

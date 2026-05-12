@@ -14,17 +14,20 @@
 //!
 //! ## Tree-sitter node kinds recognised
 //!
-//! | Call kind    | Node kind in tree-sitter-verilog |
-//! |--------------|----------------------------------|
-//! | Function     | `tf_call`                        |
-//! | System task  | `system_tf_call`                 |
-//! | Method (dot) | `method_call`                    |
-//! | Macro        | `text_macro_usage`               |
+//! | Call kind    | Node kind in tree-sitter-systemverilog |
+//! |--------------|----------------------------------------|
+//! | Function     | `tf_call`                              |
+//! | Method (dot) | `tf_call` (hierarchical_identifier)    |
+//! | System task  | `system_tf_call`                       |
+//! | Macro        | `text_macro_usage`                     |
 //!
-//! Arguments live inside `list_of_arguments_parent` (for `tf_call`,
-//! `system_tf_call`, `method_call`) or `list_of_actual_arguments` (for
-//! `text_macro_usage`). Both node types carry the argument expressions as
-//! named children (commas and parentheses are anonymous tokens).
+//! In tree-sitter-systemverilog, `obj.method(args)` produces a `tf_call`
+//! whose `hierarchical_identifier` has two `simple_identifier` children
+//! (receiver + method name). There is no separate `method_call` node.
+//!
+//! Arguments live inside `list_of_arguments` (for `tf_call`, `system_tf_call`)
+//! or `list_of_actual_arguments` (for `text_macro_usage`). Both carry the
+//! argument expressions as named children; commas and parens are anonymous.
 
 use mimir_core::{Position, Range};
 use ropey::Rope;
@@ -185,7 +188,6 @@ fn call_site_from_node(node: Node<'_>, source: &str, rope: &Rope) -> Option<Call
     match node.kind() {
         "tf_call" => call_site_from_tf_call(node, source, rope),
         "system_tf_call" => call_site_from_system_tf_call(node, source, rope),
-        "method_call" => call_site_from_method_call(node, source, rope),
         "text_macro_usage" => call_site_from_macro_usage(node, source, rope),
         _ => None,
     }
@@ -193,7 +195,9 @@ fn call_site_from_node(node: Node<'_>, source: &str, rope: &Rope) -> Option<Call
 
 /// Build a `CallSite` from a `tf_call` node.
 ///
-/// Structure: `hierarchical_identifier (list_of_arguments_parent)?`
+/// In tree-sitter-systemverilog, both `foo(args)` and `obj.method(args)` are
+/// `tf_call` nodes. A method call has a `hierarchical_identifier` with two or
+/// more `simple_identifier` children; a plain function call has exactly one.
 fn call_site_from_tf_call(node: Node<'_>, source: &str, rope: &Rope) -> Option<CallSite> {
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
@@ -201,13 +205,34 @@ fn call_site_from_tf_call(node: Node<'_>, source: &str, rope: &Rope) -> Option<C
     let name_node_container = *children.first()?; // hierarchical_identifier
     let (name, name_range) = last_identifier_in(name_node_container, source, rope)?;
 
-    let args_node = children.iter().find(|c| c.kind() == "list_of_arguments_parent").copied();
-    let (args, paren_open, paren_close) = args_from_parent(args_node, rope);
+    let args_node = children.iter().find(|c| c.kind() == "list_of_arguments").copied();
+    let (args, paren_open, paren_close) = args_from_parent(args_node, rope, source);
+
+    // Detect method call: hierarchical_identifier with >1 simple_identifier children.
+    let simple_id_count = {
+        let mut c = name_node_container.walk();
+        name_node_container
+            .named_children(&mut c)
+            .filter(|n| n.kind() == "simple_identifier")
+            .count()
+    };
+    let kind = if simple_id_count > 1 {
+        // All but the last identifier form the receiver expression.
+        let receiver_node = name_node_container; // use the whole hierarchical_identifier
+        let receiver_text = receiver_node
+            .utf8_text(source.as_bytes())
+            .ok()?
+            .to_string();
+        let receiver_range = node_range(receiver_node, rope);
+        CallKind::Method { receiver_text, receiver_range }
+    } else {
+        CallKind::Function
+    };
 
     Some(CallSite {
         name,
         name_range,
-        kind: CallKind::Function,
+        kind,
         args,
         paren_open,
         paren_close,
@@ -216,7 +241,7 @@ fn call_site_from_tf_call(node: Node<'_>, source: &str, rope: &Rope) -> Option<C
 
 /// Build a `CallSite` from a `system_tf_call` node.
 ///
-/// Structure: `system_tf_identifier (list_of_arguments_parent)?`
+/// Structure: `system_tf_identifier (list_of_arguments)?`
 fn call_site_from_system_tf_call(node: Node<'_>, source: &str, rope: &Rope) -> Option<CallSite> {
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
@@ -225,62 +250,13 @@ fn call_site_from_system_tf_call(node: Node<'_>, source: &str, rope: &Rope) -> O
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
     let name_range = node_range(name_node, rope);
 
-    let args_node = children.iter().find(|c| c.kind() == "list_of_arguments_parent").copied();
-    let (args, paren_open, paren_close) = args_from_parent(args_node, rope);
+    let args_node = children.iter().find(|c| c.kind() == "list_of_arguments").copied();
+    let (args, paren_open, paren_close) = args_from_parent(args_node, rope, source);
 
     Some(CallSite {
         name,
         name_range,
         kind: CallKind::Function,
-        args,
-        paren_open,
-        paren_close,
-    })
-}
-
-/// Build a `CallSite` from a `method_call` node.
-///
-/// Structure: `receiver . method_call_body`
-fn call_site_from_method_call(node: Node<'_>, source: &str, rope: &Rope) -> Option<CallSite> {
-    let mut cursor = node.walk();
-    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
-
-    // First named child is the receiver; last is method_call_body.
-    let receiver_node = *children.first()?;
-    let body_node = *children.iter().find(|c| c.kind() == "method_call_body")?;
-
-    let receiver_text = receiver_node
-        .utf8_text(source.as_bytes())
-        .ok()?
-        .to_string();
-    let receiver_range = node_range(receiver_node, rope);
-
-    // Inside method_call_body: method_identifier + optional list_of_arguments_parent
-    let mut body_cursor = body_node.walk();
-    let body_children: Vec<Node<'_>> = body_node.named_children(&mut body_cursor).collect();
-
-    let method_id_node = *body_children
-        .iter()
-        .find(|c| c.kind() == "method_identifier")?;
-    let name = method_id_node
-        .utf8_text(source.as_bytes())
-        .ok()?
-        .to_string();
-    let name_range = node_range(method_id_node, rope);
-
-    let args_node = body_children
-        .iter()
-        .find(|c| c.kind() == "list_of_arguments_parent")
-        .copied();
-    let (args, paren_open, paren_close) = args_from_parent(args_node, rope);
-
-    Some(CallSite {
-        name,
-        name_range,
-        kind: CallKind::Method {
-            receiver_text,
-            receiver_range,
-        },
         args,
         paren_open,
         paren_close,
@@ -369,24 +345,40 @@ fn collect_call_sites(
 // Argument extraction helpers
 // --------------------------------------------------------------------------
 
-/// Extract argument spans from a `list_of_arguments_parent` node.
+/// Extract argument spans from a `list_of_arguments` node.
+///
+/// In tree-sitter-systemverilog, `list_of_arguments` does NOT include the
+/// surrounding parentheses — they are anonymous siblings inside the parent
+/// call node. We locate `(` and `)` by scanning the parent's anonymous
+/// children rather than relying on the list node's own byte range.
+///
 /// If `args_node` is `None` (no argument list), returns empty vec and
 /// the default paren positions.
 fn args_from_parent(
     args_node: Option<Node<'_>>,
     rope: &Rope,
+    source: &str,
 ) -> (Vec<ArgSpan>, Position, Position) {
     let Some(node) = args_node else {
         let fallback = Position::new(0, 0);
         return (Vec::new(), fallback, fallback);
     };
 
-    // list_of_arguments_parent includes the parens: starts with '(' ends with ')'
-    let paren_open = Position::from_byte_offset(rope, node.start_byte());
-    let paren_close = Position::from_byte_offset(
-        rope,
-        node.end_byte().saturating_sub(1),
-    );
+    let (paren_open, paren_close) = if let Some(parent) = node.parent() {
+        let open_byte = find_anon_paren_before(parent, node.start_byte(), source)
+            .unwrap_or(node.start_byte());
+        let close_byte = find_anon_paren_after(parent, node.end_byte(), source)
+            .unwrap_or(node.end_byte().saturating_sub(1));
+        (
+            Position::from_byte_offset(rope, open_byte),
+            Position::from_byte_offset(rope, close_byte),
+        )
+    } else {
+        (
+            Position::from_byte_offset(rope, node.start_byte()),
+            Position::from_byte_offset(rope, node.end_byte().saturating_sub(1)),
+        )
+    };
 
     let args = named_children_as_arg_spans(node, rope);
     (args, paren_open, paren_close)

@@ -203,21 +203,43 @@ fn extract_callable_params(node: Node<'_>, source: &str) -> Option<Vec<Param>> {
     }
 }
 
-/// Collect `Param` entries from `tf_port_list` inside a function/task body.
+/// Collect `Param` entries from `tf_port_list` inside a function/task body,
+/// or from `class_constructor_arg_list` inside a constructor.
 fn collect_tf_port_params(node: Node<'_>, source: &str) -> Vec<Param> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "tf_port_list" {
-            let mut c2 = child.walk();
-            for item in child.named_children(&mut c2) {
-                if matches!(item.kind(), "tf_port_item" | "tf_port_item1") {
-                    if let Some(p) = param_from_port_item(item, source) {
-                        out.push(p);
+        match child.kind() {
+            "tf_port_list" => {
+                let mut c2 = child.walk();
+                for item in child.named_children(&mut c2) {
+                    if matches!(item.kind(), "tf_port_item" | "tf_port_item1") {
+                        if let Some(p) = param_from_port_item(item, source) {
+                            out.push(p);
+                        }
                     }
                 }
+                break;
             }
-            break;
+            // Constructor params: class_constructor_arg_list → class_constructor_arg
+            // → tf_port_item (one per formal argument).
+            "class_constructor_arg_list" => {
+                let mut c2 = child.walk();
+                for arg in child.named_children(&mut c2) {
+                    if arg.kind() == "class_constructor_arg" {
+                        let mut c3 = arg.walk();
+                        for item in arg.named_children(&mut c3) {
+                            if matches!(item.kind(), "tf_port_item" | "tf_port_item1") {
+                                if let Some(p) = param_from_port_item(item, source) {
+                                    out.push(p);
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            _ => {}
         }
     }
     out
@@ -225,8 +247,10 @@ fn collect_tf_port_params(node: Node<'_>, source: &str) -> Vec<Param> {
 
 /// Build a single `Param` from a `tf_port_item` or `tf_port_item1` node.
 fn param_from_port_item(item: Node<'_>, source: &str) -> Option<Param> {
-    let port_id = first_named_child_of_kind(item, "port_identifier")?;
-    let name_node = first_descendant_of_kind(port_id, "simple_identifier")?;
+    // tree-sitter-systemverilog exposes the port name as a `name` field
+    // directly on tf_port_item (no port_identifier wrapper).
+    let name_node = item.child_by_field_name("name")
+        .or_else(|| first_named_child_of_kind(item, "simple_identifier"))?;
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
 
     let ty = {
@@ -346,15 +370,13 @@ fn name_node_of<'a>(decl: Node<'a>) -> Option<Node<'a>> {
         ),
         "package_declaration" => first_descendant_of_kind(decl, "simple_identifier"),
         "class_declaration" => {
-            // `class_identifier` appears twice in `class c extends b;` —
-            // the first one is the class being defined, the second is
-            // the parent type. We want the first.
-            let id = first_named_child_of_kind(decl, "class_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // tree-sitter-systemverilog exposes the class name as a `name`
+            // field directly on the node (no `class_identifier` wrapper).
+            decl.child_by_field_name("name")
         }
         "function_body_declaration" => {
-            let id = first_named_child_of_kind(decl, "function_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // `name` field carries the simple_identifier directly.
+            decl.child_by_field_name("name")
         }
         // SV constructors are `function new(...)`. The `new` keyword is
         // an anonymous child token (tree-sitter exposes anonymous tokens
@@ -371,46 +393,43 @@ fn name_node_of<'a>(decl: Node<'a>) -> Option<Node<'a>> {
             new_kw
         }
         "task_body_declaration" => {
-            let id = first_named_child_of_kind(decl, "task_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // `name` field carries the simple_identifier directly.
+            decl.child_by_field_name("name")
         }
         "type_declaration" => first_named_child_of_kind(decl, "simple_identifier"),
         "param_assignment" => {
-            let id = first_named_child_of_kind(decl, "parameter_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // Name is the first direct simple_identifier child (no wrapper).
+            first_named_child_of_kind(decl, "simple_identifier")
         }
         "variable_decl_assignment" => first_named_child_of_kind(decl, "simple_identifier"),
         "ansi_port_declaration" => {
-            let id = first_named_child_of_kind(decl, "port_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // `port_name` field carries the simple_identifier directly.
+            decl.child_by_field_name("port_name")
         }
         "property_declaration" => {
-            let id = first_named_child_of_kind(decl, "property_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // `name` field carries the simple_identifier directly.
+            decl.child_by_field_name("name")
         }
         "sequence_declaration" => first_named_child_of_kind(decl, "simple_identifier"),
         "covergroup_declaration" => {
-            let id = first_named_child_of_kind(decl, "covergroup_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // `name` field carries the simple_identifier directly.
+            decl.child_by_field_name("name")
         }
         "enum_name_declaration" => {
-            // `enum_name_declaration` may carry a value expression
-            // (`A = 1`), so its tree contains other identifiers. The
-            // name is always the first `enum_identifier` child.
-            let id = first_named_child_of_kind(decl, "enum_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // `enum_name_declaration` may carry a value expression (`A = 1`);
+            // the name is the first direct simple_identifier child.
+            first_named_child_of_kind(decl, "simple_identifier")
         }
         "constraint_declaration" => {
-            let id = first_named_child_of_kind(decl, "constraint_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")
+            // Name is a direct simple_identifier child (no wrapper node).
+            first_named_child_of_kind(decl, "simple_identifier")
         }
         // `` `define MY_MACRO … `` — the macro name is in the
-        // `text_macro_name` → `text_macro_identifier` → `simple_identifier`
-        // chain.
+        // `text_macro_name` → `simple_identifier` chain (the
+        // `text_macro_identifier` wrapper was removed in tree-sitter-systemverilog).
         "text_macro_definition" => {
             let macro_name = first_named_child_of_kind(decl, "text_macro_name")?;
-            let ident      = first_named_child_of_kind(macro_name, "text_macro_identifier")?;
-            first_descendant_of_kind(ident, "simple_identifier")
+            first_named_child_of_kind(macro_name, "simple_identifier")
         }
         _ => None,
     }
@@ -689,8 +708,9 @@ fn declares_locally_inner(
 fn declaration_name_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     let name_node = match node.kind() {
         "tf_port_item" | "tf_port_item1" => {
-            let id = first_named_child_of_kind(node, "port_identifier")?;
-            first_descendant_of_kind(id, "simple_identifier")?
+            // `name` field carries the port identifier directly.
+            node.child_by_field_name("name")
+                .or_else(|| first_named_child_of_kind(node, "simple_identifier"))?
         }
         _ => name_node_of(node)?,
     };
@@ -1347,4 +1367,5 @@ endmodule
         let hits = occ(src, "$display");
         assert_eq!(hits.len(), 2, "expected 2 $display calls, got {hits:#?}");
     }
+
 }

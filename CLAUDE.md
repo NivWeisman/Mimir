@@ -18,7 +18,7 @@ feature.
 | ------------ | ------------------------------------------------- | --------------------------------------------------- |
 | Async / RT   | `tokio`                                           | [Cargo.toml:36](./Cargo.toml)                       |
 | LSP          | `tower-lsp` 0.20                                  | [Cargo.toml:35](./Cargo.toml)                       |
-| Parser       | `tree-sitter` 0.24 + `tree-sitter-verilog` 1.0    | [Cargo.toml:48-49](./Cargo.toml)                    |
+| Parser       | `tree-sitter` 0.25 + `tree-sitter-systemverilog` 0.3.1 | [Cargo.toml:48-49](./Cargo.toml)               |
 | Text buffer  | `ropey`                                           | [Cargo.toml:42](./Cargo.toml)                       |
 | Logging      | `tracing` + `tracing-subscriber`                  | [Cargo.toml:55-56](./Cargo.toml)                    |
 | Errors       | `thiserror` (typed) / `anyhow` (top-level glue)   | [Cargo.toml:59-60](./Cargo.toml)                    |
