@@ -32,18 +32,18 @@ pub struct InlayLabel {
 /// Pair each argument of `call` with the matching formal parameter of `sym`
 /// and produce one [`InlayLabel`] per pair.
 ///
+/// The caller is responsible for ensuring `sym` is the *right* symbol for
+/// this call site. For non-method calls a name lookup is enough; for
+/// `CallKind::Method` the caller must have resolved the receiver type
+/// (e.g. via the AST for `this`/`super` keywords, or via slang). When the
+/// caller passes a method's symbol we trust it and emit hints — there is
+/// no defensive skip here.
+///
 /// Returns an empty vector when:
 /// * `sym.params` is `None` (the symbol is not callable).
-/// * `call.kind` is [`CallKind::Method`] (tree-sitter can't resolve receiver
-///   types; slang handles this path when available).
 /// * `call.args` is empty.
 #[must_use]
 pub fn hints_for(call: &CallSite, sym: &Symbol) -> Vec<InlayLabel> {
-    // Method calls can't be resolved syntactically — receiver type is unknown.
-    if matches!(call.kind, CallKind::Method { .. }) {
-        return Vec::new();
-    }
-
     let Some(params) = &sym.params else {
         return Vec::new();
     };
@@ -113,6 +113,7 @@ mod tests {
             name_range: r,
             full_range: r,
             params: Some(params),
+            parent_class_name: None,
         }
     }
 
@@ -160,12 +161,16 @@ mod tests {
     }
 
     #[test]
-    fn method_call_returns_empty() {
+    fn method_call_with_resolved_symbol_emits_hints() {
+        // The caller (e.g. inlay handler resolving `this.method` /
+        // `super.method` via the AST) is responsible for passing the
+        // right symbol. Once they do, `hints_for` trusts them — no
+        // defensive method-skip.
         let call = make_call(
             "method",
             CallKind::Method {
-                receiver_text: "obj".into(),
-                receiver_range: make_range(0, 0, 3),
+                receiver_text: "this".into(),
+                receiver_range: make_range(0, 0, 4),
             },
             vec![make_range(1, 4, 5)],
         );
@@ -174,7 +179,9 @@ mod tests {
             SymbolKind::Method,
             vec![Param { name: "x".into(), ty: Some("int".into()) }],
         );
-        assert!(hints_for(&call, &sym).is_empty());
+        let hints = hints_for(&call, &sym);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].text, "x: int");
     }
 
     #[test]
@@ -209,6 +216,7 @@ mod tests {
             name_range: make_range(0, 0, 1),
             full_range: make_range(0, 0, 1),
             params: None, // not callable / no params info
+            parent_class_name: None,
         };
         assert!(hints_for(&call, &sym).is_empty());
     }

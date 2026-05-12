@@ -117,6 +117,12 @@ pub struct Symbol {
     /// Formal parameters for callable declarations (functions, tasks, methods,
     /// macros). `None` for non-callable symbols (modules, classes, variables…).
     pub params: Option<Vec<Param>>,
+    /// For [`SymbolKind::Class`] symbols only: the parent class name from
+    /// `class C extends P;`, with any package qualifier and parameter list
+    /// stripped. Powers `super.X(...)` inlay-hint resolution by letting the
+    /// caller walk the inheritance chain without re-parsing each ancestor.
+    /// `None` for non-class symbols and for classes with no `extends` clause.
+    pub parent_class_name: Option<String>,
 }
 
 /// Walk `tree` and return every declaration we can recognise.
@@ -180,13 +186,36 @@ fn symbol_for(
     let name_node = name_node_of(node)?;
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
     let params = extract_callable_params(node, source);
+    let parent_class_name = if matches!(kind, SymbolKind::Class) {
+        extract_class_extends_name(node, source)
+    } else {
+        None
+    };
     Some(Symbol {
         name,
         kind,
         name_range: node_range(name_node, rope),
         full_range: node_range(node, rope),
         params,
+        parent_class_name,
     })
+}
+
+/// Read a class's `extends P;` clause and return `P` as a plain name.
+/// Used by [`symbol_for`] to populate [`Symbol::parent_class_name`].
+fn extract_class_extends_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "class_declaration" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let class_type = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "class_type")?;
+    let mut c2 = class_type.walk();
+    let id = class_type
+        .named_children(&mut c2)
+        .find(|n| n.kind() == "simple_identifier")?;
+    id.utf8_text(source.as_bytes()).ok().map(str::to_owned)
 }
 
 /// Extract formal parameters for callable declarations, or `None` for
@@ -195,9 +224,9 @@ fn extract_callable_params(node: Node<'_>, source: &str) -> Option<Vec<Param>> {
     match node.kind() {
         "function_body_declaration"
         | "task_body_declaration"
-        | "class_constructor_declaration" => {
-            Some(collect_tf_port_params(node, source))
-        }
+        | "class_constructor_declaration"
+        | "function_prototype"
+        | "task_prototype" => Some(collect_tf_port_params(node, source)),
         "text_macro_definition" => Some(collect_macro_params(node, source)),
         _ => None,
     }
@@ -322,6 +351,13 @@ impl SymbolKind {
             // because constructors only appear inside a class.
             "class_constructor_declaration" => SymbolKind::Function,
             "task_body_declaration" => SymbolKind::Task,
+            // `extern virtual function/task foo(args);` — the prototype-only
+            // form used heavily in UVM headers (uvm_component.svh declares
+            // `run_phase`, `build_phase`, etc. this way and defines them
+            // out-of-class). The body lives elsewhere but the prototype
+            // already carries the param list inlay hints need.
+            "function_prototype" => SymbolKind::Function,
+            "task_prototype" => SymbolKind::Task,
             "type_declaration" => SymbolKind::Typedef,
             "param_assignment" => SymbolKind::Parameter,
             "variable_decl_assignment" => SymbolKind::Variable,
@@ -396,6 +432,9 @@ fn name_node_of<'a>(decl: Node<'a>) -> Option<Node<'a>> {
             // `name` field carries the simple_identifier directly.
             decl.child_by_field_name("name")
         }
+        // Extern prototypes (`extern virtual task run_phase(...);`) carry the
+        // name on a `name:` field just like body declarations.
+        "function_prototype" | "task_prototype" => decl.child_by_field_name("name"),
         "type_declaration" => first_named_child_of_kind(decl, "simple_identifier"),
         "param_assignment" => {
             // Name is the first direct simple_identifier child (no wrapper).
@@ -515,6 +554,74 @@ pub fn identifier_at<'a>(tree: &'a SyntaxTree, rope: &Rope, pos: Position) -> Op
         tree.source().get(leaf.byte_range())
     } else {
         None
+    }
+}
+
+// --------------------------------------------------------------------------
+// enclosing_class_info_at — for `this.X` / `super.X` resolution
+// --------------------------------------------------------------------------
+
+/// Information about the class declaration that encloses a given position
+/// in the source — used by inlay-hint / goto-def to resolve `this.X` and
+/// `super.X` method calls without slang.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnclosingClassInfo {
+    /// The enclosing class's name (the `simple_identifier` from
+    /// `class C ...`).
+    pub class_name: String,
+    /// The parent class name from `class C extends P;`, if any.
+    /// Captures only the leaf simple_identifier — package qualifiers
+    /// (`pkg::P`) and parameter lists (`P#(W)`) are stripped.
+    pub parent_class_name: Option<String>,
+}
+
+/// Walk upward from `pos` to find the nearest enclosing `class_declaration`
+/// and report its name and (optional) `extends` target.
+///
+/// Returns `None` when `pos` isn't inside any class — e.g. it sits in a
+/// top-level module, a package without a class, or whitespace at file scope.
+#[must_use]
+pub fn enclosing_class_info_at(
+    tree: &SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+) -> Option<EnclosingClassInfo> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let mut node = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    loop {
+        if node.kind() == "class_declaration" {
+            let class_name = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(tree.source().as_bytes()).ok())
+                .map(str::to_owned)?;
+            // `extends` target is the first `class_type` child, if present.
+            // Its leaf simple_identifier is the parent class name. Bind
+            // cursors to locals so the iterators (which borrow them) drop
+            // before the outer block returns — same idiom as `class_constructor_declaration`
+            // in `decl_name_node`.
+            let parent_class_name = {
+                let mut cursor = node.walk();
+                let class_type = node
+                    .named_children(&mut cursor)
+                    .find(|c| c.kind() == "class_type");
+                class_type.and_then(|ct| {
+                    let mut c2 = ct.walk();
+                    let id = ct
+                        .named_children(&mut c2)
+                        .find(|n| n.kind() == "simple_identifier");
+                    id.and_then(|n| n.utf8_text(tree.source().as_bytes()).ok())
+                        .map(str::to_owned)
+                })
+            };
+            return Some(EnclosingClassInfo {
+                class_name,
+                parent_class_name,
+            });
+        }
+        match node.parent() {
+            Some(p) => node = p,
+            None => return None,
+        }
     }
 }
 
@@ -1391,4 +1498,57 @@ endmodule
         assert_eq!(hits.len(), 2, "expected 2 $display calls, got {hits:#?}");
     }
 
+}
+
+
+#[cfg(test)]
+mod _class_inheritance_indexing_tests {
+    use super::*;
+    use crate::SyntaxParser;
+
+    /// `class X extends Y;` populates `Symbol::parent_class_name` on the
+    /// class symbol — required by inlay-hint `super.X` inheritance walking.
+    #[test]
+    fn class_extends_populates_parent_class_name() {
+        let mut p = SyntaxParser::new().unwrap();
+        let t = p
+            .parse(
+                "virtual class uvm_monitor extends uvm_component;\nendclass\n",
+                None,
+            )
+            .unwrap();
+        let rope = Rope::from_str(t.source());
+        let syms = index(&t, &rope);
+        let cls = syms
+            .iter()
+            .find(|s| s.kind == SymbolKind::Class && s.name == "uvm_monitor")
+            .expect("class indexed");
+        assert_eq!(cls.parent_class_name.as_deref(), Some("uvm_component"));
+    }
+
+    /// `extern virtual task run_phase(uvm_phase phase);` inside a class
+    /// body produces a `Method`-kind symbol whose `params` carries the
+    /// declared port list. Without this, `super.run_phase(...)` from a
+    /// descendant class has nothing to attach inlay hints to.
+    #[test]
+    fn extern_task_prototype_inside_class_is_indexed_as_method() {
+        let mut p = SyntaxParser::new().unwrap();
+        let t = p
+            .parse(
+                "virtual class uvm_component;\n  extern virtual task run_phase(uvm_phase phase);\nendclass\n",
+                None,
+            )
+            .unwrap();
+        let rope = Rope::from_str(t.source());
+        let syms = index(&t, &rope);
+        let m = syms
+            .iter()
+            .find(|s| s.name == "run_phase")
+            .expect("extern task prototype indexed");
+        assert_eq!(m.kind, SymbolKind::Method);
+        let params = m.params.as_ref().expect("prototype carries params");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "phase");
+        assert_eq!(params[0].ty.as_deref(), Some("uvm_phase"));
+    }
 }

@@ -189,8 +189,168 @@ fn call_site_from_node(node: Node<'_>, source: &str, rope: &Rope) -> Option<Call
         "tf_call" => call_site_from_tf_call(node, source, rope),
         "system_tf_call" => call_site_from_system_tf_call(node, source, rope),
         "text_macro_usage" => call_site_from_macro_usage(node, source, rope),
+        // `super.X(args)` / `this.X(args)` — distinct from `tf_call` because the
+        // receiver is an `implicit_class_handle`, not a `hierarchical_identifier`.
+        "method_call" => call_site_from_method_call(node, source, rope),
+        // `new(args)` constructor expression, e.g. `ap = new("ap", this)`.
+        "class_new" => call_site_from_class_new(node, source, rope),
+        // The `super.new(args)` call inside a constructor declaration is
+        // folded into the `class_constructor_declaration` itself as a bare
+        // `list_of_arguments` child, sandwiched between
+        // `class_constructor_arg_list` and `function_statement_or_null`.
+        // Detect it by structural position rather than node kind.
+        "class_constructor_declaration" => {
+            call_site_from_constructor_super_call(node, source, rope)
+        }
         _ => None,
     }
+}
+
+/// Build a `CallSite` from a `method_call` node — handles `super.X(args)` and
+/// `this.X(args)` constructs where the receiver is an `implicit_class_handle`.
+///
+/// Grammar shape:
+/// ```text
+/// (method_call
+///   (implicit_class_handle)
+///   (method_call_body name: (simple_identifier)
+///                     arguments: (list_of_arguments ...)))
+/// ```
+fn call_site_from_method_call(node: Node<'_>, source: &str, rope: &Rope) -> Option<CallSite> {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+
+    let handle = children.iter().find(|c| c.kind() == "implicit_class_handle")?;
+    let body = children.iter().find(|c| c.kind() == "method_call_body")?;
+
+    let receiver_text = handle.utf8_text(source.as_bytes()).ok()?.to_string();
+    let receiver_range = node_range(*handle, rope);
+
+    // The method name is the `name:` field of method_call_body.
+    let name_node = body.child_by_field_name("name")?;
+    let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
+    let name_range = node_range(name_node, rope);
+
+    // `child_by_field_name("arguments")` is unreliable on this grammar's
+    // `method_call_body` — it returns the anonymous `(` token rather than
+    // the `list_of_arguments` node. Always scan named children directly.
+    let args_node = {
+        let mut c = body.walk();
+        let n = body
+            .named_children(&mut c)
+            .find(|n| n.kind() == "list_of_arguments");
+        n
+    };
+    let (args, paren_open, paren_close) = args_from_parent(args_node, rope, source);
+
+    Some(CallSite {
+        name,
+        name_range,
+        kind: CallKind::Method {
+            receiver_text,
+            receiver_range,
+        },
+        args,
+        paren_open,
+        paren_close,
+    })
+}
+
+/// Build a `CallSite` from a `class_new` node — the `new(args)` expression
+/// used in constructor calls like `ap = new("ap", this)` and `T x = new()`.
+///
+/// Grammar shape: `(class_new (list_of_arguments ...))` — there is no
+/// receiver token; the type the constructor belongs to comes from context
+/// (the LHS of the surrounding assignment / declaration), which we can't
+/// resolve without slang. We label the call name as `"new"` and the
+/// receiver as the empty string so downstream readers know it's a
+/// constructor call but can't pick the right overload by name alone.
+fn call_site_from_class_new(node: Node<'_>, source: &str, rope: &Rope) -> Option<CallSite> {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+
+    let args_node = children
+        .iter()
+        .find(|c| c.kind() == "list_of_arguments")
+        .copied();
+
+    // The `new` keyword itself is an anonymous child; for the name range we
+    // use the start of the `class_new` node and a 3-byte (length of "new")
+    // synthetic span. Tree-sitter doesn't expose the keyword as a named node.
+    let start_byte = node.start_byte();
+    let name_start = Position::from_byte_offset(rope, start_byte);
+    let name_end = Position::from_byte_offset(rope, start_byte + 3);
+    let name_range = Range::new(name_start, name_end);
+
+    let (args, paren_open, paren_close) = args_from_parent(args_node, rope, source);
+
+    Some(CallSite {
+        name: "new".to_string(),
+        name_range,
+        kind: CallKind::Method {
+            receiver_text: String::new(),
+            receiver_range: name_range,
+        },
+        args,
+        paren_open,
+        paren_close,
+    })
+}
+
+/// Build a `CallSite` for the `super.new(args)` call that the grammar folds
+/// into a `class_constructor_declaration` node.
+///
+/// Grammar shape:
+/// ```text
+/// (class_constructor_declaration
+///   (class_constructor_arg_list ...)   ; formal params of THIS `new`
+///   (list_of_arguments ...)             ; args passed to super.new()
+///   (function_statement_or_null ...))   ; constructor body
+/// ```
+/// The `list_of_arguments` between the formal-param list and the body is
+/// the implicit super-constructor call.
+fn call_site_from_constructor_super_call(
+    node: Node<'_>,
+    source: &str,
+    rope: &Rope,
+) -> Option<CallSite> {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+
+    // Find the `list_of_arguments` that sits *after* the formal arg list.
+    // (A `list_of_arguments` appearing *before* `class_constructor_arg_list`
+    // would be malformed and we ignore it.)
+    let mut saw_arg_list = false;
+    let super_args = children.iter().find_map(|c| {
+        match c.kind() {
+            "class_constructor_arg_list" => {
+                saw_arg_list = true;
+                None
+            }
+            "list_of_arguments" if saw_arg_list => Some(*c),
+            _ => None,
+        }
+    })?;
+
+    let start_byte = super_args.start_byte();
+    let name_pos = Position::from_byte_offset(rope, start_byte);
+    let name_range = Range::new(name_pos, name_pos);
+
+    let (args, paren_open, paren_close) = args_from_parent(Some(super_args), rope, source);
+
+    Some(CallSite {
+        // Name is `new`; receiver is `super` even though no `super` token is
+        // present in the source — the grammar elides it.
+        name: "new".to_string(),
+        name_range,
+        kind: CallKind::Method {
+            receiver_text: "super".to_string(),
+            receiver_range: name_range,
+        },
+        args,
+        paren_open,
+        paren_close,
+    })
 }
 
 /// Build a `CallSite` from a `tf_call` node.
@@ -502,7 +662,8 @@ mod tests {
         let mut parser = SyntaxParser::new().unwrap();
         let tree = parser.parse(src, None).unwrap();
         let rope = Rope::from_str(src);
-        let full = Range::new(Position::new(0, 0), Position::new(9999, 0));
+        let last_line = src.lines().count().saturating_sub(1) as u32;
+        let full = Range::new(Position::new(0, 0), Position::new(last_line + 1, 0));
         call_sites_in(&tree, &rope, full)
     }
 
@@ -523,6 +684,63 @@ endmodule
         let mut parser = SyntaxParser::new().unwrap();
         let tree = parser.parse(src, None).unwrap();
         println!("SEXP:\n{}", tree.tree.root_node().to_sexp());
+    }
+
+    /// Diagnostic: dump every call site `call_sites_in` returns for a UVM
+    /// constructor + task snippet that exercises the three constructs the
+    /// user flagged as missing hints: `super.new(...)`, bare `new(...)`,
+    /// and `super.run_phase(...)`. Run with `--nocapture` to see output.
+    /// `super.X(args)` is a `method_call` (not `tf_call`) under the
+    /// 0.3.1 grammar, with `implicit_class_handle` as the receiver and
+    /// the arg list on `method_call_body`. The grammar's `arguments:`
+    /// field on `method_call_body` is unreliable (points at the `(`
+    /// token, not the `list_of_arguments` node) — `call_sites_in` works
+    /// around it by scanning named children directly. This regression
+    /// test fails if the arg-count extraction breaks again.
+    #[test]
+    fn super_dot_method_call_extracts_args() {
+        let src = "\
+class c;
+  task run_phase(int phase);
+    super.run_phase(phase);
+  endtask
+endclass
+";
+        let sites = all_sites(src);
+        let super_call = sites
+            .iter()
+            .find(|s| {
+                s.name == "run_phase"
+                    && matches!(&s.kind, CallKind::Method { receiver_text, .. } if receiver_text == "super")
+            })
+            .expect("super.run_phase site must be detected");
+        assert_eq!(super_call.args.len(), 1, "expected 1 arg, got {:?}", super_call.args);
+    }
+
+    /// All three new SV-keyword/constructor call-site kinds are
+    /// detected by `call_sites_in`: `super.new`, bare `new(...)`, and
+    /// `super.X(...)`. The exact node kinds are documented in the
+    /// `call_site_from_*` dispatchers.
+    #[test]
+    fn detects_super_new_class_new_and_super_method() {
+        let src = "\
+class apb_monitor;
+   uvm_analysis_port ap;
+   function new(string name, uvm_component parent = null);
+      super.new(name, parent);
+      ap = new(\"ap\", this);
+   endfunction
+   virtual task run_phase(uvm_phase phase);
+      super.run_phase(phase);
+   endtask
+endclass
+";
+        let sites = all_sites(src);
+        let names: Vec<&str> = sites.iter().map(|s| s.name.as_str()).collect();
+        // Two `new` calls (constructor super-call + class_new for `ap`)
+        // and one `super.run_phase` should all surface.
+        assert!(names.iter().filter(|n| **n == "new").count() >= 2, "expected at least 2 `new` sites; got {:?}", names);
+        assert!(names.contains(&"run_phase"), "expected run_phase site; got {:?}", names);
     }
 
     #[test]

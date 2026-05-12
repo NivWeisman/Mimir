@@ -47,6 +47,7 @@ use mimir_syntax::{
     calls::{call_site_at, active_arg_index, call_sites_in, CallKind},
     inlay::hints_for,
     signature::signature_for,
+    symbols::enclosing_class_info_at,
     Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity,
     Symbol, SymbolKind as MSymbolKind, SyntaxParser, SyntaxTree,
 };
@@ -1541,31 +1542,141 @@ impl LanguageServer for Backend {
         );
 
         let Some((tree, index)) = self.cached_tree_and_index(&uri).await else {
-            debug!("inlay_hint: no tree available");
+            debug!("inlay_hint trace: no cached tree for this URI; bailing");
             return Ok(None);
         };
         let rope = Rope::from_str(tree.source());
 
         let call_sites = call_sites_in(&tree, &rope, vp_range);
-        debug!(count = call_sites.len(), "inlay_hint: call sites in viewport");
+        debug!(
+            calls = call_sites.len(),
+            "inlay_hint trace: scanning AST for call sites in viewport",
+        );
 
         let wi = self.workspace_index.read().await;
         let mut hints: Vec<InlayHint> = Vec::new();
 
         for call in &call_sites {
-            // Skip method calls — receiver type unknown without slang.
+            let kind_label = match &call.kind {
+                CallKind::Function => "function",
+                CallKind::Method { .. } => "method",
+                CallKind::Macro => "macro",
+            };
+            let receiver = match &call.kind {
+                CallKind::Method { receiver_text, .. } => Some(receiver_text.as_str()),
+                _ => None,
+            };
+
+            // For method calls we resolve the receiver via AST when it's
+            // `this` or `super` — both are SV keywords with a well-defined
+            // class meaning. For any other receiver (e.g. `obj.method(...)`)
+            // we still need slang to know `obj`'s type, so we skip with a
+            // diagnostic trace.
             if matches!(call.kind, CallKind::Method { .. }) {
+                let recv = receiver.unwrap_or("");
+                if recv != "this" && recv != "super" {
+                    debug!(
+                        name = %call.name,
+                        kind = kind_label,
+                        receiver = recv,
+                        args = call.args.len(),
+                        line = call.name_range.start.line,
+                        col = call.name_range.start.character,
+                        "inlay_hint trace: skipping method call — slang is needed to resolve the receiver's type",
+                    );
+                    continue;
+                }
+                // `this.X` or `super.X`: find the enclosing class and resolve.
+                let class_info = enclosing_class_info_at(&tree, &rope, call.name_range.start);
+                let target_class = match (recv, class_info.as_ref()) {
+                    ("this", Some(info)) => Some(info.class_name.clone()),
+                    ("super", Some(info)) => info.parent_class_name.clone(),
+                    _ => None,
+                };
+                debug!(
+                    name = %call.name,
+                    kind = kind_label,
+                    receiver = recv,
+                    target_class = target_class.as_deref().unwrap_or("<unknown>"),
+                    line = call.name_range.start.line,
+                    col = call.name_range.start.character,
+                    "inlay_hint trace: resolving method via AST",
+                );
+                // Look up the method:
+                //   * `this.X` — same-file index of the current class, then
+                //     same-file by-name fallback (other classes in the file
+                //     don't usually share method names with the current one).
+                //   * `super.X` — workspace lookup for the parent class, then
+                //     drill into the methods declared inside it.
+                let sym = if recv == "this" {
+                    // For `this.X` the current class is in this file, so the
+                    // same-file index already has all candidates.
+                    index
+                        .iter()
+                        .find(|s| s.name == call.name && s.kind == MSymbolKind::Method)
+                        .cloned()
+                } else if let Some(parent) = target_class {
+                    find_method_in_class(&wi, &parent, &call.name)
+                } else {
+                    None
+                };
+                if let Some(sym) = sym {
+                    let labels = hints_for(call, &sym);
+                    debug!(
+                        name = %call.name,
+                        receiver = recv,
+                        sym_params = sym.params.as_ref().map(|p| p.len()).unwrap_or(0),
+                        call_args = call.args.len(),
+                        labels = labels.len(),
+                        "inlay_hint trace: method resolved via AST",
+                    );
+                    for label in labels {
+                        hints.push(InlayHint {
+                            position: Position::new(label.position.line, label.position.character),
+                            label: InlayHintLabel::String(label.text),
+                            kind: Some(InlayHintKind::PARAMETER),
+                            text_edits: None,
+                            tooltip: None,
+                            padding_left: None,
+                            padding_right: Some(true),
+                            data: None,
+                        });
+                    }
+                } else {
+                    debug!(
+                        name = %call.name,
+                        receiver = recv,
+                        "inlay_hint trace: method NOT resolved — slang would help here",
+                    );
+                }
                 continue;
             }
-            // Look up symbol: same-file first, then workspace.
-            let sym = index.iter().find(|s| s.name == call.name).cloned();
-            let sym = if sym.is_none() {
+
+            // Same-file (DocumentState.index) first.
+            let same_file_hit = index.iter().find(|s| s.name == call.name).cloned();
+            // Workspace-wide (filelist + include-chain hydration) fallback.
+            let workspace_hit = if same_file_hit.is_none() {
                 wi.entries()
                     .find(|e| e.symbol.name == call.name)
                     .map(|e| e.symbol.clone())
             } else {
-                sym
+                None
             };
+            let sym = same_file_hit.clone().or(workspace_hit.clone());
+
+            debug!(
+                name = %call.name,
+                kind = kind_label,
+                args = call.args.len(),
+                line = call.name_range.start.line,
+                col = call.name_range.start.character,
+                same_file_hit = same_file_hit.is_some(),
+                workspace_hit = workspace_hit.is_some(),
+                resolved = sym.is_some(),
+                slang_would_help = sym.is_none(),
+                "inlay_hint trace: symbol lookup",
+            );
+
             let Some(sym) = sym else { continue };
 
             for label in hints_for(call, &sym) {
@@ -1582,7 +1693,10 @@ impl LanguageServer for Backend {
             }
         }
 
-        debug!(count = hints.len(), "inlay_hint returned");
+        debug!(
+            emitted = hints.len(),
+            "inlay_hint trace: done — these are the hints the editor will show",
+        );
         Ok(Some(hints))
     }
 
@@ -1948,6 +2062,61 @@ fn slang_location_to_lsp(loc: SlangDefinitionLocation) -> Option<Location> {
         uri: url,
         range: m_range_to_lsp(loc.range),
     })
+}
+
+/// Look up a method named `method_name` declared inside the body of the
+/// class named `class_name`, walking up the inheritance chain via each
+/// class's recorded [`Symbol::parent_class_name`] when the method isn't
+/// found in the class itself.
+///
+/// Used by `inlay_hint` to resolve `super.X(...)` calls without slang:
+/// the AST gives us the parent class name from the `extends` clause; this
+/// helper bridges that to the parent's (or grandparent's, …) method
+/// symbols via the index — so `super.run_phase(phase)` from a class
+/// extending `uvm_monitor` finds `uvm_component::run_phase` two levels up.
+///
+/// Strategy per inheritance step:
+///   1. Find the workspace entry for the current class (kind=Class).
+///      Multiple matches across files are possible — pick the first.
+///   2. Among entries for `method_name`, pick the one whose URL matches the
+///      class's URL *and* whose `full_range` is inside the class's
+///      `full_range`. That's the method declared in that class body.
+///   3. If no match, recurse on the parent class name. Capped at 16 hops
+///      to prevent runaway searches if the index has a cycle.
+fn find_method_in_class(
+    wi: &workspace_index::WorkspaceIndex,
+    class_name: &str,
+    method_name: &str,
+) -> Option<Symbol> {
+    let mut current = class_name.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..16 {
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        let class_entry = wi
+            .lookup(&current)
+            .iter()
+            .find(|e| e.symbol.kind == MSymbolKind::Class)
+            .cloned()?;
+        if let Some(method) = wi
+            .lookup(method_name)
+            .iter()
+            .find(|e| {
+                e.url == class_entry.url
+                    && range_contains(class_entry.symbol.full_range, e.symbol.full_range)
+                    && e.symbol.kind == MSymbolKind::Method
+            })
+            .map(|e| e.symbol.clone())
+        {
+            return Some(method);
+        }
+        match class_entry.symbol.parent_class_name {
+            Some(parent) => current = parent,
+            None => return None,
+        }
+    }
+    None
 }
 
 /// Wrap a list of locations into a `GotoDefinitionResponse`, treating
@@ -3273,6 +3442,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(line, 0), MPosition::new(line, 1)),
             full_range: MRange::new(MPosition::new(line, 0), MPosition::new(line, 10)),
             params: None,
+            parent_class_name: None,
         }
     }
 
@@ -3420,6 +3590,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(0, 7), MPosition::new(0, 13)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 9)),
             params: None,
+            parent_class_name: None,
         };
         let out = nest_symbols(&[s]);
         assert_eq!(out.len(), 1);
@@ -3438,6 +3609,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(0, 6), MPosition::new(0, 7)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(6, 8)),
             params: None,
+            parent_class_name: None,
         };
         let f = Symbol {
             name: "f".into(),
@@ -3445,6 +3617,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(1, 18), MPosition::new(1, 19)),
             full_range: MRange::new(MPosition::new(1, 4), MPosition::new(2, 12)),
             params: None,
+            parent_class_name: None,
         };
         let g = Symbol {
             name: "g".into(),
@@ -3452,6 +3625,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(3, 9), MPosition::new(3, 10)),
             full_range: MRange::new(MPosition::new(3, 4), MPosition::new(4, 8)),
             params: None,
+            parent_class_name: None,
         };
         let out = nest_symbols(&[class, f, g]);
         assert_eq!(out.len(), 1);
@@ -3476,6 +3650,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(0, 7), MPosition::new(0, 8)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(1, 9)),
             params: None,
+            parent_class_name: None,
         };
         let b = Symbol {
             name: "b".into(),
@@ -3483,6 +3658,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(2, 7), MPosition::new(2, 8)),
             full_range: MRange::new(MPosition::new(2, 0), MPosition::new(3, 9)),
             params: None,
+            parent_class_name: None,
         };
         let out = nest_symbols(&[a, b]);
         let names: Vec<&str> = out.iter().map(|n| n.name.as_str()).collect();
@@ -3498,6 +3674,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(0, 8), MPosition::new(0, 9)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(8, 10)),
             params: None,
+            parent_class_name: None,
         };
         let cls = Symbol {
             name: "c".into(),
@@ -3505,6 +3682,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(1, 6), MPosition::new(1, 7)),
             full_range: MRange::new(MPosition::new(1, 0), MPosition::new(6, 8)),
             params: None,
+            parent_class_name: None,
         };
         let m = Symbol {
             name: "f".into(),
@@ -3512,6 +3690,7 @@ mod tests {
             name_range: MRange::new(MPosition::new(2, 18), MPosition::new(2, 19)),
             full_range: MRange::new(MPosition::new(2, 4), MPosition::new(3, 12)),
             params: None,
+            parent_class_name: None,
         };
         let out = nest_symbols(&[pkg, cls, m]);
         assert_eq!(out.len(), 1);
