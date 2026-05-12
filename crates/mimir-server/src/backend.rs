@@ -1062,11 +1062,31 @@ impl LanguageServer for Backend {
                     let include_dirs = resolved.include_dirs.clone();
                     let parser = self.parser.clone();
                     let workspace_index = self.workspace_index.clone();
+                    // Snapshot the first project file before the move so we
+                    // can build a stable startup-elaborate trigger URI.
+                    let first_project_file = paths.first().cloned();
                     tokio::spawn(async move {
                         hydrate_workspace_index(paths, include_dirs, parser, workspace_index)
                             .await;
                     });
                     *self.project.write().await = Some(resolved);
+
+                    // Kick off a workspace-wide slang elaborate so semantic
+                    // cross-file features (definition, completion,
+                    // signatureHelp) are warm before the user opens any
+                    // file. `schedule_elaborate` reads `self.project`, so
+                    // we must call it after the write above. It's a no-op
+                    // when slang isn't configured. The trigger URI is just
+                    // a debounce-map key — reuse the first filelist entry.
+                    if let Some(first) = first_project_file {
+                        if let Ok(trigger) = Url::from_file_path(&first) {
+                            debug!(
+                                trigger = %trigger,
+                                "scheduling startup slang elaborate",
+                            );
+                            self.schedule_elaborate(trigger).await;
+                        }
+                    }
                 }
                 Ok(None) => {
                     info!(
@@ -1976,10 +1996,21 @@ enum DefinitionRoute {
 /// configured, no project, untitled buffer); `Some(TransportError)`
 /// means it ran and failed; `Some(Resolved(_))` means it ran and
 /// answered.
+///
+/// Policy: slang is primary; an *empty* slang answer falls back to the
+/// tree-sitter workspace index. Unlike `goto_type_definition` /
+/// `goto_implementation`, definition has a meaningful syntax fallback
+/// (every declared symbol is in the workspace index), so an empty slang
+/// reply on a position slang can't resolve (e.g. a type argument inside
+/// `IDENT#(T)`) still has somewhere useful to land.
 fn route_definition(outcome: Option<SlangDefinitionOutcome>) -> DefinitionRoute {
     match outcome {
-        Some(SlangDefinitionOutcome::Resolved(locs)) => DefinitionRoute::UseSlangResult(locs),
-        Some(SlangDefinitionOutcome::TransportError) | None => DefinitionRoute::UseSyntaxFallback,
+        Some(SlangDefinitionOutcome::Resolved(locs)) if !locs.is_empty() => {
+            DefinitionRoute::UseSlangResult(locs)
+        }
+        // Slang resolved-but-empty, transport error, or not run at all —
+        // give the syntax index a chance.
+        _ => DefinitionRoute::UseSyntaxFallback,
     }
 }
 
@@ -3570,12 +3601,15 @@ mod tests {
         assert_eq!(route, DefinitionRoute::UseSlangResult(locs));
     }
 
-    /// `route_definition` still picks slang when its answer is empty —
-    /// trust-slang-on-empty means we don't fall back to syntax.
+    /// `route_definition` falls back to syntax when slang resolved with
+    /// an empty location set. Slang misses some positions (notably type
+    /// names inside parameterized scopes — see the apb_monitor →
+    /// apb_rw cross-file test); when it can't resolve, the workspace
+    /// index gets a chance instead of silently returning no result.
     #[test]
-    fn route_definition_uses_slang_when_resolved_empty() {
+    fn route_definition_falls_back_when_slang_resolved_empty() {
         let route = route_definition(Some(SlangDefinitionOutcome::Resolved(Vec::new())));
-        assert_eq!(route, DefinitionRoute::UseSlangResult(Vec::new()));
+        assert_eq!(route, DefinitionRoute::UseSyntaxFallback);
     }
 
     /// Transport errors fall back to the syntax index — the user still

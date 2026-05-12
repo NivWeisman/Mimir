@@ -1056,6 +1056,29 @@ endclass
         assert_eq!(pick(&s, "ANOTHER_MACRO").kind, SymbolKind::Macro);
     }
 
+    /// Macro parameter names are extracted into `Symbol::params`. The §3
+    /// inlay-hint work joins call-site argument positions against this
+    /// list, so it has to survive the symbol index round-trip — this test
+    /// pins the contract.
+    #[test]
+    fn text_macro_definition_exposes_parameter_names() {
+        let s = idx("`define uvm_fatal(ID, MSG) my_report(ID, MSG)\n");
+        let sym = pick(&s, "uvm_fatal");
+        assert_eq!(sym.kind, SymbolKind::Macro);
+        let params = sym
+            .params
+            .as_ref()
+            .expect("macro with `()` should index params");
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["ID", "MSG"]);
+        // Macros carry no SV types — every param's `ty` must be `None`.
+        assert!(
+            params.iter().all(|p| p.ty.is_none()),
+            "macro params should have no type, got {:?}",
+            params,
+        );
+    }
+
     #[test]
     fn text_macro_inside_module_is_indexed() {
         let s = idx("module m;\n`define LOCAL 42\nendmodule\n");

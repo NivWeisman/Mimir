@@ -87,16 +87,26 @@ impl SyntaxTree {
 ///    `if-begin-end` block inside a class method the grammar loses its parse
 ///    context and produces an ERROR root.
 ///
-/// **Exception**: `\`define` lines are left intact. Macro definitions carry
-/// symbol names (`MY_MACRO`, `ANOTHER_MACRO`, …) that the symbol indexer reads
-/// from `SyntaxTree::source`; blanking them would make those symbols invisible.
+/// **Allowlist of directives to blank** (IEEE 1800-2023 §22) — compiler
+/// directives that aren't real SV syntax and that the new
+/// `tree-sitter-systemverilog 0.3.1` grammar still doesn't model. `\`define`
+/// is deliberately **excluded**: macro definitions carry symbol names that
+/// the symbol indexer reads from `SyntaxTree::source`, so blanking them
+/// would make those symbols invisible.
+///
+/// User-defined macro **invocations** (`` `uvm_fatal(...) ``,
+/// `` `uvm_object_utils(...) ``, …) are not directives and are not blanked —
+/// the new grammar handles them as `text_macro_usage` nodes inside the
+/// surrounding statement context, which is what AST-backed inlay hints and
+/// goto-def need to see.
 ///
 /// Because we only replace characters *within* a line — keeping every newline
 /// in place and maintaining the exact byte count — every byte offset and line
 /// number that tree-sitter emits maps verbatim back to the original source.
 ///
-/// Inline backtick references (`x = \`MY_MACRO + y;`) are NOT blanked: the
-/// first non-whitespace character of those lines is not a backtick.
+/// Inline backtick references on a line that does not *start* with a
+/// backtick (`x = \`MY_MACRO + y;`) are NOT considered here: the first
+/// non-whitespace character of those lines is a regular SV token.
 ///
 /// Returns `Cow::Borrowed(source)` when the source contains no backtick
 /// characters at all (fast path).
@@ -115,15 +125,13 @@ fn blank_backtick_lines(source: &str) -> Cow<'_, str> {
         };
 
         let trimmed = line.trim_start();
-        // Blank every backtick line EXCEPT `define — macro definitions carry
-        // symbol names that the symbol indexer reads from SyntaxTree::source.
         let should_blank = trimmed.starts_with('`') && {
             let after = &trimmed[1..];
             let kw = after
                 .split(|c: char| !c.is_alphanumeric() && c != '_')
                 .next()
                 .unwrap_or("");
-            kw != "define"
+            is_compiler_directive(kw)
         };
         if should_blank {
             // Spaces of identical byte length so all byte offsets are preserved.
@@ -138,6 +146,36 @@ fn blank_backtick_lines(source: &str) -> Cow<'_, str> {
     }
 
     Cow::Owned(out)
+}
+
+/// Compiler directives that don't represent SV syntax the parser knows about.
+/// Listed against IEEE 1800-2023 §22; `define` is intentionally NOT here —
+/// we keep `\`define` lines intact so the symbol indexer can read macro names.
+fn is_compiler_directive(kw: &str) -> bool {
+    matches!(
+        kw,
+        "ifdef"
+            | "ifndef"
+            | "elsif"
+            | "else"
+            | "endif"
+            | "include"
+            | "timescale"
+            | "default_nettype"
+            | "celldefine"
+            | "endcelldefine"
+            | "resetall"
+            | "line"
+            | "undef"
+            | "undefineall"
+            | "pragma"
+            | "begin_keywords"
+            | "end_keywords"
+            | "unconnected_drive"
+            | "nounconnected_drive"
+            | "__FILE__"
+            | "__LINE__"
+    )
 }
 
 
@@ -257,15 +295,15 @@ mod tests {
         );
     }
 
-    /// Guard directives (`ifdef/`ifndef/`endif) and standalone UVM macro calls
-    /// on their own lines are blanked so the parser can see clean SV structure.
-    /// `define lines are left intact so symbol names remain accessible.
+    /// Compiler directives (`` `ifdef ``, `` `ifndef ``, `` `endif ``,
+    /// `` `include ``, etc.) are blanked so the parser sees clean SV
+    /// structure. `` `define `` lines and user-macro call lines
+    /// (`` `uvm_fatal(...) ``) are **kept** intact under the
+    /// tree-sitter-systemverilog 0.3.1 allowlist policy — both carry real
+    /// information the AST-backed features need.
     #[test]
-    fn backtick_lines_blanked_except_define() {
+    fn compiler_directives_blanked_but_define_and_macro_calls_kept() {
         init_for_tests();
-        // File with: an include guard, a flag-define, a UVM macro call, and a class.
-        // After preprocessing, the ifndef and uvm_fatal lines become spaces;
-        // the `define line stays. The class must be parseable.
         let src = "\
 `ifndef GUARD_SV
 `define GUARD_SV
@@ -285,12 +323,94 @@ endclass
             "expected source_file root, got {}",
             tree.tree.root_node().kind()
         );
-        // The `define line is kept verbatim so its byte range is readable.
-        let define_line = tree.source.lines().nth(1).unwrap_or("");
+        let lines: Vec<&str> = tree.source.lines().collect();
+        // Compiler directive lines are blanked.
         assert!(
-            define_line.starts_with('`'),
-            "`define line should be preserved in source: {:?}",
-            define_line
+            lines[0].trim().is_empty(),
+            "`ifndef line should be blanked: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[7].trim().is_empty(),
+            "`endif line should be blanked: {:?}",
+            lines[7]
+        );
+        // `define` line and the user-macro call line are preserved.
+        assert!(
+            lines[1].starts_with('`'),
+            "`define line should be preserved: {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[4].contains("uvm_fatal"),
+            "user-macro call line should be preserved: {:?}",
+            lines[4]
+        );
+    }
+
+    /// Regression lock-in: under tree-sitter-systemverilog 0.3.1 the
+    /// parameterized scope call `IDENT#(T)::method(args)` parses with the
+    /// `::` and the scope operand *fused* into the call's function name
+    /// expression — there is no longer a separate `package_scope` /
+    /// `class_scope` / `::` child the way the old `tree-sitter-verilog`
+    /// grammar (and the now-removed `blank_parameterized_scopes` rewrite)
+    /// exposed. That fusing is the price we pay for the body parsing
+    /// cleanly, and tree-sitter-only scope resolution for these calls is
+    /// the capability we lost.
+    ///
+    /// This test pins the new shape so a future grammar bump can't quietly
+    /// reintroduce a separate `::` node without us noticing and updating
+    /// the slang-fallback paths.
+    #[test]
+    fn fused_parameterized_scope_call_has_no_separate_double_colon_node() {
+        init_for_tests();
+        let src = "\
+class apb_monitor;
+   virtual function void build_phase(int phase);
+      int tmp;
+      if (!uvm_config_db#(apb_vif)::get(this, \"\", \"vif\", tmp)) begin
+      end
+   endfunction
+endclass
+";
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).expect("parse");
+        let sexp = tree.tree.root_node().to_sexp();
+        assert!(
+            !sexp.contains("(package_scope") && !sexp.contains("(class_scope"),
+            "expected fused parameterized scope, got a separate scope node:\n{}",
+            sexp,
+        );
+    }
+
+    /// A `` `uvm_fatal(...) `` statement that occupies a whole line (the
+    /// apb_monitor style) survives [`blank_backtick_lines`] under the
+    /// 0.3.1 allowlist policy and parses as a `text_macro_usage` node in
+    /// the AST. This is the hook the §3 macro-arg inlay hints and the
+    /// syntax goto-def macro-callsite path key off.
+    #[test]
+    fn whole_line_macro_call_yields_text_macro_usage_in_ast() {
+        init_for_tests();
+        let src = "\
+class C;
+  function void f();
+    `uvm_fatal(\"TAG\", \"msg\")
+  endfunction
+endclass
+";
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).expect("parse");
+        let macro_line = tree.source.lines().nth(2).unwrap_or("");
+        assert!(
+            macro_line.contains("uvm_fatal"),
+            "macro callsite line should be preserved, got: {:?}",
+            macro_line,
+        );
+        let sexp = tree.tree.root_node().to_sexp();
+        assert!(
+            sexp.contains("text_macro_usage"),
+            "expected text_macro_usage node in the AST; got:\n{}",
+            sexp,
         );
     }
 
