@@ -485,7 +485,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 - ✅ Filelist (`.f` / `-f`) parsing for compilation units (via `.mimir.toml`'s `slang.filelist`)
 - ✅ `+define+` / `+incdir+` macro & include path config
-- ✅ Multi-file elaboration & cross-file symbol resolution. Slang elaborates the whole compilation unit; the server kicks off a workspace-wide elaborate on `initialize` (before the user opens any file) so semantic features are warm by the time the first request lands. Cross-file goto-definition is wired through both engines (slang primary, tree-sitter workspace index fallback).
+- ✅ Multi-file elaboration & cross-file symbol resolution. Slang elaborates the whole compilation unit; the server kicks off a workspace-wide elaborate on `initialize` (before the user opens any file) so semantic features are warm by the time the first request lands. Cross-file goto-definition is wired through both engines (slang primary, tree-sitter workspace index fallback). The server hashes the `ElaborateParams` inputs (file texts + include dirs + defines + `top`) and skips the slang round-trip when a subsequent `did_open` / `did_change` produces an identical hash — `did_open`-ing a file that was already part of the startup elaborate is a cache hit, not another ~500KB diagnostics dump. On the first successful elaborate the server emits one `info!("indexed by startup slang elaborate", file=...)` per file slang now has compiled.
 - ⬜ Integration with simulator-specific build files (Verilator, Xcelium, VCS, Questa)
 
 ---

@@ -27,7 +27,9 @@
 //! the simpler `await`-on-the-reactor model wins on readability.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -143,6 +145,22 @@ pub(crate) struct Backend {
     /// user fixes the root-cause error.
     slang_published: Arc<RwLock<HashSet<Url>>>,
 
+    /// Hash of the inputs of the most recent **successful** slang elaborate.
+    /// Used by [`Backend::schedule_elaborate`] to skip a re-elaborate when
+    /// the project's file texts, include dirs, defines, and `top` haven't
+    /// changed since the last successful call — that's the common case
+    /// after `did_open` of an already-warm file. `None` until the first
+    /// elaborate succeeds. Only updated on success so a failed elaborate
+    /// doesn't lock out future retries.
+    last_elaborate_input_hash: Arc<RwLock<Option<u64>>>,
+
+    /// Latched `true` after the first successful elaborate has emitted its
+    /// per-file `info!("indexed by startup slang elaborate")` lines. This
+    /// is the user-visible signal that the warm slang elaborate completed;
+    /// subsequent elaborates stay at `debug!` so the log doesn't grow with
+    /// every edit.
+    startup_index_logged: Arc<AtomicBool>,
+
     /// Workspace-wide tree-sitter symbol index. Populated from two sources:
     /// every `reparse_and_publish` for an open document folds that doc's
     /// fresh `Vec<Symbol>` in, and `initialize` spawns a one-shot
@@ -170,6 +188,8 @@ impl Backend {
             project: Arc::new(RwLock::new(None)),
             pending_elaborations: Arc::new(RwLock::new(HashMap::new())),
             slang_published: Arc::new(RwLock::new(HashSet::new())),
+            last_elaborate_input_hash: Arc::new(RwLock::new(None)),
+            startup_index_logged: Arc::new(AtomicBool::new(false)),
             workspace_index: Arc::new(RwLock::new(WorkspaceIndex::new())),
         }
     }
@@ -366,6 +386,8 @@ impl Backend {
         let documents = self.documents.clone();
         let pending = self.pending_elaborations.clone();
         let slang_published = self.slang_published.clone();
+        let last_hash = self.last_elaborate_input_hash.clone();
+        let startup_logged = self.startup_index_logged.clone();
         let lsp_client = self.client.clone();
         let trigger_for_task = trigger_uri.clone();
 
@@ -376,15 +398,53 @@ impl Backend {
             // currently-open documents (their in-memory text overrides
             // anything on disk so unsaved changes participate).
             let (params, files_in_request) = build_elaborate_params(&project, &documents).await;
+
+            // Hash the inputs that determine slang's answer. If we've
+            // already sent slang exactly this set of files+config and got
+            // a successful response, the prior diagnostics still apply —
+            // skip the round-trip (which is the ~500KB packet) and let
+            // the editor keep what it has.
+            let input_hash = hash_elaborate_inputs(&params);
+            if *last_hash.read().await == Some(input_hash) {
+                debug!(
+                    hash = input_hash,
+                    files = params.files.len(),
+                    "slang inputs unchanged since last elaborate; skipping",
+                );
+                pending.write().await.remove(&trigger_for_task);
+                return;
+            }
+
             debug!(
                 files = params.files.len(),
                 include_dirs = params.include_dirs.len(),
+                hash = input_hash,
                 "sending elaborate request",
             );
             match slang.elaborate(&params).await {
                 Ok(result) => {
                     publish_slang_result(&lsp_client, &files_in_request, result, &slang_published)
                         .await;
+                    *last_hash.write().await = Some(input_hash);
+
+                    // First successful elaborate of the session: emit one
+                    // `info!` per file that slang now has compiled.
+                    // `compare_exchange` so a concurrent elaborate doesn't
+                    // double-log. AcqRel is the cheapest ordering that
+                    // gives both the winner and the loser a coherent view.
+                    if startup_logged
+                        .compare_exchange(
+                            false,
+                            true,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        for url in &files_in_request {
+                            info!(file = %url, "indexed by startup slang elaborate");
+                        }
+                    }
                 }
                 Err(e) => {
                     // We deliberately don't drop the slang client here
@@ -1875,6 +1935,34 @@ async fn hydrate_workspace_index(
         requested = count_requested,
         "workspace index hydrated",
     );
+}
+
+/// Hash the inputs of an [`ElaborateParams`] for cache-keying purposes.
+///
+/// Includes everything slang's compilation depends on: each source file's
+/// `path` + `text` + `is_compilation_unit`, plus `include_dirs`,
+/// `defines`, and `top`. Uses `DefaultHasher` — deterministic within one
+/// process (sufficient for an in-memory equality check) and O(total bytes).
+///
+/// Two requests with identical inputs hash to the same value; any change
+/// to a file's text, the filelist, include search paths, or defines
+/// produces a different hash and forces a fresh slang elaborate.
+fn hash_elaborate_inputs(params: &ElaborateParams) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in &params.files {
+        f.path.hash(&mut h);
+        f.text.hash(&mut h);
+        f.is_compilation_unit.hash(&mut h);
+    }
+    for d in &params.include_dirs {
+        d.hash(&mut h);
+    }
+    for d in &params.defines {
+        d.name.hash(&mut h);
+        d.value.hash(&mut h);
+    }
+    params.top.hash(&mut h);
+    h.finish()
 }
 
 async fn build_elaborate_params(
