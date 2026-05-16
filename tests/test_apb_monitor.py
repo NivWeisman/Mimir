@@ -223,6 +223,64 @@ class ApbMonitorTest(unittest.TestCase):
         self.assertGreaterEqual(len(result), 8)
 
     # ------------------------------------------------------------------
+    # workspace/symbol — workspace-wide fuzzy picker (Ctrl+T / xref)
+    # ------------------------------------------------------------------
+
+    def test_workspace_symbol_empty_query_returns_visible_symbols(self) -> None:
+        """Empty query → server returns up to 200 visible-kind symbols
+        (the documented v1 cap). With a `.mimir.toml` filelist that pulls
+        in the UVM library, the workspace index has thousands of entries
+        — every candidate ties at score 0, so the alphabetical tie-break
+        decides what makes the cut. We only assert the response shape
+        and cap here; content assertions live in the fuzzy-query test
+        below, where the query narrows the result set."""
+        result = self.lsp.request("workspace/symbol", {"query": ""})
+        self.assertIsInstance(result, list)
+        self.assertGreater(len(result), 0)
+        self.assertLessEqual(len(result), 200)
+        for sym in result:
+            self.assertIn("name", sym)
+            self.assertIn("kind", sym)
+            self.assertIn("location", sym)
+
+    def test_workspace_symbol_fuzzy_query_filters_results(self) -> None:
+        """A specific subsequence query must return matches and only
+        matches — `apb_mon` matches `apb_monitor` / `apb_monitor_cbs`
+        but not unrelated symbols."""
+        result = self.lsp.request("workspace/symbol", {"query": "apb_mon"})
+        self.assertIsInstance(result, list)
+        self.assertGreater(len(result), 0)
+        for sym in result:
+            self.assertIn("name", sym)
+            self.assertIn("kind", sym)
+            self.assertIn("location", sym)
+            loc = sym["location"]
+            self.assertIn("uri", loc)
+            self.assertTrue(loc["uri"].startswith("file://"))
+            self.assertIn("range", loc)
+
+    def test_workspace_symbol_unmatched_query_returns_empty(self) -> None:
+        """A query that can't match any candidate (out-of-order chars
+        against every symbol) returns an empty list, not a crash."""
+        result = self.lsp.request(
+            "workspace/symbol", {"query": "zzzznever_matches_anythingzzzz"}
+        )
+        self.assertIsInstance(result, list)
+        self.assertEqual(result, [])
+
+    def test_workspace_symbol_excludes_variables_and_ports(self) -> None:
+        """Variables/ports/parameters are filtered out — the picker is
+        for top-of-mind navigation, not every signal in the project.
+        `sigs` (a class field, indexed as Variable) must not appear."""
+        result = self.lsp.request("workspace/symbol", {"query": "sigs"})
+        names = {s["name"] for s in result}
+        self.assertNotIn(
+            "sigs",
+            names,
+            f"unexpected Variable kind in workspace/symbol results: {sorted(names)}",
+        )
+
+    # ------------------------------------------------------------------
     # AST-cache behaviour: subsequent requests don't re-parse.
     # ------------------------------------------------------------------
 
