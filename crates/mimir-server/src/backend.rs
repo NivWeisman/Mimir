@@ -47,7 +47,6 @@ use mimir_syntax::{
     calls::{call_site_at, active_arg_index, call_sites_in, CallKind},
     inlay::hints_for,
     signature::signature_for,
-    symbols::enclosing_class_info_at,
     Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity,
     Symbol, SymbolKind as MSymbolKind, SyntaxParser, SyntaxTree,
 };
@@ -1567,87 +1566,62 @@ impl LanguageServer for Backend {
                 _ => None,
             };
 
-            // For method calls we resolve the receiver via AST when it's
-            // `this` or `super` — both are SV keywords with a well-defined
-            // class meaning. For any other receiver (e.g. `obj.method(...)`)
-            // we still need slang to know `obj`'s type, so we skip with a
-            // diagnostic trace.
+            // Method-call routing. Four shapes:
+            //   * `this.X(...)`  → resolve via enclosing class
+            //   * `super.X(...)` → resolve via enclosing class's `extends` chain
+            //   * `new(...)`      → resolve via LHS of the surrounding assignment
+            //                       (receiver_text is empty for `class_new` calls)
+            //   * `obj.X(...)`    → resolve via the AST-declared type of `obj`
             if matches!(call.kind, CallKind::Method { .. }) {
                 let recv = receiver.unwrap_or("");
-                if recv != "this" && recv != "super" {
-                    debug!(
-                        name = %call.name,
-                        kind = kind_label,
-                        receiver = recv,
-                        args = call.args.len(),
-                        line = call.name_range.start.line,
-                        col = call.name_range.start.character,
-                        "inlay_hint trace: skipping method call — slang is needed to resolve the receiver's type",
-                    );
-                    continue;
-                }
-                // `this.X` or `super.X`: find the enclosing class and resolve.
-                let class_info = enclosing_class_info_at(&tree, &rope, call.name_range.start);
-                let target_class = match (recv, class_info.as_ref()) {
-                    ("this", Some(info)) => Some(info.class_name.clone()),
-                    ("super", Some(info)) => info.parent_class_name.clone(),
-                    _ => None,
-                };
-                debug!(
-                    name = %call.name,
-                    kind = kind_label,
-                    receiver = recv,
-                    target_class = target_class.as_deref().unwrap_or("<unknown>"),
-                    line = call.name_range.start.line,
-                    col = call.name_range.start.character,
-                    "inlay_hint trace: resolving method via AST",
+                let resolved = resolve_method_symbol(
+                    call,
+                    recv,
+                    &tree,
+                    &rope,
+                    &index,
+                    &wi,
                 );
-                // Look up the method:
-                //   * `this.X` — same-file index of the current class, then
-                //     same-file by-name fallback (other classes in the file
-                //     don't usually share method names with the current one).
-                //   * `super.X` — workspace lookup for the parent class, then
-                //     drill into the methods declared inside it.
-                let sym = if recv == "this" {
-                    // For `this.X` the current class is in this file, so the
-                    // same-file index already has all candidates.
-                    index
-                        .iter()
-                        .find(|s| s.name == call.name && s.kind == MSymbolKind::Method)
-                        .cloned()
-                } else if let Some(parent) = target_class {
-                    find_method_in_class(&wi, &parent, &call.name)
-                } else {
-                    None
-                };
-                if let Some(sym) = sym {
-                    let labels = hints_for(call, &sym);
-                    debug!(
-                        name = %call.name,
-                        receiver = recv,
-                        sym_params = sym.params.as_ref().map(|p| p.len()).unwrap_or(0),
-                        call_args = call.args.len(),
-                        labels = labels.len(),
-                        "inlay_hint trace: method resolved via AST",
-                    );
-                    for label in labels {
-                        hints.push(InlayHint {
-                            position: Position::new(label.position.line, label.position.character),
-                            label: InlayHintLabel::String(label.text),
-                            kind: Some(InlayHintKind::PARAMETER),
-                            text_edits: None,
-                            tooltip: None,
-                            padding_left: None,
-                            padding_right: Some(true),
-                            data: None,
-                        });
+                match resolved {
+                    MethodResolution::Resolved(sym, source_label) => {
+                        let labels = hints_for(call, &sym);
+                        debug!(
+                            name = %call.name,
+                            receiver = recv,
+                            via = source_label,
+                            sym_params = sym.params.as_ref().map(|p| p.len()).unwrap_or(0),
+                            call_args = call.args.len(),
+                            labels = labels.len(),
+                            "inlay_hint trace: method resolved",
+                        );
+                        for label in labels {
+                            hints.push(InlayHint {
+                                position: Position::new(
+                                    label.position.line,
+                                    label.position.character,
+                                ),
+                                label: InlayHintLabel::String(label.text),
+                                kind: Some(InlayHintKind::PARAMETER),
+                                text_edits: None,
+                                tooltip: None,
+                                padding_left: None,
+                                padding_right: Some(true),
+                                data: None,
+                            });
+                        }
                     }
-                } else {
-                    debug!(
-                        name = %call.name,
-                        receiver = recv,
-                        "inlay_hint trace: method NOT resolved — slang would help here",
-                    );
+                    MethodResolution::NotResolved(reason) => {
+                        debug!(
+                            name = %call.name,
+                            kind = kind_label,
+                            receiver = recv,
+                            args = call.args.len(),
+                            line = call.name_range.start.line,
+                            col = call.name_range.start.character,
+                            reason,
+                            "inlay_hint trace: method NOT resolved — slang would help here",
+                        );
+                    }
                 }
                 continue;
             }
@@ -2062,6 +2036,137 @@ fn slang_location_to_lsp(loc: SlangDefinitionLocation) -> Option<Location> {
         uri: url,
         range: m_range_to_lsp(loc.range),
     })
+}
+
+/// Outcome of the AST-driven method-call resolver. `Resolved(sym, via)`
+/// carries the resolved symbol plus a short human-readable tag for the
+/// route taken (used by trace logs). `NotResolved(reason)` is also
+/// human-readable.
+enum MethodResolution {
+    Resolved(Symbol, &'static str),
+    NotResolved(&'static str),
+}
+
+/// Resolve a method-call site to a `Symbol` via the AST, without slang.
+///
+/// `recv` is the receiver text as the call-site builder stored it —
+/// "super", "this", "" (for `class_new`), or a `hierarchical_identifier`
+/// for `obj.method` chains.
+///
+/// Routes:
+///   * `recv == "this"`  → look up `call.name` as a Method in the enclosing
+///     class's same-file index entries.
+///   * `recv == "super"` → walk the enclosing class's `extends` chain via
+///     [`find_method_in_class`].
+///   * `recv == ""`      → constructor-expression form (`class_new`); use
+///     [`mimir_syntax::symbols::class_new_lhs_at`] to find the LHS context,
+///     then look up `"new"` in the resolved class.
+///   * otherwise        → `obj.method`-style; the receiver is a
+///     `hierarchical_identifier` that includes the method name, so we
+///     strip the trailing segment, refuse chained receivers (`obj.field`
+///     would need slang), feed the bare identifier through
+///     [`mimir_syntax::symbols::find_variable_type_at`] to get its
+///     declared type, normalize, and resolve.
+fn resolve_method_symbol(
+    call: &mimir_syntax::calls::CallSite,
+    recv: &str,
+    tree: &mimir_syntax::SyntaxTree,
+    rope: &Rope,
+    same_file_index: &[Symbol],
+    wi: &workspace_index::WorkspaceIndex,
+) -> MethodResolution {
+    use mimir_syntax::symbols::{
+        class_new_lhs_at, enclosing_class_info_at, find_variable_type_at,
+        normalize_type_name, ClassNewLhs,
+    };
+
+    match recv {
+        "this" => {
+            // Same-file methods of the enclosing class. The same-file index
+            // already only contains symbols from this document; for typical
+            // single-class files (apb_monitor, packet, …) name lookup is
+            // sufficient.
+            let _ = enclosing_class_info_at(tree, rope, call.name_range.start);
+            same_file_index
+                .iter()
+                .find(|s| s.name == call.name && s.kind == MSymbolKind::Method)
+                .cloned()
+                .map(|s| MethodResolution::Resolved(s, "this/same-file"))
+                .unwrap_or(MethodResolution::NotResolved("this.X not in same-file index"))
+        }
+        "super" => {
+            let info = enclosing_class_info_at(tree, rope, call.name_range.start);
+            let Some(parent) = info.and_then(|i| i.parent_class_name) else {
+                return MethodResolution::NotResolved("super used but no extends clause");
+            };
+            find_method_in_class(wi, &parent, &call.name)
+                .map(|s| MethodResolution::Resolved(s, "super/inheritance walk"))
+                .unwrap_or(MethodResolution::NotResolved(
+                    "super.X not found in any ancestor",
+                ))
+        }
+        "" => {
+            // `class_new` expression — find the LHS context.
+            let ctx = match class_new_lhs_at(tree, rope, call.name_range.start) {
+                Some(c) => c,
+                None => return MethodResolution::NotResolved(
+                    "class_new not in a recognised assignment shape",
+                ),
+            };
+            let target_class = match ctx {
+                ClassNewLhs::DeclaredType(ty) => normalize_type_name(&ty),
+                ClassNewLhs::LhsName(name) => find_variable_type_at(
+                    tree, rope, call.name_range.start, &name,
+                )
+                .as_deref()
+                .and_then(normalize_type_name),
+            };
+            let Some(cls) = target_class else {
+                return MethodResolution::NotResolved(
+                    "class_new LHS type unresolvable from AST",
+                );
+            };
+            find_method_in_class(wi, &cls, "new")
+                .map(|s| MethodResolution::Resolved(s, "class_new/LHS-type"))
+                .unwrap_or(MethodResolution::NotResolved(
+                    "constructor not found for resolved class",
+                ))
+        }
+        _ => {
+            // `obj.method` style. `recv` is the whole hierarchical_identifier
+            // including the method name (an artefact of how `tf_call`
+            // call-site detection captures the receiver). Strip the trailing
+            // segment to get just the receiver chain, then accept only
+            // single-segment receivers — chained access (`obj.field.method`)
+            // would need recursive resolution that's closer to a type
+            // checker and out of scope here.
+            let receiver_chain = match recv.rsplit_once('.') {
+                Some((before, _method)) => before,
+                None => recv,
+            };
+            if receiver_chain.contains('.') {
+                return MethodResolution::NotResolved(
+                    "chained receiver access needs slang",
+                );
+            }
+            let ty = find_variable_type_at(
+                tree,
+                rope,
+                call.name_range.start,
+                receiver_chain,
+            );
+            let Some(cls) = ty.as_deref().and_then(normalize_type_name) else {
+                return MethodResolution::NotResolved(
+                    "receiver type unresolvable from AST",
+                );
+            };
+            find_method_in_class(wi, &cls, &call.name)
+                .map(|s| MethodResolution::Resolved(s, "obj.method/AST-typed"))
+                .unwrap_or(MethodResolution::NotResolved(
+                    "method not found in resolved receiver class",
+                ))
+        }
+    }
 }
 
 /// Look up a method named `method_name` declared inside the body of the

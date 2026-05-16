@@ -626,6 +626,265 @@ pub fn enclosing_class_info_at(
 }
 
 // --------------------------------------------------------------------------
+// find_variable_type_at — for `obj.method` / `ap = new(...)` resolution
+// --------------------------------------------------------------------------
+
+/// Find the declared type of a variable named `name` visible at `pos`.
+///
+/// Walks the AST from `pos` outward, scanning each ancestor scope for a
+/// declaration matching `name`. The first match wins (innermost scope).
+/// Pruning at nested scope boundaries (functions, classes, modules) keeps
+/// us from finding declarations in unrelated sibling scopes during the
+/// upward walk.
+///
+/// Returns the raw type text from source — e.g. `"uvm_analysis_port#(apb_rw)"`
+/// or `"virtual apb_if.passive"`. Use [`normalize_type_name`] to extract
+/// the base class identifier for workspace-index lookup.
+///
+/// Returns `None` when no declaration of `name` is in scope.
+#[must_use]
+pub fn find_variable_type_at(
+    tree: &SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+    name: &str,
+) -> Option<String> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let mut scope = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    let source = tree.source();
+    loop {
+        if let Some(ty) = search_scope_for_var(scope, name, source, true) {
+            return Some(ty);
+        }
+        match scope.parent() {
+            Some(p) => scope = p,
+            None => return None,
+        }
+    }
+}
+
+/// Recursively scan `node`'s descendants for a variable declaration named
+/// `name`. When `is_root` is `false` and we hit another scope boundary
+/// (nested function/class/etc.) we stop descending — those have their own
+/// local declarations that aren't in our scope.
+fn search_scope_for_var(
+    node: Node<'_>,
+    name: &str,
+    source: &str,
+    is_root: bool,
+) -> Option<String> {
+    if !is_root && is_scope_boundary(node.kind()) {
+        return None;
+    }
+    if let Some(ty) = extract_var_type_if_match(node, name, source) {
+        return Some(ty);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(ty) = search_scope_for_var(child, name, source, false) {
+            return Some(ty);
+        }
+    }
+    None
+}
+
+/// True when `kind` introduces a new declaration scope. The upward walk in
+/// [`find_variable_type_at`] stops descending into these to avoid pulling
+/// in declarations from unrelated sibling functions or classes.
+fn is_scope_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_body_declaration"
+            | "task_body_declaration"
+            | "class_constructor_declaration"
+            | "function_prototype"
+            | "task_prototype"
+            | "class_declaration"
+            | "module_declaration"
+            | "interface_declaration"
+            | "program_declaration"
+            | "package_declaration"
+    )
+}
+
+/// If `node` is a variable declaration of `name`, return its type text.
+fn extract_var_type_if_match(node: Node<'_>, name: &str, source: &str) -> Option<String> {
+    match node.kind() {
+        // `data_declaration` lives both at class scope (`uvm_analysis_port ap;`)
+        // and at block scope (locals via `block_item_declaration`); same shape.
+        "data_declaration" => extract_from_data_declaration(node, name, source),
+        // `tf_port_item` is a formal arg of a function/task or a constructor.
+        "tf_port_item" | "tf_port_item1" => {
+            let name_node = node.child_by_field_name("name")?;
+            if name_node.utf8_text(source.as_bytes()).ok()? != name {
+                return None;
+            }
+            let dt = first_named_child_of_kinds(
+                node,
+                &["data_type_or_implicit", "data_type"],
+            )?;
+            Some(dt.utf8_text(source.as_bytes()).ok()?.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Pull `(name, type)` from a `data_declaration` and return the type if
+/// any of the declared names matches.
+fn extract_from_data_declaration(
+    dd: Node<'_>,
+    name: &str,
+    source: &str,
+) -> Option<String> {
+    // Find the list_of_variable_decl_assignments and check each entry's name.
+    let list = first_named_child_of_kind(dd, "list_of_variable_decl_assignments")?;
+    let mut cursor = list.walk();
+    let has_name = list.named_children(&mut cursor).any(|vda| {
+        if vda.kind() != "variable_decl_assignment" {
+            return false;
+        }
+        vda.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            == Some(name)
+    });
+    if !has_name {
+        return None;
+    }
+    let dt = first_named_child_of_kinds(
+        dd,
+        &["data_type_or_implicit", "data_type"],
+    )?;
+    Some(dt.utf8_text(source.as_bytes()).ok()?.trim().to_string())
+}
+
+// --------------------------------------------------------------------------
+// normalize_type_name — strip qualifiers to get the base class identifier
+// --------------------------------------------------------------------------
+
+/// Reduce a declared-type text to the base class identifier suitable for
+/// `workspace_index.lookup(...)`. Strips, in order:
+///
+/// * leading `virtual ` (interface refs like `virtual apb_if`)
+/// * package qualifier `pkg::` (uses the *last* `::` so `a::b::c` → `c`)
+/// * parameter list `#(...)` (`foo#(T)` → `foo`)
+/// * array dimensions `[...]`
+/// * modport suffix `.passive` (after `virtual` was stripped)
+///
+/// Returns `None` when what's left isn't a single identifier (built-in
+/// scalar types like `int` / `logic` aren't classes; we return them as
+/// `Some("int")` and let the caller's class lookup miss, which is fine).
+#[must_use]
+pub fn normalize_type_name(ty: &str) -> Option<String> {
+    let s = ty.trim();
+    let s = s.strip_prefix("virtual ").map(str::trim_start).unwrap_or(s);
+    let s = match s.rfind("::") {
+        Some(i) => &s[i + 2..],
+        None => s,
+    };
+    let s = match s.find('#') {
+        Some(i) => s[..i].trim(),
+        None => s,
+    };
+    let s = match s.find('[') {
+        Some(i) => s[..i].trim(),
+        None => s,
+    };
+    let s = match s.find('.') {
+        Some(i) => s[..i].trim(),
+        None => s,
+    };
+    let s = s.trim();
+    if s.is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+// --------------------------------------------------------------------------
+// class_new_lhs_at — for `ap = new(...)` / `T x = new(...)` resolution
+// --------------------------------------------------------------------------
+
+/// What's on the left of a `class_new` expression — needed because the
+/// constructor being called belongs to whatever class the LHS holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassNewLhs {
+    /// `T x = new(...);` — the type is right there in the surrounding
+    /// `data_declaration` and we return it directly.
+    DeclaredType(String),
+    /// `ap = new(...);` — only an identifier is on the LHS; the caller has
+    /// to feed it through [`find_variable_type_at`] to get the type.
+    LhsName(String),
+}
+
+/// Given a position inside (or at the start of) a `class_new` node, walk up
+/// to whichever construct holds the LHS and report it.
+///
+/// Returns `None` when the `class_new` doesn't sit in a recognised
+/// assignment shape (e.g. inside a function call argument, or as a return
+/// value — both legal SV but rarer and harder to attribute a type to).
+#[must_use]
+pub fn class_new_lhs_at(
+    tree: &SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+) -> Option<ClassNewLhs> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let mut node = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    // Walk up to the class_new itself (cursor may have landed on an
+    // arg expression inside it).
+    while node.kind() != "class_new" {
+        node = node.parent()?;
+    }
+    let parent = node.parent()?;
+    match parent.kind() {
+        // `variable_decl_assignment` ── `T x = new(...);` ── type is on the
+        // enclosing `data_declaration`.
+        "variable_decl_assignment" => {
+            let dd = parent.parent()?;
+            // dd is `list_of_variable_decl_assignments`; its parent is `data_declaration`.
+            let dd = dd.parent()?;
+            if dd.kind() != "data_declaration" {
+                return None;
+            }
+            let dt = first_named_child_of_kinds(
+                dd,
+                &["data_type_or_implicit", "data_type"],
+            )?;
+            Some(ClassNewLhs::DeclaredType(
+                dt.utf8_text(tree.source().as_bytes())
+                    .ok()?
+                    .trim()
+                    .to_string(),
+            ))
+        }
+        // `blocking_assignment` ── `ap = new(...);` ── LHS is a
+        // hierarchical_identifier we have to resolve elsewhere.
+        "blocking_assignment" => {
+            let mut cursor = parent.walk();
+            let lhs = parent
+                .named_children(&mut cursor)
+                .find(|c| c.kind() == "hierarchical_identifier")?;
+            // Take only the first simple_identifier — chained LHS (`a.b = new()`)
+            // is out of scope for v1.
+            let mut c2 = lhs.walk();
+            let first_id = lhs
+                .named_children(&mut c2)
+                .find(|c| c.kind() == "simple_identifier")?;
+            let name = first_id
+                .utf8_text(tree.source().as_bytes())
+                .ok()?
+                .to_string();
+            Some(ClassNewLhs::LhsName(name))
+        }
+        _ => None,
+    }
+}
+
+// --------------------------------------------------------------------------
 // occurrences_of
 // --------------------------------------------------------------------------
 
@@ -1498,6 +1757,150 @@ endmodule
         assert_eq!(hits.len(), 2, "expected 2 $display calls, got {hits:#?}");
     }
 
+    // ------------------------------------------------------------------
+    // find_variable_type_at / normalize_type_name
+    // ------------------------------------------------------------------
+
+    fn parse(src: &str) -> (SyntaxTree, Rope) {
+        let mut parser = crate::SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let rope = Rope::from_str(src);
+        (tree, rope)
+    }
+
+    #[test]
+    fn find_variable_type_finds_class_field() {
+        let src = "\
+class apb_monitor;
+  uvm_analysis_port ap;
+  function void f();
+    ap.write(1);
+  endfunction
+endclass
+";
+        let (tree, rope) = parse(src);
+        // Position inside `ap` on the `ap.write(...)` line (line 3, col 4).
+        let ty = find_variable_type_at(&tree, &rope, Position::new(3, 4), "ap");
+        assert_eq!(ty.as_deref(), Some("uvm_analysis_port"));
+    }
+
+    #[test]
+    fn find_variable_type_finds_local_var() {
+        let src = "\
+module m;
+  initial begin
+    int x;
+    x = 1;
+  end
+endmodule
+";
+        let (tree, rope) = parse(src);
+        // Position on the `x = 1` line.
+        let ty = find_variable_type_at(&tree, &rope, Position::new(3, 4), "x");
+        assert_eq!(ty.as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn find_variable_type_finds_tf_port_arg() {
+        let src = "\
+class c;
+  function void f(uvm_phase phase);
+    phase.run();
+  endfunction
+endclass
+";
+        let (tree, rope) = parse(src);
+        // Position on `phase.run()`.
+        let ty = find_variable_type_at(&tree, &rope, Position::new(2, 4), "phase");
+        assert_eq!(ty.as_deref(), Some("uvm_phase"));
+    }
+
+    #[test]
+    fn find_variable_type_returns_none_when_undeclared() {
+        let src = "\
+class c;
+  function void f();
+    nope.bar();
+  endfunction
+endclass
+";
+        let (tree, rope) = parse(src);
+        let ty = find_variable_type_at(&tree, &rope, Position::new(2, 4), "nope");
+        assert_eq!(ty, None);
+    }
+
+    #[test]
+    fn normalize_strips_parameter_list() {
+        assert_eq!(
+            normalize_type_name("uvm_analysis_port#(apb_rw)").as_deref(),
+            Some("uvm_analysis_port"),
+        );
+    }
+
+    #[test]
+    fn normalize_strips_package_qualifier() {
+        assert_eq!(
+            normalize_type_name("uvm_pkg::uvm_analysis_port#(T)").as_deref(),
+            Some("uvm_analysis_port"),
+        );
+    }
+
+    #[test]
+    fn normalize_strips_virtual_and_modport() {
+        assert_eq!(
+            normalize_type_name("virtual apb_if.passive").as_deref(),
+            Some("apb_if"),
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_plain_identifier() {
+        assert_eq!(normalize_type_name("apb_rw").as_deref(), Some("apb_rw"));
+        // Built-ins come through too — caller's class lookup will miss
+        // gracefully when they aren't classes.
+        assert_eq!(normalize_type_name("int").as_deref(), Some("int"));
+    }
+
+    // ------------------------------------------------------------------
+    // class_new_lhs_at
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn class_new_lhs_blocking_assignment_returns_name() {
+        let src = "\
+class c;
+  uvm_analysis_port ap;
+  function new();
+    ap = new(\"ap\", this);
+  endfunction
+endclass
+";
+        let (tree, rope) = parse(src);
+        // Position inside `new(` on line 3.
+        let ctx = class_new_lhs_at(&tree, &rope, Position::new(3, 10));
+        assert_eq!(ctx, Some(ClassNewLhs::LhsName("ap".into())));
+    }
+
+    #[test]
+    fn class_new_lhs_decl_initializer_returns_declared_type() {
+        let src = "\
+class c;
+  function new();
+    uvm_phase p = new(\"p\");
+  endfunction
+endclass
+";
+        let (tree, rope) = parse(src);
+        // Position inside the `new("p")` initializer on line 2.
+        let ctx = class_new_lhs_at(&tree, &rope, Position::new(2, 20));
+        match ctx {
+            Some(ClassNewLhs::DeclaredType(t)) => assert!(
+                t.contains("uvm_phase"),
+                "expected uvm_phase in declared type, got {t:?}"
+            ),
+            other => panic!("expected DeclaredType, got {other:?}"),
+        }
+    }
 }
 
 

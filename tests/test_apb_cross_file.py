@@ -189,6 +189,56 @@ class ApbMonitorCrossFileTest(unittest.TestCase):
             f"no inlay hint mentioning macro param `ID` on lines 50-65; got {sorted(labels)}",
         )
 
+    # ------------------------------------------------------------------
+    # AST-driven method-call resolution: obj.method + class_new
+    # ------------------------------------------------------------------
+
+    def test_inlay_hint_on_ap_write_arg(self) -> None:
+        """``ap.write(tr)`` at line 90 (0-indexed 89) — ``ap`` is a
+        class field declared `uvm_analysis_port#(apb_rw) ap;`. The
+        inlay handler resolves the receiver type via the AST, looks up
+        the `write` method on `uvm_analysis_port`, and emits a labelled
+        hint for the `t` argument."""
+        hints = self.lsp.request(
+            "textDocument/inlayHint",
+            {
+                "textDocument": {"uri": self.uri},
+                "range": _range(85, 0, 95, 0),
+            },
+        )
+        self.assertIsInstance(hints, list)
+        labels = {_hint_label(h) for h in hints if 85 <= h["position"]["line"] <= 95}
+        # `uvm_analysis_port::write(input T t)` — the param name is `t`.
+        self.assertTrue(
+            any("t" == lbl or lbl.startswith("t:") or lbl.startswith("t ") for lbl in labels),
+            f"no inlay hint mentioning `t` param of write on lines 85-95; got {sorted(labels)}",
+        )
+
+    def test_inlay_hints_on_class_new_for_ap(self) -> None:
+        """``ap = new(\"ap\", this);`` at line 46 (0-indexed 45) is a
+        ``class_new`` whose LHS is the field ``ap`` declared
+        ``uvm_analysis_port#(apb_rw) ap;``. The handler resolves the
+        LHS type via the AST and looks up
+        ``uvm_analysis_port::new(string name, uvm_component parent)``,
+        emitting ``name`` and ``parent`` hints before the args."""
+        hints = self.lsp.request(
+            "textDocument/inlayHint",
+            {
+                "textDocument": {"uri": self.uri},
+                "range": _range(40, 0, 50, 0),
+            },
+        )
+        self.assertIsInstance(hints, list)
+        labels = {_hint_label(h) for h in hints if 40 <= h["position"]["line"] <= 50}
+        self.assertTrue(
+            any("name" in lbl for lbl in labels),
+            f"no inlay hint mentioning `name` near class_new on lines 40-50; got {sorted(labels)}",
+        )
+        self.assertTrue(
+            any("parent" in lbl for lbl in labels),
+            f"no inlay hint mentioning `parent` near class_new on lines 40-50; got {sorted(labels)}",
+        )
+
     # Note: a startup-workspace-elaborate XFAIL test belongs here once §1
     # lands. It was prototyped but pulled because spawning a second
     # ``MimirLspClient`` mid-suite in the apb workspace stacks ~5 min of
