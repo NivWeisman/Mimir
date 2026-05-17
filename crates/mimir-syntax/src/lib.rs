@@ -22,6 +22,10 @@
 //!    tree and emits one [`FoldRange`] per top-level construct (module,
 //!    class, function, task, package, …). Powers `textDocument/foldingRange`
 //!    in `mimir-server`.
+//! 7. **Semantic-token classifier.** [`semantic_tokens::semantic_tokens`]
+//!    walks the tree and classifies every keyword, identifier, type,
+//!    string, number, and comment into a stable legend. Powers
+//!    `textDocument/semanticTokens` (full + range) in `mimir-server`.
 //!
 //! ## Why tree-sitter?
 //!
@@ -46,6 +50,7 @@ pub mod folding;
 pub mod inlay;
 pub mod keywords;
 pub mod parser;
+pub mod semantic_tokens;
 pub mod signature;
 pub mod symbols;
 

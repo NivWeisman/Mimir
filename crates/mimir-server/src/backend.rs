@@ -1396,6 +1396,22 @@ impl LanguageServer for Backend {
                 // `Variable`/`Port`/`Parameter`/`EnumMember` from the result
                 // set — too noisy for an IDE's project-wide picker.
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                // Semantic tokens: SV-aware coloring driven by the
+                // tree-sitter parse tree. Full + range; no delta. The
+                // legend is fixed at server-init time (the same
+                // ordinals are baked into `mimir_syntax::semantic_tokens`
+                // — re-ordering would silently mis-color every open
+                // document).
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: Default::default(),
+                            legend: semantic_tokens_legend(),
+                            range: Some(true),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    ),
+                ),
                 // Hover: declaration line for the symbol under the cursor,
                 // a synthesized signature for callables, the `define` body
                 // for macros, and receiver-aware lookup for `this.X` /
@@ -1837,6 +1853,92 @@ impl LanguageServer for Backend {
             .collect();
         debug!(count = ranges.len(), "folding_range returned");
         Ok(Some(ranges))
+    }
+
+    /// SV-aware semantic tokens for the whole document. Pure
+    /// tree-sitter — walks the cached parse tree, classifies every
+    /// keyword / type / identifier / literal, and returns one
+    /// delta-encoded `SemanticTokens` blob. The legend advertised in
+    /// `initialize` pins the ordinals; see
+    /// [`mimir_syntax::semantic_tokens`] for the classifier rules and
+    /// known limitations.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> LspResult<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let Some(tree) = self.cached_tree(&uri).await else {
+            debug!("semantic_tokens_full: no tree available");
+            return Ok(None);
+        };
+        let rope = {
+            let docs = self.documents.read().await;
+            match docs.get(&uri) {
+                Some(state) => Rope::from_str(&state.document.text()),
+                None => {
+                    debug!("semantic_tokens_full: URI not in open-doc store");
+                    return Ok(None);
+                }
+            }
+        };
+        let raw = mimir_syntax::semantic_tokens::semantic_tokens(&tree, &rope);
+        let data = encode_semantic_tokens(&raw);
+        debug!(count = data.len(), "semantic_tokens_full returned");
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
+    }
+
+    /// Same classifier as [`Self::semantic_tokens_full`], but constrained
+    /// to the editor-supplied range so the cost on huge files scales
+    /// with the visible viewport. We translate the LSP range to a byte
+    /// range once and hand it to
+    /// [`mimir_syntax::semantic_tokens::semantic_tokens_in_range`]; the
+    /// walker prunes whole subtrees that don't overlap.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> LspResult<Option<SemanticTokensRangeResult>> {
+        let uri = params.text_document.uri;
+        let Some(tree) = self.cached_tree(&uri).await else {
+            debug!("semantic_tokens_range: no tree available");
+            return Ok(None);
+        };
+        let rope = {
+            let docs = self.documents.read().await;
+            match docs.get(&uri) {
+                Some(state) => Rope::from_str(&state.document.text()),
+                None => {
+                    debug!("semantic_tokens_range: URI not in open-doc store");
+                    return Ok(None);
+                }
+            }
+        };
+        let start =
+            MPosition::new(params.range.start.line, params.range.start.character)
+                .to_byte_offset(&rope)
+                .ok();
+        let end = MPosition::new(params.range.end.line, params.range.end.character)
+            .to_byte_offset(&rope)
+            .ok();
+        let (Some(start_byte), Some(end_byte)) = (start, end) else {
+            debug!("semantic_tokens_range: range out of bounds");
+            return Ok(None);
+        };
+        let raw = mimir_syntax::semantic_tokens::semantic_tokens_in_range(
+            &tree,
+            &rope,
+            start_byte..end_byte,
+        );
+        let data = encode_semantic_tokens(&raw);
+        debug!(count = data.len(), "semantic_tokens_range returned");
+        Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 
     #[instrument(
@@ -3333,6 +3435,57 @@ fn m_fold_to_lsp(f: mimir_syntax::FoldRange) -> FoldingRange {
         kind: Some(FoldingRangeKind::Region),
         collapsed_text: None,
     }
+}
+
+/// Build the LSP semantic-tokens legend from
+/// [`mimir_syntax::semantic_tokens::TokenType`]'s static list. Ordinals
+/// here pin the wire format — must stay in lockstep with the enum.
+fn semantic_tokens_legend() -> SemanticTokensLegend {
+    use mimir_syntax::semantic_tokens::{TokenModifier, TokenType};
+    SemanticTokensLegend {
+        token_types: TokenType::legend()
+            .iter()
+            .map(|t| SemanticTokenType::new(t.name()))
+            .collect(),
+        token_modifiers: TokenModifier::legend_names()
+            .iter()
+            .map(|n| SemanticTokenModifier::new(n))
+            .collect(),
+    }
+}
+
+/// Convert source-order [`mimir_syntax::semantic_tokens::RawToken`]s into
+/// LSP's delta-encoded `SemanticToken` records. Each record is a delta
+/// from the previous token: `delta_line` is the row delta;
+/// `delta_start` is the column delta within the same row, or the
+/// absolute column when `delta_line > 0`.
+///
+/// Input must already be sorted by `(line, start_col)` — the classifier
+/// guarantees this and a unit test asserts it.
+fn encode_semantic_tokens(
+    raw: &[mimir_syntax::semantic_tokens::RawToken],
+) -> Vec<SemanticToken> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut prev_line = 0u32;
+    let mut prev_col = 0u32;
+    for t in raw {
+        let delta_line = t.line - prev_line;
+        let delta_start = if delta_line == 0 {
+            t.start_col - prev_col
+        } else {
+            t.start_col
+        };
+        out.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: t.length,
+            token_type: t.token_type,
+            token_modifiers_bitset: t.modifiers,
+        });
+        prev_line = t.line;
+        prev_col = t.start_col;
+    }
+    out
 }
 
 /// Maximum number of entries returned by `workspace/symbol`. Picked to
@@ -5733,6 +5886,88 @@ mod tests {
         let src = "module m;\ninitial $DISPLAY(\"hi\");\nendmodule\n";
         let (tree, rope) = parse_for_hover(src);
         assert!(keyword_hover_at(&tree, &rope, MPosition::new(1, 8)).is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // semantic tokens — encoder
+    // ----------------------------------------------------------------------
+
+    /// First token in the stream encodes as absolute coordinates.
+    #[test]
+    fn encode_semantic_tokens_first_token_is_absolute() {
+        let raw = vec![mimir_syntax::semantic_tokens::RawToken {
+            line: 3,
+            start_col: 7,
+            length: 5,
+            token_type: 0,
+            modifiers: 0,
+        }];
+        let enc = encode_semantic_tokens(&raw);
+        assert_eq!(enc.len(), 1);
+        assert_eq!(enc[0].delta_line, 3);
+        assert_eq!(enc[0].delta_start, 7);
+        assert_eq!(enc[0].length, 5);
+    }
+
+    /// Same-line follow-up tokens encode `delta_start` as the column
+    /// delta from the previous token, not an absolute column.
+    #[test]
+    fn encode_semantic_tokens_same_line_uses_column_delta() {
+        let raw = vec![
+            mimir_syntax::semantic_tokens::RawToken {
+                line: 0,
+                start_col: 0,
+                length: 6,
+                token_type: 0,
+                modifiers: 0,
+            },
+            mimir_syntax::semantic_tokens::RawToken {
+                line: 0,
+                start_col: 7,
+                length: 3,
+                token_type: 1,
+                modifiers: 0,
+            },
+        ];
+        let enc = encode_semantic_tokens(&raw);
+        assert_eq!(enc[1].delta_line, 0);
+        assert_eq!(enc[1].delta_start, 7); // 7 - 0 = 7
+    }
+
+    /// When `delta_line > 0` the encoder must reset `delta_start` to
+    /// the absolute column, not the column delta from the prior line.
+    #[test]
+    fn encode_semantic_tokens_new_line_resets_column() {
+        let raw = vec![
+            mimir_syntax::semantic_tokens::RawToken {
+                line: 0,
+                start_col: 10,
+                length: 3,
+                token_type: 0,
+                modifiers: 0,
+            },
+            mimir_syntax::semantic_tokens::RawToken {
+                line: 2,
+                start_col: 4,
+                length: 5,
+                token_type: 0,
+                modifiers: 0,
+            },
+        ];
+        let enc = encode_semantic_tokens(&raw);
+        assert_eq!(enc[1].delta_line, 2);
+        assert_eq!(enc[1].delta_start, 4); // absolute, not 4 - 10
+    }
+
+    /// The legend the server advertises must have exactly as many
+    /// entries as the classifier produces ordinals for. Mismatched
+    /// counts would silently misrender colours in every client.
+    #[test]
+    fn semantic_tokens_legend_matches_syntax_crate() {
+        use mimir_syntax::semantic_tokens::{TokenModifier, TokenType};
+        let legend = semantic_tokens_legend();
+        assert_eq!(legend.token_types.len(), TokenType::legend().len());
+        assert_eq!(legend.token_modifiers.len(), TokenModifier::legend_names().len());
     }
 
     /// Single-line function declaration: only one source line lands in
