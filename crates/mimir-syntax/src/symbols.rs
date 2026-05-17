@@ -557,6 +557,29 @@ pub fn identifier_at<'a>(tree: &'a SyntaxTree, rope: &Rope, pos: Position) -> Op
     }
 }
 
+/// Return the raw text of the leaf token under `pos` — a superset of
+/// [`identifier_at`] that also surfaces keyword tokens (`always_ff`,
+/// `module`, …) and other single-word leaves.
+///
+/// Used by the hover path's keyword/system-task help fallback: cursor
+/// on `always_ff` returns `Some("always_ff")` so the server can look
+/// the word up in [`keywords::doc_for`](crate::keywords::doc_for).
+///
+/// Returns `None` when the cursor is on whitespace, on a multi-token
+/// node (comment body, string literal), or off the end of the document.
+/// Punctuation (`(`, `,`, …) is returned as-is — callers must filter
+/// against their own lookup table.
+#[must_use]
+pub fn word_at<'a>(tree: &'a SyntaxTree, rope: &Rope, pos: Position) -> Option<&'a str> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let leaf = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    let text = tree.source().get(leaf.byte_range())?;
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(text)
+}
+
 // --------------------------------------------------------------------------
 // hover_receiver_at — classify `this.X` / `super.X` / `obj.X` for hover
 // --------------------------------------------------------------------------
@@ -1619,6 +1642,57 @@ endclass
         let src = "module m;\nparameter int W = 8;\ninitial W = W;\nendmodule\n";
         // Line 2 ("initial W = W;"), column 8 is the 'W' after `=`.
         assert_eq!(ident_at(src, 2, 12).as_deref(), Some("W"));
+    }
+
+    // --- word_at -------------------------------------------------------
+
+    fn word_at_str(src: &str, line: u32, col: u32) -> Option<String> {
+        init_for_tests();
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        word_at(&tree, &Rope::from_str(src), Position::new(line, col)).map(str::to_owned)
+    }
+
+    #[test]
+    fn word_at_returns_keyword_token() {
+        // Cursor on "module" — `identifier_at` returns None, but `word_at`
+        // surfaces the keyword text for the hover-help fallback.
+        assert_eq!(
+            word_at_str("module foo;\nendmodule\n", 0, 0).as_deref(),
+            Some("module"),
+        );
+    }
+
+    #[test]
+    fn word_at_returns_always_ff() {
+        let src = "module m;\n  always_ff @(posedge clk) q <= d;\nendmodule\n";
+        assert_eq!(word_at_str(src, 1, 2).as_deref(), Some("always_ff"));
+    }
+
+    #[test]
+    fn word_at_returns_system_task_with_dollar() {
+        let src = "module m;\ninitial $display(\"hi\");\nendmodule\n";
+        // Line 1, column 8 is the '$' of "$display".
+        assert_eq!(word_at_str(src, 1, 8).as_deref(), Some("$display"));
+    }
+
+    #[test]
+    fn word_at_returns_identifier() {
+        // word_at is a superset of identifier_at; regular identifiers still come back.
+        assert_eq!(
+            word_at_str("module foo;\nendmodule\n", 0, 7).as_deref(),
+            Some("foo"),
+        );
+    }
+
+    #[test]
+    fn word_at_whitespace_returns_none() {
+        assert_eq!(word_at_str("module foo;\nendmodule\n", 0, 6), None);
+    }
+
+    #[test]
+    fn word_at_out_of_bounds_returns_none() {
+        assert_eq!(word_at_str("module foo;\nendmodule\n", 99, 0), None);
     }
 
     // ------------------------------------------------------------------

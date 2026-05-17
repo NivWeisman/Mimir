@@ -1758,9 +1758,19 @@ impl LanguageServer for Backend {
             return Ok(Some(hover));
         }
 
-        Ok(self
+        if let Some(hover) = self
             .hover_via_tree_sitter(&uri, &tree, &rope, &index, target)
-            .await)
+            .await
+        {
+            return Ok(Some(hover));
+        }
+
+        // Final fallback: cursor on a reserved keyword or `$system_task`
+        // for which we have a static one-line LRM-grounded description
+        // (e.g. `always_ff`, `$display`). Runs after slang and the
+        // workspace-symbol lookup both miss so it never overrides
+        // user-defined symbols that happen to shadow a keyword.
+        Ok(keyword_hover_at(&tree, &rope, target))
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -2812,6 +2822,24 @@ fn read_macro_body(sym: &Symbol, sym_url: &Url, doc_rope: Option<&Rope>) -> Opti
 /// docstrings look identical to the user.
 fn hover_markdown(line: &str) -> Hover {
     hover_from_markdown(format!("```systemverilog\n{line}\n```"))
+}
+
+/// Final hover fallback: if the cursor sits on a reserved keyword or
+/// `$system_task` for which the curated table in
+/// [`mimir_syntax::keywords::doc_for`] has a description, build a
+/// markdown popup. Returns `None` for unknown words, whitespace, or
+/// punctuation — the caller treats that as "no hover".
+///
+/// The popup format mirrors [`hover_for_symbol`] so keyword help looks
+/// the same as symbol help: the word itself in a `systemverilog`
+/// fenced block, then the one-line description as a separate markdown
+/// paragraph below.
+fn keyword_hover_at(tree: &SyntaxTree, rope: &Rope, target: MPosition) -> Option<Hover> {
+    let word = mimir_syntax::symbols::word_at(tree, rope, target)?;
+    let doc = mimir_syntax::keywords::doc_for(word)?;
+    Some(hover_from_markdown(format!(
+        "```systemverilog\n{word}\n```\n\n{doc}"
+    )))
 }
 
 /// Build a `Hover` from an already-formatted markdown blob. Always
@@ -5636,6 +5664,75 @@ mod tests {
         };
         // No doc, and the path doesn't exist on disk either → None.
         assert!(hover_for_symbol(&s, &url, &docs).is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // keyword / system-task hover help — `keyword_hover_at`
+    // ----------------------------------------------------------------------
+
+    /// Build (tree, rope) from `src` for the hover-help tests.
+    fn parse_for_hover(src: &str) -> (mimir_syntax::SyntaxTree, Rope) {
+        mimir_core::logging::init_for_tests();
+        let mut parser = mimir_syntax::SyntaxParser::new().expect("parser");
+        let tree = parser.parse(src, None).expect("parse");
+        (tree, Rope::from_str(src))
+    }
+
+    /// Cursor on `always_ff` returns the curated doc popup with the
+    /// keyword in a fenced block and the description below.
+    #[test]
+    fn hover_on_always_ff_returns_doc() {
+        let src = "module m;\n  always_ff @(posedge clk) q <= d;\nendmodule\n";
+        let (tree, rope) = parse_for_hover(src);
+        let h = keyword_hover_at(&tree, &rope, MPosition::new(1, 2)).expect("hover");
+        let v = hover_markdown_value(&h);
+        assert!(v.starts_with("```systemverilog\nalways_ff\n```"), "got {v:?}");
+        assert!(v.contains("Edge-sensitive sequential always block"), "got {v:?}");
+        assert!(v.contains("§9.2.2.4"), "expected LRM ref, got {v:?}");
+    }
+
+    /// Cursor on `$display` resolves through the `$…` table.
+    #[test]
+    fn hover_on_dollar_display_returns_doc() {
+        let src = "module m;\ninitial $display(\"hi\");\nendmodule\n";
+        let (tree, rope) = parse_for_hover(src);
+        // Line 1, column 8 is the `$`.
+        let h = keyword_hover_at(&tree, &rope, MPosition::new(1, 8)).expect("hover");
+        let v = hover_markdown_value(&h);
+        assert!(v.starts_with("```systemverilog\n$display\n```"), "got {v:?}");
+        assert!(v.contains("Print arguments followed by a newline"), "got {v:?}");
+    }
+
+    /// A keyword we deliberately don't document (`endmodule` — structural
+    /// noise) returns `None`. Guards against the fallback ever emitting an
+    /// empty / surprising popup.
+    #[test]
+    fn hover_on_undocumented_keyword_returns_none() {
+        let src = "module m;\nendmodule\n";
+        let (tree, rope) = parse_for_hover(src);
+        // Line 1, column 0 is the 'e' of "endmodule".
+        assert!(keyword_hover_at(&tree, &rope, MPosition::new(1, 0)).is_none());
+    }
+
+    /// Punctuation / whitespace / off-the-end positions return `None`.
+    #[test]
+    fn hover_on_non_word_returns_none() {
+        let src = "module m;\nendmodule\n";
+        let (tree, rope) = parse_for_hover(src);
+        // Column 6 is the space between "module" and "m".
+        assert!(keyword_hover_at(&tree, &rope, MPosition::new(0, 6)).is_none());
+        // Way off the end of the document.
+        assert!(keyword_hover_at(&tree, &rope, MPosition::new(99, 0)).is_none());
+    }
+
+    /// `$DISPLAY` (uppercase) is *not* in the system-task table — the LRM
+    /// treats system tasks as case-sensitive. The fallback must not paper
+    /// over that and return `$display`'s doc.
+    #[test]
+    fn hover_on_uppercase_system_task_returns_none() {
+        let src = "module m;\ninitial $DISPLAY(\"hi\");\nendmodule\n";
+        let (tree, rope) = parse_for_hover(src);
+        assert!(keyword_hover_at(&tree, &rope, MPosition::new(1, 8)).is_none());
     }
 
     /// Single-line function declaration: only one source line lands in
