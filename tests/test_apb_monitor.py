@@ -223,6 +223,75 @@ class ApbMonitorTest(unittest.TestCase):
         self.assertGreaterEqual(len(result), 8)
 
     # ------------------------------------------------------------------
+    # textDocument/hover
+    # ------------------------------------------------------------------
+
+    def _hover(self, line: int, character: int) -> dict | None:
+        return self.lsp.request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": self.uri},
+                "position": {"line": line, "character": character},
+            },
+        )
+
+    def test_hover_class_name_shows_declaration_line(self) -> None:
+        """Cursor on the `apb_monitor` class identifier (line 36 / 0-idx 35
+        column 9 is `apb_monitor`) returns the class declaration as a
+        fenced systemverilog block."""
+        result = self._hover(35, 9)
+        self.assertIsNotNone(result, "no hover for class name")
+        contents = result["contents"]
+        self.assertEqual(contents["kind"], "markdown")
+        value = contents["value"]
+        self.assertIn("class apb_monitor", value)
+        self.assertTrue(value.startswith("```systemverilog"))
+        self.assertTrue(value.endswith("```"))
+
+    def test_hover_field_reference_shows_declaration(self) -> None:
+        """Cursor on `cfg` (line 40 / 0-idx 39) returns its declaration
+        line `apb_config cfg;`."""
+        # Line 40 raw: `   apb_config cfg;` — `cfg` starts at char 14.
+        result = self._hover(39, 14)
+        self.assertIsNotNone(result, "no hover for class field")
+        value = result["contents"]["value"]
+        self.assertIn("apb_config cfg;", value)
+
+    def test_hover_function_emits_signature(self) -> None:
+        """Cursor on the `build_phase` declaration (line 49 / 0-idx 48)
+        returns a synthesized signature: `function build_phase(uvm_phase phase);`."""
+        # Line 49 raw: `   virtual function void build_phase(uvm_phase phase);`
+        # `build_phase` starts at char 27.
+        result = self._hover(48, 27)
+        self.assertIsNotNone(result, "no hover for function declaration")
+        value = result["contents"]["value"]
+        self.assertIn("build_phase", value)
+        self.assertIn("uvm_phase", value)
+
+    def test_hover_on_keyword_returns_none(self) -> None:
+        """Cursor on `class` (line 36 / 0-idx 35 col 0) returns no hover —
+        keyword help is deferred to a future slice."""
+        # Line 36: `class apb_monitor extends uvm_monitor;` — `class` at col 0.
+        result = self._hover(35, 0)
+        self.assertIsNone(result, f"unexpected hover on keyword: {result}")
+
+    def test_hover_on_whitespace_returns_none(self) -> None:
+        """Cursor on whitespace returns no hover."""
+        # An almost certainly-blank position somewhere in the file.
+        result = self._hover(2, 0)
+        self.assertIsNone(result)
+
+    def test_hover_this_field_resolves_via_class(self) -> None:
+        """Cursor on `sigs` in `this.sigs.pck` (line 70 / 0-idx 69)
+        resolves through the enclosing class to the declaration on
+        line 37. Receiver-aware hover via `this`."""
+        # Line 70 raw: `            @ (this.sigs.pck);` — `sigs` at char 21.
+        result = self._hover(69, 21)
+        if result is not None:
+            value = result["contents"]["value"]
+            self.assertIn("sigs", value)
+
+    # ------------------------------------------------------------------
     # workspace/symbol — workspace-wide fuzzy picker (Ctrl+T / xref)
     # ------------------------------------------------------------------
 

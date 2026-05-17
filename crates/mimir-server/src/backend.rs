@@ -466,6 +466,151 @@ impl Backend {
             .insert(trigger_uri, handle);
     }
 
+    /// Tree-sitter side of hover: resolve the identifier under the
+    /// cursor to a `Symbol` and build a `Hover` from its declaration line
+    /// or synthesized signature.
+    ///
+    /// Lookup priority:
+    /// 1. `this.X` / `super.X` — walk the enclosing class + `extends`.
+    /// 2. `obj.X` — AST-resolve `obj`'s declared type, look the method up
+    ///    on that class.
+    /// 3. Bare identifier — same-file index, then workspace index.
+    ///
+    /// Returns `None` when the cursor isn't on an identifier, when no
+    /// symbol of that name is in scope, or when the symbol's declaration
+    /// line can't be read.
+    async fn hover_via_tree_sitter(
+        &self,
+        uri: &Url,
+        tree: &SyntaxTree,
+        rope: &Rope,
+        same_file_index: &[Symbol],
+        target: MPosition,
+    ) -> Option<Hover> {
+        let name = mimir_syntax::symbols::identifier_at(tree, rope, target)?;
+
+        // Receiver-aware: `this.X` / `super.X` / `obj.X`.
+        let receiver = mimir_syntax::symbols::hover_receiver_at(tree, rope, target);
+
+        let resolved: Option<(Url, Symbol)> = match &receiver {
+            Some(mimir_syntax::symbols::HoverReceiver::This) => {
+                let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, target)?;
+                let wi = self.workspace_index.read().await;
+                find_method_in_class(&wi, &info.class_name, name)
+                    .or_else(|| find_field_in_class(&wi, &info.class_name, name))
+                    .map(|sym| {
+                        let url = method_url_in_class(&wi, &info.class_name, &sym)
+                            .unwrap_or_else(|| uri.clone());
+                        (url, sym)
+                    })
+            }
+            Some(mimir_syntax::symbols::HoverReceiver::Super) => {
+                let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, target)?;
+                let parent = info.parent_class_name?;
+                let wi = self.workspace_index.read().await;
+                find_method_in_class(&wi, &parent, name)
+                    .or_else(|| find_field_in_class(&wi, &parent, name))
+                    .map(|sym| {
+                        let url = method_url_in_class(&wi, &parent, &sym)
+                            .unwrap_or_else(|| uri.clone());
+                        (url, sym)
+                    })
+            }
+            Some(mimir_syntax::symbols::HoverReceiver::Object(recv_name)) => {
+                let ty = mimir_syntax::symbols::find_variable_type_at(
+                    tree, rope, target, recv_name,
+                )?;
+                let cls = mimir_syntax::symbols::normalize_type_name(&ty)?;
+                let wi = self.workspace_index.read().await;
+                find_method_in_class(&wi, &cls, name)
+                    .or_else(|| find_field_in_class(&wi, &cls, name))
+                    .map(|sym| {
+                        let url = method_url_in_class(&wi, &cls, &sym)
+                            .unwrap_or_else(|| uri.clone());
+                        (url, sym)
+                    })
+            }
+            None => {
+                // Bare identifier: same-file index first, workspace fallback.
+                if let Some(sym) = same_file_index.iter().find(|s| s.name == name).cloned() {
+                    Some((uri.clone(), sym))
+                } else {
+                    let wi = self.workspace_index.read().await;
+                    wi.lookup(name)
+                        .first()
+                        .map(|e| (e.url.clone(), e.symbol.clone()))
+                }
+            }
+        };
+
+        let (sym_url, sym) = resolved?;
+        let docs = self.documents.read().await;
+        hover_for_symbol(&sym, &sym_url, &docs)
+    }
+
+    /// Slang-first hover: ask slang where the symbol under the cursor is
+    /// declared, then read the declaration line at that location. Used
+    /// when `MIMIR_SLANG_PATH` is configured.
+    ///
+    /// Returns `None` when slang isn't configured, when slang has no
+    /// answer, or on transport error — the caller falls through to the
+    /// tree-sitter path in all three cases. Hover is a UX feature, not a
+    /// correctness one: an empty slang result should still let the user
+    /// see *something* via the syntax index rather than nothing at all.
+    async fn try_slang_hover(
+        &self,
+        uri: &Url,
+        rope: &Rope,
+        target: MPosition,
+    ) -> Option<Hover> {
+        let slang = self.slang.read().await.clone()?;
+        let project = self.project.read().await.clone()?;
+
+        let (params, _) =
+            build_definition_params(&project, &self.documents, uri, target).await?;
+
+        let result = match slang.definition(&params).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "slang hover transport error; falling back to syntax");
+                return None;
+            }
+        };
+
+        let loc = result.locations.into_iter().next()?;
+        let dest_uri = match path_to_url(&loc.path) {
+            Some(u) => u,
+            None => {
+                debug!(path = %loc.path, "slang hover: location path not a file URL");
+                return None;
+            }
+        };
+        let line_no = loc.range.start.line;
+
+        // Read the declaration line: open-doc store first, then disk.
+        let line_text: Option<String> = {
+            let docs = self.documents.read().await;
+            docs.get(&dest_uri).and_then(|state| {
+                let r = Rope::from_str(&state.document.text());
+                read_line_trimmed(&r, line_no)
+            })
+        }
+        .or_else(|| {
+            // Same-file shortcut: if the destination is the URI we already
+            // have a rope for, avoid the disk read.
+            if &dest_uri == uri {
+                read_line_trimmed(rope, line_no)
+            } else {
+                std::fs::read_to_string(&loc.path)
+                    .ok()
+                    .and_then(|t| read_line_trimmed(&Rope::from_str(&t), line_no))
+            }
+        });
+
+        let line = line_text?;
+        Some(hover_markdown(&line))
+    }
+
     /// Try to resolve a definition via the slang sidecar.
     ///
     /// Returns:
@@ -1233,6 +1378,14 @@ impl LanguageServer for Backend {
                 // `Variable`/`Port`/`Parameter`/`EnumMember` from the result
                 // set — too noisy for an IDE's project-wide picker.
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                // Hover: declaration line for the symbol under the cursor,
+                // a synthesized signature for callables, the `define` body
+                // for macros, and receiver-aware lookup for `this.X` /
+                // `super.X` / `obj.X`. Slang-first when configured (scope-
+                // aware lookup via the existing `definition` RPC) with a
+                // tree-sitter fallback that uses the same workspace symbol
+                // index `definition` / `workspace/symbol` already consume.
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 // We publish diagnostics as a *push* (via the `Client`) on
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
@@ -1465,6 +1618,48 @@ impl LanguageServer for Backend {
                 .collect();
         debug!(count = highlights.len(), "document_highlight returned");
         Ok(Some(highlights))
+    }
+
+    /// Hover: declaration line for the symbol under the cursor, with a
+    /// synthesized signature for callables and the full `define` body
+    /// for macros. Receiver-aware for `this.X` / `super.X` / `obj.X` —
+    /// reuses the same enclosing-class + `find_method_in_class` chain
+    /// that drives inlay hints.
+    ///
+    /// Slang-first when configured: routes through
+    /// [`try_slang_hover`] (which calls `slang.definition` and reads the
+    /// declaration line at the resolved location). On transport error or
+    /// an empty slang result, falls through to the tree-sitter path —
+    /// hover is a UX feature, not a correctness one, so we prefer "show
+    /// the textually-first match" to "show nothing" when slang declines
+    /// to resolve.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document_position_params.text_document.uri))]
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri.clone();
+        let pos = params.text_document_position_params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        let Some((tree, index)) = self.cached_tree_and_index(&uri).await else {
+            debug!("hover: no cached parse for this URI");
+            return Ok(None);
+        };
+        let rope = {
+            let docs = self.documents.read().await;
+            match docs.get(&uri) {
+                Some(state) => Rope::from_str(&state.document.text()),
+                None => {
+                    debug!("hover: URI not in open-doc store");
+                    return Ok(None);
+                }
+            }
+        };
+
+        // Slang-first lookup, then tree-sitter fallback.
+        if let Some(hover) = self.try_slang_hover(&uri, &rope, target).await {
+            return Ok(Some(hover));
+        }
+
+        Ok(self.hover_via_tree_sitter(&uri, &tree, &rope, &index, target).await)
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -2338,6 +2533,214 @@ fn find_method_in_class(
         }
     }
     None
+}
+
+/// Variant of [`find_method_in_class`] for class fields / variables.
+///
+/// Walks the `extends` chain identically but matches kind=Variable
+/// against entries whose `full_range` is contained in the class body.
+/// Used by hover for cursor on `this.cfg`, `obj.field`, etc.
+fn find_field_in_class(
+    wi: &workspace_index::WorkspaceIndex,
+    class_name: &str,
+    field_name: &str,
+) -> Option<Symbol> {
+    let mut current = class_name.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..16 {
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        let class_entry = wi
+            .lookup(&current)
+            .iter()
+            .find(|e| e.symbol.kind == MSymbolKind::Class)
+            .cloned()?;
+        if let Some(field) = wi
+            .lookup(field_name)
+            .iter()
+            .find(|e| {
+                e.url == class_entry.url
+                    && range_contains(class_entry.symbol.full_range, e.symbol.full_range)
+                    && matches!(
+                        e.symbol.kind,
+                        MSymbolKind::Variable | MSymbolKind::Port | MSymbolKind::Parameter
+                    )
+            })
+            .map(|e| e.symbol.clone())
+        {
+            return Some(field);
+        }
+        match class_entry.symbol.parent_class_name {
+            Some(parent) => current = parent,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Find the URL of the file that contains the class body in which `sym`
+/// is declared. Walks the `extends` chain like
+/// [`find_method_in_class`] / [`find_field_in_class`] do, so a method
+/// resolved on an ancestor returns the ancestor's file URL.
+fn method_url_in_class(
+    wi: &workspace_index::WorkspaceIndex,
+    class_name: &str,
+    sym: &Symbol,
+) -> Option<Url> {
+    let mut current = class_name.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..16 {
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        let class_entry = wi
+            .lookup(&current)
+            .iter()
+            .find(|e| e.symbol.kind == MSymbolKind::Class)
+            .cloned()?;
+        if wi
+            .lookup(&sym.name)
+            .iter()
+            .any(|e| e.url == class_entry.url && e.symbol.name_range == sym.name_range)
+        {
+            return Some(class_entry.url);
+        }
+        match class_entry.symbol.parent_class_name {
+            Some(parent) => current = parent,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Build a `Hover` from a resolved [`Symbol`] by:
+///
+/// 1. Synthesizing a typed signature for callables (function/task/
+///    method/macro) via [`mimir_syntax::signature::signature_for`].
+/// 2. For macros, additionally appending the full `define` body
+///    captured from the source between `full_range.start` and
+///    `full_range.end`.
+/// 3. Falling back to the raw declaration line for non-callables
+///    (classes, modules, variables, typedefs, parameters, …).
+///
+/// The line is read from the open-doc store first (the editor's
+/// authoritative view of unsaved content), then from disk — mirrors
+/// `completionItem/resolve`'s pattern. Returns `None` only when the
+/// declaration line genuinely can't be found anywhere.
+fn hover_for_symbol(
+    sym: &Symbol,
+    sym_url: &Url,
+    docs: &std::collections::HashMap<Url, DocumentState>,
+) -> Option<Hover> {
+    let rope_from_doc: Option<Rope> = docs.get(sym_url).map(|s| Rope::from_str(&s.document.text()));
+
+    // 1. Callable signatures (function/task/method/macro).
+    if let Some(sig) = mimir_syntax::signature::signature_for(sym) {
+        if sym.kind == MSymbolKind::Macro {
+            // For macros: signature + body.
+            let body = read_macro_body(sym, sym_url, rope_from_doc.as_ref());
+            let value = match body {
+                Some(b) if !b.trim().is_empty() => {
+                    format!("```systemverilog\n{}\n{}\n```", sig.label, b)
+                }
+                _ => format!("```systemverilog\n{}\n```", sig.label),
+            };
+            return Some(hover_from_markdown(value));
+        }
+        return Some(hover_from_markdown(format!(
+            "```systemverilog\n{};\n```",
+            sig.label
+        )));
+    }
+
+    // 2. Non-callables: the declaration line.
+    let line_no = sym.name_range.start.line;
+    let line = rope_from_doc
+        .as_ref()
+        .and_then(|r| read_line_trimmed(r, line_no))
+        .or_else(|| {
+            sym_url
+                .to_file_path()
+                .ok()
+                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .and_then(|t| read_line_trimmed(&Rope::from_str(&t), line_no))
+        })?;
+    Some(hover_markdown(&line))
+}
+
+/// Read the source slice covering `sym.full_range` from the open-doc
+/// rope first, then from disk. Returns the trimmed body.
+///
+/// Used by hover on a macro reference to show the full `\`define`
+/// expansion, including multi-line `\\`-continued bodies. Returns
+/// `None` if neither source is readable; the caller drops to showing
+/// just the signature in that case.
+fn read_macro_body(sym: &Symbol, sym_url: &Url, doc_rope: Option<&Rope>) -> Option<String> {
+    let slice_from_rope = |rope: &Rope| -> Option<String> {
+        let start = sym.full_range.start.to_byte_offset(rope).ok()?;
+        let end = sym.full_range.end.to_byte_offset(rope).ok()?;
+        if end <= start || end > rope.len_bytes() {
+            return None;
+        }
+        Some(rope.byte_slice(start..end).to_string())
+    };
+
+    let raw = doc_rope.and_then(slice_from_rope).or_else(|| {
+        let path = sym_url.to_file_path().ok()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let rope = Rope::from_str(&text);
+        slice_from_rope(&rope)
+    })?;
+
+    // Strip the leading `\`define MACRO_NAME(...)`-or-`\`define MACRO_NAME`
+    // header. Everything after the first `)` (for parametrised macros) or
+    // after the macro name (for bare ones) up to the end-of-define is the
+    // body. We keep this conservative: skip the first source line up to
+    // and including the closing paren of the params; if there's no `(`
+    // skip past the name.
+    let after_name = raw
+        .find(&sym.name)
+        .map(|i| i + sym.name.len())
+        .unwrap_or(0);
+    let after_params = if let Some(rest) = raw.get(after_name..) {
+        if rest.trim_start().starts_with('(') {
+            // Skip to the matching `)`.
+            rest.find(')').map(|idx| after_name + idx + 1).unwrap_or(after_name)
+        } else {
+            after_name
+        }
+    } else {
+        after_name
+    };
+
+    let body = raw.get(after_params..).unwrap_or("").trim_matches(|c: char| {
+        c == ' ' || c == '\t' || c == '\\' || c == '\r' || c == '\n'
+    });
+    if body.is_empty() {
+        return None;
+    }
+    Some(body.to_string())
+}
+
+/// Wrap a single line as a SystemVerilog markdown fenced block — the
+/// same format `completionItem/resolve` uses, so hover and resolve
+/// docstrings look identical to the user.
+fn hover_markdown(line: &str) -> Hover {
+    hover_from_markdown(format!("```systemverilog\n{line}\n```"))
+}
+
+/// Build a `Hover` from an already-formatted markdown blob. Always
+/// emits `MarkupKind::Markdown`; LSP clients that prefer plain text
+/// degrade gracefully on their end.
+fn hover_from_markdown(markdown: String) -> Hover {
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: markdown,
+        }),
+        range: None,
+    }
 }
 
 /// Wrap a list of locations into a `GotoDefinitionResponse`, treating
@@ -4775,4 +5178,147 @@ mod tests {
         assert_eq!(out[0].name, "class");
         assert_eq!(out[1].name, "my_class");
     }
+
+    // ----------------------------------------------------------------------
+    // hover — hover_for_symbol + read_macro_body
+    // ----------------------------------------------------------------------
+
+    /// Build a `DocumentState` for tests with the given text. The parsed
+    /// `tree`/`index` are left empty — the hover helpers don't read them.
+    fn doc_state(text: &str) -> DocumentState {
+        DocumentState {
+            document: TextDocument::new(text, 1),
+            language_id: "systemverilog".to_string(),
+            index: Vec::new(),
+            tree: None,
+            index_version: 0,
+        }
+    }
+
+    /// Extract the markdown payload from a `Hover` — every hover we emit
+    /// is `HoverContents::Markup`, so the match is total.
+    fn hover_markdown_value(h: &Hover) -> &str {
+        match &h.contents {
+            HoverContents::Markup(MarkupContent { value, .. }) => value.as_str(),
+            _ => panic!("expected MarkupContent, got {:?}", h.contents),
+        }
+    }
+
+    /// Bare non-callable symbol (class) → fenced declaration line.
+    #[test]
+    fn hover_for_class_returns_declaration_line() {
+        let url = url("file:///a.sv");
+        let text = "class apb_monitor extends uvm_monitor;\n  int x;\nendclass\n";
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(text));
+
+        let s = Symbol {
+            name: "apb_monitor".to_string(),
+            kind: MSymbolKind::Class,
+            name_range: MRange::new(MPosition::new(0, 6), MPosition::new(0, 17)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 8)),
+            params: None,
+            parent_class_name: Some("uvm_monitor".to_string()),
+        };
+        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        assert_eq!(
+            hover_markdown_value(&h),
+            "```systemverilog\nclass apb_monitor extends uvm_monitor;\n```",
+        );
+    }
+
+    /// Callable symbol (function with params) → synthesized signature,
+    /// not the source line.
+    #[test]
+    fn hover_for_function_emits_signature() {
+        let url = url("file:///a.sv");
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(""));
+
+        let s = Symbol {
+            name: "add".to_string(),
+            kind: MSymbolKind::Function,
+            name_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 3)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 0)),
+            params: Some(vec![
+                mimir_syntax::Param { name: "a".into(), ty: Some("int".into()) },
+                mimir_syntax::Param { name: "b".into(), ty: Some("int".into()) },
+            ]),
+            parent_class_name: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        assert_eq!(
+            hover_markdown_value(&h),
+            "```systemverilog\nfunction add(int a, int b);\n```",
+        );
+    }
+
+    /// Macro → `define` header + multi-line body.
+    #[test]
+    fn hover_for_macro_includes_body() {
+        let url = url("file:///a.sv");
+        let text = "`define MY_MACRO(x) \\\n    $display(\"hi: %0d\", x);\n";
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(text));
+
+        // Line 1 has 27 chars (4 spaces + 23 chars of `$display(...);`); use
+        // exactly that as `end.character` — the position just before `\n`.
+        let s = Symbol {
+            name: "MY_MACRO".to_string(),
+            kind: MSymbolKind::Macro,
+            name_range: MRange::new(MPosition::new(0, 8), MPosition::new(0, 16)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(1, 27)),
+            params: Some(vec![mimir_syntax::Param { name: "x".into(), ty: None }]),
+            parent_class_name: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let v = hover_markdown_value(&h);
+        // Header is the synthesized signature; body is the trimmed body.
+        assert!(v.starts_with("```systemverilog\n`define MY_MACRO(x)"), "got {v:?}");
+        assert!(v.contains("$display"), "expected body to include $display, got {v:?}");
+    }
+
+    /// Module-kind symbol → fenced declaration line, falls back to disk
+    /// when the open-doc store has no entry for the URL. We assert the
+    /// open-doc path here; the disk path is exercised by integration
+    /// tests.
+    #[test]
+    fn hover_for_unknown_url_returns_none_when_doc_absent() {
+        let url = url("file:///never-opened.sv");
+        let docs = std::collections::HashMap::new();
+        let s = Symbol {
+            name: "x".to_string(),
+            kind: MSymbolKind::Variable,
+            name_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 1)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 10)),
+            params: None,
+            parent_class_name: None,
+        };
+        // No doc, and the path doesn't exist on disk either → None.
+        assert!(hover_for_symbol(&s, &url, &docs).is_none());
+    }
+
+    /// `read_macro_body` strips the `\`define NAME(args)` header.
+    #[test]
+    fn read_macro_body_strips_define_header() {
+        let url = url("file:///a.sv");
+        let text = "`define FOO(a, b) a + b\n";
+        let docs_state = doc_state(text);
+        let rope = Rope::from_str(&docs_state.document.text());
+
+        let s = Symbol {
+            name: "FOO".to_string(),
+            kind: MSymbolKind::Macro,
+            name_range: MRange::new(MPosition::new(0, 8), MPosition::new(0, 11)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 23)),
+            params: Some(vec![
+                mimir_syntax::Param { name: "a".into(), ty: None },
+                mimir_syntax::Param { name: "b".into(), ty: None },
+            ]),
+            parent_class_name: None,
+        };
+        let body = read_macro_body(&s, &url, Some(&rope)).expect("body extracted");
+        assert_eq!(body, "a + b");
+    }
+
 }

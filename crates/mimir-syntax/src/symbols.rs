@@ -558,6 +558,114 @@ pub fn identifier_at<'a>(tree: &'a SyntaxTree, rope: &Rope, pos: Position) -> Op
 }
 
 // --------------------------------------------------------------------------
+// hover_receiver_at — classify `this.X` / `super.X` / `obj.X` for hover
+// --------------------------------------------------------------------------
+
+/// Classification of the receiver for the identifier under the cursor,
+/// produced by [`hover_receiver_at`].
+///
+/// `Object(name)` carries the receiver's identifier text — the server
+/// uses this to look up the receiver's declared type via
+/// [`find_variable_type_at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoverReceiver {
+    /// `this.X` — receiver is the enclosing class.
+    This,
+    /// `super.X` — receiver is the enclosing class's parent.
+    Super,
+    /// `obj.X` — receiver is a variable named `obj`.
+    Object(String),
+}
+
+/// If the identifier under `pos` is the RHS of a `.` member access,
+/// return the receiver kind. Returns `None` for bare identifiers and
+/// for cursor positions that aren't on a `simple_identifier`.
+///
+/// Two grammar shapes carry the receiver in tree-sitter-systemverilog
+/// 0.3.1, and they're slightly different for `this`/`super` vs `obj`:
+///
+/// * `this.X` / `super.X` — the parent (`variable_lvalue` for field
+///   access, `method_call` for calls) has an `implicit_class_handle`
+///   sibling carrying the `this` / `super` keyword.
+/// * `obj.X(...)` and `obj.X` — the cursor's `simple_identifier` and
+///   the receiver `simple_identifier` are both children of the same
+///   `hierarchical_identifier`. The receiver is the *first*
+///   simple_identifier child.
+///
+/// Chained access (`a.b.c`, `pkg::X`, etc.) returns `None` — the hover
+/// handler falls back to bare-identifier lookup and defers semantic
+/// resolution to slang.
+#[must_use]
+pub fn hover_receiver_at(
+    tree: &SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+) -> Option<HoverReceiver> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let leaf = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    if leaf.kind() != "simple_identifier" {
+        return None;
+    }
+    let source = tree.source();
+
+    let mut node = leaf;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            // `obj.X` shape: hierarchical_identifier with two
+            // simple_identifier children. The cursor must be on a
+            // non-first child (otherwise it's on the receiver itself).
+            "hierarchical_identifier" => {
+                let mut c = parent.walk();
+                let kids: Vec<Node<'_>> = parent.named_children(&mut c).collect();
+                let simple_ids: Vec<&Node<'_>> = kids
+                    .iter()
+                    .filter(|n| n.kind() == "simple_identifier")
+                    .collect();
+                if simple_ids.len() >= 2 {
+                    let leaf_idx = simple_ids.iter().position(|n| n.id() == leaf.id())?;
+                    if leaf_idx == 0 {
+                        return None;
+                    }
+                    let recv = simple_ids[0].utf8_text(source.as_bytes()).ok()?.trim();
+                    return Some(HoverReceiver::Object(recv.to_string()));
+                }
+                node = parent;
+            }
+            // `this.X` / `super.X` shape: variable_lvalue (field) or
+            // method_call (call) with an implicit_class_handle as its
+            // first named child.
+            "variable_lvalue" | "method_call" => {
+                let mut c = parent.walk();
+                let kids: Vec<Node<'_>> = parent.named_children(&mut c).collect();
+                if let Some(first) = kids.first() {
+                    if first.kind() == "implicit_class_handle" {
+                        let text = first.utf8_text(source.as_bytes()).ok()?.trim();
+                        return match text {
+                            "this" => Some(HoverReceiver::This),
+                            "super" => Some(HoverReceiver::Super),
+                            _ => None,
+                        };
+                    }
+                }
+                node = parent;
+            }
+            // Don't escape past these — the identifier isn't a member-
+            // select receiver if its nearest "container" is a statement
+            // or declaration scope.
+            "statement_or_null"
+            | "data_declaration"
+            | "list_of_arguments"
+            | "function_body_declaration"
+            | "task_body_declaration"
+            | "class_declaration"
+            | "module_declaration" => return None,
+            _ => node = parent,
+        }
+    }
+    None
+}
+
+// --------------------------------------------------------------------------
 // enclosing_class_info_at — for `this.X` / `super.X` resolution
 // --------------------------------------------------------------------------
 
@@ -1953,5 +2061,59 @@ mod _class_inheritance_indexing_tests {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "phase");
         assert_eq!(params[0].ty.as_deref(), Some("uvm_phase"));
+    }
+
+    // ------------------------------------------------------------------
+    // hover_receiver_at
+    // ------------------------------------------------------------------
+
+    /// Parse `src`, position the cursor on the identifier at `(line, col)`,
+    /// and report what receiver kind the hover helper would assign.
+    fn receiver_at(src: &str, line: u32, col: u32) -> Option<HoverReceiver> {
+        mimir_core::logging::init_for_tests();
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        hover_receiver_at(&tree, &Rope::from_str(src), Position::new(line, col))
+    }
+
+    #[test]
+    fn hover_receiver_bare_identifier_has_no_receiver() {
+        let src = "module top;\n  int x;\n  initial x = 1;\nendmodule\n";
+        // cursor on the `x` inside `initial x = 1;`
+        assert_eq!(receiver_at(src, 2, 10), None);
+    }
+
+    #[test]
+    fn hover_receiver_this_dot_field_is_this() {
+        let src = "class C;\n  int x;\n  function void f();\n    this.x = 1;\n  endfunction\nendclass\n";
+        // cursor on the `x` after `this.`
+        assert_eq!(receiver_at(src, 3, 9), Some(HoverReceiver::This));
+    }
+
+    #[test]
+    fn hover_receiver_super_dot_method_is_super() {
+        let src = "class C extends P;\n  function void f();\n    super.build_phase(p);\n  endfunction\nendclass\n";
+        // cursor on the `b` of `build_phase`
+        assert_eq!(receiver_at(src, 2, 10), Some(HoverReceiver::Super));
+    }
+
+    #[test]
+    fn hover_receiver_obj_dot_method_carries_obj_name() {
+        let src = "class C;\n  function void f();\n    my_obj.go();\n  endfunction\nendclass\n";
+        // cursor on the `g` of `go`
+        assert_eq!(
+            receiver_at(src, 2, 11),
+            Some(HoverReceiver::Object("my_obj".to_string())),
+        );
+    }
+
+    /// Cursor on the receiver itself (the `obj` part of `obj.method`)
+    /// must NOT report itself as the receiver — that's a bare identifier
+    /// from the hover handler's perspective.
+    #[test]
+    fn hover_receiver_cursor_on_receiver_is_bare() {
+        let src = "class C;\n  function void f();\n    my_obj.go();\n  endfunction\nendclass\n";
+        // cursor on the `m` of `my_obj`
+        assert_eq!(receiver_at(src, 2, 4), None);
     }
 }
