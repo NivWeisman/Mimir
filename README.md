@@ -365,7 +365,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (265 today)
+cargo test   --workspace                    # run all unit tests (303 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
 make integration                            # python LSP tests against the local UVM example
@@ -462,7 +462,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 - ⬜ `textDocument/declaration`
 - ✅ `textDocument/typeDefinition` — slang-only (requires `MIMIR_SLANG_PATH`). Cursor on a variable / port / parameter / class-field reference → jumps to the *type's* declaration (typedef, class, enum, struct, packed union). Cursor on a subroutine call → jumps to the return type. No tree-sitter fallback (type resolution requires semantic analysis).
 - ✅ `textDocument/implementation` — slang-only (requires `MIMIR_SLANG_PATH`). Cursor on a `virtual` / `pure virtual` method → all overrides in subclasses across the compilation unit. Cursor on a class name → all directly-derived subclasses. Non-virtual methods and leaf classes return no results.
-- ⬜ `textDocument/references`
+- ✅ `textDocument/references` — workspace-wide "Find All References" for the identifier under the cursor. Tree-sitter only (the slang sidecar doesn't yet expose a references RPC, so cross-package homonym disambiguation is a future slice). v1 has three sources, merged and deduped by `(url, range)`: (1) **same file** is scope-aware via the same `occurrences_of_at` helper `documentHighlight` uses — a `phase` local in `build_phase` doesn't bleed into another `phase` in `connect_phase`; (2) **other open buffers** contribute whole-file lexical matches against cached parse trees in the open-doc store (essentially free — no re-parse); (3) **closed filelist-hydrated files** contribute *declaration sites only* (`Symbol::name_range` from the workspace index), since the index doesn't retain parse trees. Honours `ReferenceContext::include_declaration` by stripping locations equal to any known declaration range when `false`. Caps at 1000 results (logged at `warn!` when truncated) so the editor's peek list stays usable on popular UVM macros. Limitations: no slang-backed scope/type-aware resolution (so `pkg_a::foo` and `pkg_b::foo` are conflated by name); cross-file *usages* in non-open files aren't returned (declarations only — re-parsing closed files on demand is a v2 follow-up); the open-buffer scan is whole-file, not scope-aware, so two functions in another file each declaring a local `phase` would both light up; no hierarchical-name support (`u_dut.fsm.state`), matching the deferral on `definition`.
 - ⬜ `callHierarchy/*`
 - ⬜ `typeHierarchy/*`
 - ⬜ Hierarchical-name hover / navigation (`u_dut.fsm.state`) — slang-only future slice; today's tree-sitter resolution stops at one segment.

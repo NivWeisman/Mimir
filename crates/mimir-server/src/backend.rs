@@ -40,17 +40,17 @@ use mimir_slang::{
     DefinitionLocation as SlangDefinitionLocation, DefinitionParams as SlangDefinitionParams,
     Diagnostic as SlangDiagnostic, ElaborateParams, ElaborateResult,
     ImplementationLocation as SlangImplementationLocation,
-    ImplementationParams as SlangImplementationParams, Severity as SlangSeverity, SlangCompletionItem,
-    SignatureHelpParams as SlangSignatureHelpParams, SourceFile,
+    ImplementationParams as SlangImplementationParams, Severity as SlangSeverity,
+    SignatureHelpParams as SlangSignatureHelpParams, SlangCompletionItem, SourceFile,
     TypeDefinitionLocation as SlangTypeDefinitionLocation,
     TypeDefinitionParams as SlangTypeDefinitionParams,
 };
 use mimir_syntax::{
-    calls::{call_site_at, active_arg_index, call_sites_in, CallKind},
+    calls::{active_arg_index, call_site_at, call_sites_in, CallKind},
     inlay::hints_for,
     signature::signature_for,
-    Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity,
-    Symbol, SymbolKind as MSymbolKind, SyntaxParser, SyntaxTree,
+    Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity, Symbol, SymbolKind as MSymbolKind,
+    SyntaxParser, SyntaxTree,
 };
 use ropey::Rope;
 use tokio::sync::{Mutex, RwLock};
@@ -433,12 +433,7 @@ impl Backend {
                     // double-log. AcqRel is the cheapest ordering that
                     // gives both the winner and the loser a coherent view.
                     if startup_logged
-                        .compare_exchange(
-                            false,
-                            true,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
                         for url in &files_in_request {
@@ -511,22 +506,21 @@ impl Backend {
                 find_method_in_class(&wi, &parent, name)
                     .or_else(|| find_field_in_class(&wi, &parent, name))
                     .map(|sym| {
-                        let url = method_url_in_class(&wi, &parent, &sym)
-                            .unwrap_or_else(|| uri.clone());
+                        let url =
+                            method_url_in_class(&wi, &parent, &sym).unwrap_or_else(|| uri.clone());
                         (url, sym)
                     })
             }
             Some(mimir_syntax::symbols::HoverReceiver::Object(recv_name)) => {
-                let ty = mimir_syntax::symbols::find_variable_type_at(
-                    tree, rope, target, recv_name,
-                )?;
+                let ty =
+                    mimir_syntax::symbols::find_variable_type_at(tree, rope, target, recv_name)?;
                 let cls = mimir_syntax::symbols::normalize_type_name(&ty)?;
                 let wi = self.workspace_index.read().await;
                 find_method_in_class(&wi, &cls, name)
                     .or_else(|| find_field_in_class(&wi, &cls, name))
                     .map(|sym| {
-                        let url = method_url_in_class(&wi, &cls, &sym)
-                            .unwrap_or_else(|| uri.clone());
+                        let url =
+                            method_url_in_class(&wi, &cls, &sym).unwrap_or_else(|| uri.clone());
                         (url, sym)
                     })
             }
@@ -557,17 +551,11 @@ impl Backend {
     /// tree-sitter path in all three cases. Hover is a UX feature, not a
     /// correctness one: an empty slang result should still let the user
     /// see *something* via the syntax index rather than nothing at all.
-    async fn try_slang_hover(
-        &self,
-        uri: &Url,
-        rope: &Rope,
-        target: MPosition,
-    ) -> Option<Hover> {
+    async fn try_slang_hover(&self, uri: &Url, rope: &Rope, target: MPosition) -> Option<Hover> {
         let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
-        let (params, _) =
-            build_definition_params(&project, &self.documents, uri, target).await?;
+        let (params, _) = build_definition_params(&project, &self.documents, uri, target).await?;
 
         let result = match slang.definition(&params).await {
             Ok(r) => r,
@@ -920,8 +908,7 @@ impl Backend {
         let filtered: Vec<SlangCompletionItem> = items
             .into_iter()
             .filter(|it| {
-                prefix_lower.is_empty()
-                    || it.label.to_ascii_lowercase().starts_with(&prefix_lower)
+                prefix_lower.is_empty() || it.label.to_ascii_lowercase().starts_with(&prefix_lower)
             })
             .collect();
         debug!(count = filtered.len(), "slang member completion");
@@ -1004,8 +991,7 @@ impl Backend {
         let client = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
-        let (def_params, _) =
-            build_definition_params(&project, &self.documents, uri, pos).await?;
+        let (def_params, _) = build_definition_params(&project, &self.documents, uri, pos).await?;
         let params = SlangSignatureHelpParams {
             files: def_params.files,
             include_dirs: def_params.include_dirs,
@@ -1017,7 +1003,10 @@ impl Backend {
 
         match client.signature_help(&params).await {
             Ok(result) if !result.signatures.is_empty() => {
-                debug!(count = result.signatures.len(), "slang signature help returned");
+                debug!(
+                    count = result.signatures.len(),
+                    "slang signature help returned"
+                );
                 Some(result.signatures)
             }
             Ok(_) => {
@@ -1059,7 +1048,10 @@ impl Backend {
                 .collect()
         };
 
-        Some(SyntaxCandidates { same_file, cross_file })
+        Some(SyntaxCandidates {
+            same_file,
+            cross_file,
+        })
     }
 
     /// Syntax-only macro completion for `uri` at `pos`.
@@ -1083,16 +1075,15 @@ impl Backend {
         let mut seen: HashSet<String> = HashSet::new();
         let mut scored: Vec<(u32, CompletionItem)> = Vec::new();
 
-        let make_item = |name: String, score: u32, data: Option<serde_json::Value>| {
-            CompletionItem {
+        let make_item =
+            |name: String, score: u32, data: Option<serde_json::Value>| CompletionItem {
                 label: name,
                 kind: Some(CompletionItemKind::CONSTANT),
                 detail: Some("`define".to_owned()),
                 sort_text: Some(completion_score::assign_sort_text(score)),
                 data,
                 ..Default::default()
-            }
-        };
+            };
 
         // Same-file first; if a name comes back from the workspace as well,
         // the dedup `seen` keeps the same-file entry which has the boost.
@@ -1261,8 +1252,7 @@ impl LanguageServer for Backend {
                     // MIMIR_SLANG_PATH and try to spawn from there.
                     if self.slang.read().await.is_none() {
                         if let Some(path) = resolved.env.get(crate::SLANG_PATH_ENV) {
-                            match mimir_slang::Client::spawn(path, std::iter::empty::<&str>())
-                                .await
+                            match mimir_slang::Client::spawn(path, std::iter::empty::<&str>()).await
                             {
                                 Ok(client) => {
                                     info!(
@@ -1297,8 +1287,7 @@ impl LanguageServer for Backend {
                     // can build a stable startup-elaborate trigger URI.
                     let first_project_file = paths.first().cloned();
                     tokio::spawn(async move {
-                        hydrate_workspace_index(paths, include_dirs, parser, workspace_index)
-                            .await;
+                        hydrate_workspace_index(paths, include_dirs, parser, workspace_index).await;
                     });
                     *self.project.write().await = Some(resolved);
 
@@ -1361,18 +1350,21 @@ impl LanguageServer for Backend {
                 // based (no scope/shadowing); semantic-aware scoping is
                 // future work atop slang.
                 document_highlight_provider: Some(OneOf::Left(true)),
+                // Tree-sitter-only: workspace-wide "Find All References".
+                // Same-file results are scope-aware (reuses the
+                // `documentHighlight` helper); other open buffers contribute
+                // whole-file lexical matches; closed filelist-hydrated files
+                // contribute declaration sites only (the workspace index
+                // doesn't retain parse trees). Slang RPC for references is a
+                // future slice.
+                references_provider: Some(OneOf::Left(true)),
                 // Syntax-only for stages 1–4; slang takes over for stages 5–6.
                 // Trigger characters: `.` (member access), `` ` `` (macros),
                 // `$` (system task/function names), `:` (the first half of
                 // `::`; the handler runs again on the second colon, where
                 // `detect_member_access` recognises the package-scope trigger).
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![
-                        ".".into(),
-                        "`".into(),
-                        "$".into(),
-                        ":".into(),
-                    ]),
+                    trigger_characters: Some(vec![".".into(), "`".into(), "$".into(), ":".into()]),
                     // Lazy enrichment via `completionItem/resolve` — every
                     // syntax-side item ships a `data` payload that the
                     // resolve handler turns into a markdown documentation
@@ -1646,6 +1638,83 @@ impl LanguageServer for Backend {
         Ok(Some(highlights))
     }
 
+    /// Workspace-wide "Find All References" for the identifier under the
+    /// cursor. Tree-sitter only — the slang sidecar doesn't yet expose a
+    /// `references` RPC. v1 shape:
+    ///
+    /// 1. **Same file**: scope-aware via [`occurrences_of_at`]. Two `phase`
+    ///    locals in different methods don't bleed into each other; a
+    ///    free-standing reference whose declaration isn't visible
+    ///    (`super.x`) falls back to whole-file matching, matching what
+    ///    `documentHighlight` does.
+    /// 2. **Other open buffers**: whole-file lexical match via
+    ///    [`occurrences_of`]. Parse trees for open docs are already cached
+    ///    in [`Backend::documents`], so this is essentially free.
+    /// 3. **Closed filelist-hydrated files**: the workspace index only
+    ///    retains `Symbol` (name + ranges), not parse trees, so we
+    ///    contribute *declaration sites only* (`entry.symbol.name_range`).
+    ///    Cross-file *usages* in non-open files are a v2 follow-up that
+    ///    would require re-parsing on demand.
+    ///
+    /// Honours [`ReferenceContext::include_declaration`]: when `false`,
+    /// declarations identified by the workspace index are filtered out.
+    /// Caps total results at [`REFERENCES_LIMIT`] to keep the editor UI
+    /// responsive; logs a `warn!` when truncation kicks in.
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position.text_document.uri),
+    )]
+    async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let target = MPosition::new(pos.line, pos.character);
+        let include_declaration = params.context.include_declaration;
+
+        let Some(cursor_tree) = self.cached_tree(&uri).await else {
+            debug!("references: no tree available");
+            return Ok(None);
+        };
+        let cursor_rope = Rope::from_str(cursor_tree.source());
+
+        // Cursor must sit on an identifier; otherwise `None` lets the
+        // editor distinguish "no result" from "empty result".
+        let Some(name) = mimir_syntax::symbols::identifier_at(&cursor_tree, &cursor_rope, target)
+        else {
+            debug!("references: cursor not on identifier");
+            return Ok(None);
+        };
+        let name = name.to_owned();
+
+        // Snapshot the open-doc trees (excluding the cursor file) under a
+        // single read lock, then drop the lock before holding the
+        // workspace-index lock. We clone the trees — `SyntaxTree` is
+        // cheap to clone (`tree_sitter::Tree` is internally `Arc`).
+        let other_open: Vec<(Url, SyntaxTree)> = {
+            let docs = self.documents.read().await;
+            docs.iter()
+                .filter(|(other_uri, _)| **other_uri != uri)
+                .filter_map(|(other_uri, state)| {
+                    state.tree.as_ref().map(|t| (other_uri.clone(), t.clone()))
+                })
+                .collect()
+        };
+
+        let wi = self.workspace_index.read().await;
+        let locations = collect_references(
+            &name,
+            &uri,
+            &cursor_tree,
+            &cursor_rope,
+            target,
+            &other_open,
+            &wi,
+            include_declaration,
+        );
+        debug!(count = locations.len(), name = %name, "references returned");
+        Ok(Some(locations))
+    }
+
     /// Hover: declaration line for the symbol under the cursor, with a
     /// synthesized signature for callables and the full `define` body
     /// for macros. Receiver-aware for `this.X` / `super.X` / `obj.X` —
@@ -1661,7 +1730,11 @@ impl LanguageServer for Backend {
     /// to resolve.
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document_position_params.text_document.uri))]
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri.clone();
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .clone();
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
 
@@ -1685,7 +1758,9 @@ impl LanguageServer for Backend {
             return Ok(Some(hover));
         }
 
-        Ok(self.hover_via_tree_sitter(&uri, &tree, &rope, &index, target).await)
+        Ok(self
+            .hover_via_tree_sitter(&uri, &tree, &rope, &index, target)
+            .await)
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -1838,10 +1913,7 @@ impl LanguageServer for Backend {
         skip_all,
         fields(uri = %params.text_document.uri),
     )]
-    async fn inlay_hint(
-        &self,
-        params: InlayHintParams,
-    ) -> LspResult<Option<Vec<InlayHint>>> {
+    async fn inlay_hint(&self, params: InlayHintParams) -> LspResult<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
         let vp = params.range;
         let vp_range = MRange::new(
@@ -1883,14 +1955,7 @@ impl LanguageServer for Backend {
             //   * `obj.X(...)`    → resolve via the AST-declared type of `obj`
             if matches!(call.kind, CallKind::Method { .. }) {
                 let recv = receiver.unwrap_or("");
-                let resolved = resolve_method_symbol(
-                    call,
-                    recv,
-                    &tree,
-                    &rope,
-                    &index,
-                    &wi,
-                );
+                let resolved = resolve_method_symbol(call, recv, &tree, &rope, &index, &wi);
                 match resolved {
                     MethodResolution::Resolved(sym, source_label) => {
                         let labels = hints_for(call, &sym);
@@ -1988,10 +2053,7 @@ impl LanguageServer for Backend {
         skip_all,
         fields(uri = %params.text_document_position.text_document.uri),
     )]
-    async fn completion(
-        &self,
-        params: CompletionParams,
-    ) -> LspResult<Option<CompletionResponse>> {
+    async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -2006,8 +2068,9 @@ impl LanguageServer for Backend {
         // Route 1: `` ` `` trigger — macro-name completion.
         if let Some(rope) = &rope {
             if let Some(macro_prefix) = detect_macro_trigger(rope, target) {
-                if let Some(resp) =
-                    self.try_slang_macro_completion(&uri, target, &macro_prefix).await
+                if let Some(resp) = self
+                    .try_slang_macro_completion(&uri, target, &macro_prefix)
+                    .await
                 {
                     return Ok(Some(resp));
                 }
@@ -2413,8 +2476,8 @@ fn resolve_method_symbol(
     wi: &workspace_index::WorkspaceIndex,
 ) -> MethodResolution {
     use mimir_syntax::symbols::{
-        class_new_lhs_at, enclosing_class_info_at, find_variable_type_at,
-        normalize_type_name, ClassNewLhs,
+        class_new_lhs_at, enclosing_class_info_at, find_variable_type_at, normalize_type_name,
+        ClassNewLhs,
     };
 
     match recv {
@@ -2429,7 +2492,9 @@ fn resolve_method_symbol(
                 .find(|s| s.name == call.name && s.kind == MSymbolKind::Method)
                 .cloned()
                 .map(|s| MethodResolution::Resolved(s, "this/same-file"))
-                .unwrap_or(MethodResolution::NotResolved("this.X not in same-file index"))
+                .unwrap_or(MethodResolution::NotResolved(
+                    "this.X not in same-file index",
+                ))
         }
         "super" => {
             let info = enclosing_class_info_at(tree, rope, call.name_range.start);
@@ -2446,22 +2511,22 @@ fn resolve_method_symbol(
             // `class_new` expression — find the LHS context.
             let ctx = match class_new_lhs_at(tree, rope, call.name_range.start) {
                 Some(c) => c,
-                None => return MethodResolution::NotResolved(
-                    "class_new not in a recognised assignment shape",
-                ),
+                None => {
+                    return MethodResolution::NotResolved(
+                        "class_new not in a recognised assignment shape",
+                    )
+                }
             };
             let target_class = match ctx {
                 ClassNewLhs::DeclaredType(ty) => normalize_type_name(&ty),
-                ClassNewLhs::LhsName(name) => find_variable_type_at(
-                    tree, rope, call.name_range.start, &name,
-                )
-                .as_deref()
-                .and_then(normalize_type_name),
+                ClassNewLhs::LhsName(name) => {
+                    find_variable_type_at(tree, rope, call.name_range.start, &name)
+                        .as_deref()
+                        .and_then(normalize_type_name)
+                }
             };
             let Some(cls) = target_class else {
-                return MethodResolution::NotResolved(
-                    "class_new LHS type unresolvable from AST",
-                );
+                return MethodResolution::NotResolved("class_new LHS type unresolvable from AST");
             };
             find_method_in_class(wi, &cls, "new")
                 .map(|s| MethodResolution::Resolved(s, "class_new/LHS-type"))
@@ -2482,20 +2547,11 @@ fn resolve_method_symbol(
                 None => recv,
             };
             if receiver_chain.contains('.') {
-                return MethodResolution::NotResolved(
-                    "chained receiver access needs slang",
-                );
+                return MethodResolution::NotResolved("chained receiver access needs slang");
             }
-            let ty = find_variable_type_at(
-                tree,
-                rope,
-                call.name_range.start,
-                receiver_chain,
-            );
+            let ty = find_variable_type_at(tree, rope, call.name_range.start, receiver_chain);
             let Some(cls) = ty.as_deref().and_then(normalize_type_name) else {
-                return MethodResolution::NotResolved(
-                    "receiver type unresolvable from AST",
-                );
+                return MethodResolution::NotResolved("receiver type unresolvable from AST");
             };
             find_method_in_class(wi, &cls, &call.name)
                 .map(|s| MethodResolution::Resolved(s, "obj.method/AST-typed"))
@@ -2659,7 +2715,9 @@ fn hover_for_symbol(
     sym_url: &Url,
     docs: &std::collections::HashMap<Url, DocumentState>,
 ) -> Option<Hover> {
-    let rope_from_doc: Option<Rope> = docs.get(sym_url).map(|s| Rope::from_str(&s.document.text()));
+    let rope_from_doc: Option<Rope> = docs
+        .get(sym_url)
+        .map(|s| Rope::from_str(&s.document.text()));
 
     // 1. Callable signatures (function/task/method/macro).
     if let Some(sig) = mimir_syntax::signature::signature_for(sym) {
@@ -2725,14 +2783,13 @@ fn read_macro_body(sym: &Symbol, sym_url: &Url, doc_rope: Option<&Rope>) -> Opti
     // body. We keep this conservative: skip the first source line up to
     // and including the closing paren of the params; if there's no `(`
     // skip past the name.
-    let after_name = raw
-        .find(&sym.name)
-        .map(|i| i + sym.name.len())
-        .unwrap_or(0);
+    let after_name = raw.find(&sym.name).map(|i| i + sym.name.len()).unwrap_or(0);
     let after_params = if let Some(rest) = raw.get(after_name..) {
         if rest.trim_start().starts_with('(') {
             // Skip to the matching `)`.
-            rest.find(')').map(|idx| after_name + idx + 1).unwrap_or(after_name)
+            rest.find(')')
+                .map(|idx| after_name + idx + 1)
+                .unwrap_or(after_name)
         } else {
             after_name
         }
@@ -2740,9 +2797,10 @@ fn read_macro_body(sym: &Symbol, sym_url: &Url, doc_rope: Option<&Rope>) -> Opti
         after_name
     };
 
-    let body = raw.get(after_params..).unwrap_or("").trim_matches(|c: char| {
-        c == ' ' || c == '\t' || c == '\\' || c == '\r' || c == '\n'
-    });
+    let body = raw
+        .get(after_params..)
+        .unwrap_or("")
+        .trim_matches(|c: char| c == ' ' || c == '\t' || c == '\\' || c == '\r' || c == '\n');
     if body.is_empty() {
         return None;
     }
@@ -3098,6 +3156,127 @@ fn resolve_definition(
     out
 }
 
+/// Cap on the total number of `Location`s returned by
+/// `textDocument/references`. Picked larger than the workspace-symbol cap
+/// (200) because a popular UVM macro can legitimately have hundreds of
+/// usages and silently dropping them would be misleading — but small
+/// enough that the editor's peek list stays responsive. Truncation is
+/// logged at `warn!`.
+const REFERENCES_LIMIT: usize = 1000;
+
+/// Collect `textDocument/references` results.
+///
+/// Pure function — takes already-resolved tree snapshots and the
+/// workspace index by reference, returns LSP `Location`s. Split out from
+/// the async handler so it's unit-testable without `tower-lsp`.
+///
+/// `other_open` carries every open document **other than** the cursor
+/// file: each entry is `(url, tree)`. The cursor file is handled
+/// separately via the scope-aware path.
+///
+/// Dedup strategy: locations are keyed by `(url, range)`. The cursor
+/// file's scope-aware hits are pushed first, then open-buffer
+/// whole-file hits, then workspace-index declaration sites. A file that
+/// is both open *and* listed in the filelist therefore contributes its
+/// (richer) open-buffer hits, and the declaration site from the index
+/// is deduped away.
+///
+/// `include_declaration = false` filters out locations that match any
+/// declaration `name_range` known to the workspace index — the LSP
+/// semantics are "exclude the *definition* of the symbol", and the
+/// index's declarations are the closest syntactic proxy.
+#[allow(clippy::too_many_arguments)]
+fn collect_references(
+    name: &str,
+    cursor_uri: &Url,
+    cursor_tree: &SyntaxTree,
+    cursor_rope: &Rope,
+    cursor_pos: MPosition,
+    other_open: &[(Url, SyntaxTree)],
+    wi: &WorkspaceIndex,
+    include_declaration: bool,
+) -> Vec<Location> {
+    // Set of (url, range) declaration sites known to the workspace index.
+    // Used both to dedup against the workspace-only path and to filter
+    // out declarations when the client requested it.
+    let declarations: HashSet<(Url, MRange)> = wi
+        .lookup(name)
+        .iter()
+        .map(|e| (e.url.clone(), e.symbol.name_range))
+        .collect();
+
+    let mut seen: HashSet<(Url, MRange)> = HashSet::new();
+    let mut out: Vec<Location> = Vec::new();
+    let mut truncated = false;
+
+    let push = |out: &mut Vec<Location>,
+                seen: &mut HashSet<(Url, MRange)>,
+                truncated: &mut bool,
+                u: &Url,
+                r: MRange|
+     -> bool {
+        if !include_declaration && declarations.contains(&(u.clone(), r)) {
+            return true;
+        }
+        if !seen.insert((u.clone(), r)) {
+            return true;
+        }
+        if out.len() >= REFERENCES_LIMIT {
+            *truncated = true;
+            return false;
+        }
+        out.push(Location {
+            uri: u.clone(),
+            range: m_range_to_lsp(r),
+        });
+        true
+    };
+
+    // 1. Same file — scope-aware.
+    for r in mimir_syntax::symbols::occurrences_of_at(cursor_tree, cursor_rope, cursor_pos) {
+        if !push(&mut out, &mut seen, &mut truncated, cursor_uri, r) {
+            break;
+        }
+    }
+
+    // 2. Other open buffers — whole-file lexical match.
+    'outer: for (other_uri, other_tree) in other_open {
+        let other_rope = Rope::from_str(other_tree.source());
+        for r in mimir_syntax::symbols::occurrences_of(other_tree, &other_rope, name) {
+            if !push(&mut out, &mut seen, &mut truncated, other_uri, r) {
+                break 'outer;
+            }
+        }
+    }
+
+    // 3. Declaration sites from the workspace index (for files that
+    //    aren't currently open). Open buffers above already covered
+    //    those entries, and dedup keeps things consistent.
+    if !truncated {
+        for entry in wi.lookup(name) {
+            if !push(
+                &mut out,
+                &mut seen,
+                &mut truncated,
+                &entry.url,
+                entry.symbol.name_range,
+            ) {
+                break;
+            }
+        }
+    }
+
+    if truncated {
+        warn!(
+            limit = REFERENCES_LIMIT,
+            name = %name,
+            "references truncated at limit",
+        );
+    }
+
+    out
+}
+
 /// Convert our internal `Range` into the `lsp_types` shape.
 fn m_range_to_lsp(r: MRange) -> Range {
     Range {
@@ -3314,9 +3493,7 @@ fn detect_member_access(rope: &Rope, pos: MPosition) -> Option<(bool, String)> {
     let mut i = chars.len();
 
     // Skip trailing identifier chars (the partial member name being typed).
-    while i > 0
-        && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$')
-    {
+    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
         i -= 1;
     }
     let prefix: String = chars[i..].iter().collect();
@@ -3362,9 +3539,7 @@ fn detect_macro_trigger(rope: &Rope, pos: MPosition) -> Option<String> {
     let mut i = chars.len();
 
     // Skip trailing identifier chars (the partial macro name being typed).
-    while i > 0
-        && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')
-    {
+    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_') {
         i -= 1;
     }
     let prefix: String = chars[i..].iter().collect();
@@ -4678,8 +4853,14 @@ mod tests {
         Location {
             uri: Url::parse("file:///proj/a.sv").unwrap(),
             range: Range {
-                start: Position { line: 1, character: 0 },
-                end: Position { line: 1, character: 8 },
+                start: Position {
+                    line: 1,
+                    character: 0,
+                },
+                end: Position {
+                    line: 1,
+                    character: 8,
+                },
             },
         }
     }
@@ -4721,16 +4902,14 @@ mod tests {
     #[test]
     fn route_implementation_uses_slang_when_resolved_non_empty() {
         let locs = vec![sample_location()];
-        let route =
-            route_implementation(Some(SlangImplementationOutcome::Resolved(locs.clone())));
+        let route = route_implementation(Some(SlangImplementationOutcome::Resolved(locs.clone())));
         assert_eq!(route, ImplementationRoute::UseSlangResult(locs));
     }
 
     /// Empty resolved → still `UseSlangResult` (trust-slang-on-empty).
     #[test]
     fn route_implementation_uses_slang_when_resolved_empty() {
-        let route =
-            route_implementation(Some(SlangImplementationOutcome::Resolved(Vec::new())));
+        let route = route_implementation(Some(SlangImplementationOutcome::Resolved(Vec::new())));
         assert_eq!(route, ImplementationRoute::UseSlangResult(Vec::new()));
     }
 
@@ -4758,8 +4937,7 @@ mod tests {
         // (UTF-16 column 4).
         let rope = Rope::from_str("  a.");
         let pos = MPosition::new(0, 4);
-        let patch =
-            build_member_completion_sentinel(&rope, pos).expect("cursor in bounds");
+        let patch = build_member_completion_sentinel(&rope, pos).expect("cursor in bounds");
         assert_eq!(patch.insert, COMPLETION_SENTINEL);
         assert_eq!(patch.insert_byte_offset, 4);
         assert_eq!(patch.adjusted_position.line, 0);
@@ -4809,12 +4987,7 @@ mod tests {
     #[test]
     fn completion_options_trigger_characters() {
         let opts = CompletionOptions {
-            trigger_characters: Some(vec![
-                ".".into(),
-                "`".into(),
-                "$".into(),
-                ":".into(),
-            ]),
+            trigger_characters: Some(vec![".".into(), "`".into(), "$".into(), ":".into()]),
             resolve_provider: Some(false),
             ..Default::default()
         };
@@ -4827,8 +5000,7 @@ mod tests {
     /// request, no log).
     #[tokio::test]
     async fn initialize_advertises_colon_trigger() {
-        let (service, _socket) =
-            tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
         #[allow(deprecated)]
         let init = InitializeParams {
             root_uri: None,
@@ -4846,10 +5018,22 @@ mod tests {
             .expect("completion provider")
             .trigger_characters
             .expect("trigger chars");
-        assert!(triggers.iter().any(|s| s == ":"), "expected `:` in {triggers:?}");
-        assert!(triggers.iter().any(|s| s == "."), "expected `.` in {triggers:?}");
-        assert!(triggers.iter().any(|s| s == "`"), "expected backtick in {triggers:?}");
-        assert!(triggers.iter().any(|s| s == "$"), "expected `$` in {triggers:?}");
+        assert!(
+            triggers.iter().any(|s| s == ":"),
+            "expected `:` in {triggers:?}"
+        );
+        assert!(
+            triggers.iter().any(|s| s == "."),
+            "expected `.` in {triggers:?}"
+        );
+        assert!(
+            triggers.iter().any(|s| s == "`"),
+            "expected backtick in {triggers:?}"
+        );
+        assert!(
+            triggers.iter().any(|s| s == "$"),
+            "expected `$` in {triggers:?}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -4923,7 +5107,11 @@ mod tests {
         let item = keyword_completion_item("module");
         assert_eq!(item.kind, Some(CompletionItemKind::KEYWORD));
         assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
-        assert!(item.insert_text.as_deref().unwrap_or("").contains("endmodule"));
+        assert!(item
+            .insert_text
+            .as_deref()
+            .unwrap_or("")
+            .contains("endmodule"));
         assert_eq!(item.detail.as_deref(), Some("snippet"));
     }
 
@@ -5062,7 +5250,10 @@ mod tests {
     fn detect_macro_trigger_full_name() {
         let rope = rope_from("`UVM_INFO");
         let pos = MPosition::new(0, 9); // end of "UVM_INFO"
-        assert_eq!(detect_macro_trigger(&rope, pos), Some("UVM_INFO".to_string()));
+        assert_eq!(
+            detect_macro_trigger(&rope, pos),
+            Some("UVM_INFO".to_string())
+        );
     }
 
     /// No backtick — plain identifier → `None`.
@@ -5097,14 +5288,26 @@ mod tests {
     fn slang_completion_kind_to_lsp_known_codes() {
         assert_eq!(slang_completion_kind_to_lsp(2), CompletionItemKind::METHOD);
         assert_eq!(slang_completion_kind_to_lsp(5), CompletionItemKind::FIELD);
-        assert_eq!(slang_completion_kind_to_lsp(6), CompletionItemKind::VARIABLE);
-        assert_eq!(slang_completion_kind_to_lsp(20), CompletionItemKind::ENUM_MEMBER);
-        assert_eq!(slang_completion_kind_to_lsp(21), CompletionItemKind::CONSTANT);
+        assert_eq!(
+            slang_completion_kind_to_lsp(6),
+            CompletionItemKind::VARIABLE
+        );
+        assert_eq!(
+            slang_completion_kind_to_lsp(20),
+            CompletionItemKind::ENUM_MEMBER
+        );
+        assert_eq!(
+            slang_completion_kind_to_lsp(21),
+            CompletionItemKind::CONSTANT
+        );
     }
 
     #[test]
     fn slang_completion_kind_to_lsp_unknown_falls_back_to_variable() {
-        assert_eq!(slang_completion_kind_to_lsp(99), CompletionItemKind::VARIABLE);
+        assert_eq!(
+            slang_completion_kind_to_lsp(99),
+            CompletionItemKind::VARIABLE
+        );
     }
 
     // ------------------------------------------------------------------
@@ -5117,8 +5320,7 @@ mod tests {
     /// re-parsing on every request.
     #[tokio::test]
     async fn did_open_populates_tree_cache() {
-        let (service, _socket) =
-            tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
         let backend = service.inner();
         let uri = Url::parse("file:///tmp/cache-test.sv").unwrap();
         backend
@@ -5144,8 +5346,7 @@ mod tests {
     /// acquisition, so this just exercises the cached read path.)
     #[tokio::test]
     async fn cached_tree_returns_populated_entry() {
-        let (service, _socket) =
-            tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
         let backend = service.inner();
         let uri = Url::parse("file:///tmp/cache-helper.sv").unwrap();
         backend
@@ -5168,8 +5369,7 @@ mod tests {
     /// synthesising an empty tree.
     #[tokio::test]
     async fn cached_tree_unknown_uri_returns_none() {
-        let (service, _socket) =
-            tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
         let backend = service.inner();
         let uri = Url::parse("file:///tmp/never-opened.sv").unwrap();
         assert!(backend.cached_tree(&uri).await.is_none());
@@ -5366,8 +5566,14 @@ mod tests {
             name_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 3)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 0)),
             params: Some(vec![
-                mimir_syntax::Param { name: "a".into(), ty: Some("int".into()) },
-                mimir_syntax::Param { name: "b".into(), ty: Some("int".into()) },
+                mimir_syntax::Param {
+                    name: "a".into(),
+                    ty: Some("int".into()),
+                },
+                mimir_syntax::Param {
+                    name: "b".into(),
+                    ty: Some("int".into()),
+                },
             ]),
             parent_class_name: None,
         };
@@ -5393,14 +5599,23 @@ mod tests {
             kind: MSymbolKind::Macro,
             name_range: MRange::new(MPosition::new(0, 8), MPosition::new(0, 16)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(1, 27)),
-            params: Some(vec![mimir_syntax::Param { name: "x".into(), ty: None }]),
+            params: Some(vec![mimir_syntax::Param {
+                name: "x".into(),
+                ty: None,
+            }]),
             parent_class_name: None,
         };
         let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
         let v = hover_markdown_value(&h);
         // Header is the synthesized signature; body is the trimmed body.
-        assert!(v.starts_with("```systemverilog\n`define MY_MACRO(x)"), "got {v:?}");
-        assert!(v.contains("$display"), "expected body to include $display, got {v:?}");
+        assert!(
+            v.starts_with("```systemverilog\n`define MY_MACRO(x)"),
+            "got {v:?}"
+        );
+        assert!(
+            v.contains("$display"),
+            "expected body to include $display, got {v:?}"
+        );
     }
 
     /// Module-kind symbol → fenced declaration line, falls back to disk
@@ -5479,8 +5694,14 @@ mod tests {
             name_range: MRange::new(MPosition::new(0, 8), MPosition::new(0, 11)),
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 23)),
             params: Some(vec![
-                mimir_syntax::Param { name: "a".into(), ty: None },
-                mimir_syntax::Param { name: "b".into(), ty: None },
+                mimir_syntax::Param {
+                    name: "a".into(),
+                    ty: None,
+                },
+                mimir_syntax::Param {
+                    name: "b".into(),
+                    ty: None,
+                },
             ]),
             parent_class_name: None,
         };
@@ -5488,4 +5709,187 @@ mod tests {
         assert_eq!(body, "a + b");
     }
 
+    // ----------------------------------------------------------------------
+    // references — collect_references
+    // ----------------------------------------------------------------------
+
+    /// Parse `text` into a `SyntaxTree` for a tests-only callsite. We
+    /// build a fresh parser per test rather than sharing one — these
+    /// tests aren't perf-sensitive and the parser cost is small.
+    fn parse_tree(text: &str) -> SyntaxTree {
+        let mut parser = SyntaxParser::new().expect("grammar load");
+        parser.parse(text, None).expect("parse")
+    }
+
+    /// Build a populated `WorkspaceIndex` from a slice of `(url, text)`
+    /// pairs. Mirrors how the eager hydration pass folds parsed-from-disk
+    /// files into the index on `initialize`.
+    fn workspace_index_from(files: &[(&Url, &str)]) -> WorkspaceIndex {
+        let mut wi = WorkspaceIndex::new();
+        for (u, text) in files {
+            let tree = parse_tree(text);
+            let rope = Rope::from_str(text);
+            let symbols = mimir_syntax::symbols::index(&tree, &rope);
+            wi.update((*u).clone(), &symbols);
+        }
+        wi
+    }
+
+    /// Helper: invoke `collect_references` with the cursor positioned on
+    /// the first occurrence of `name` in `cursor_text`. Other open
+    /// buffers are passed as `(url, text)` pairs.
+    fn run_references(
+        name: &str,
+        cursor_uri: &Url,
+        cursor_text: &str,
+        other_open: &[(Url, &str)],
+        wi: &WorkspaceIndex,
+        include_declaration: bool,
+    ) -> Vec<Location> {
+        let cursor_tree = parse_tree(cursor_text);
+        let cursor_rope = Rope::from_str(cursor_text);
+        // Position the cursor on the first byte-offset occurrence of `name`.
+        let byte = cursor_text.find(name).expect("name appears in cursor_text");
+        // Compute UTF-16 column/line for that byte. Cursor text in these
+        // tests is ASCII, so byte offset == utf16 offset and we can
+        // count lines/columns by character.
+        let prefix = &cursor_text[..byte];
+        let line = prefix.bytes().filter(|b| *b == b'\n').count() as u32;
+        let col = match prefix.rfind('\n') {
+            Some(nl) => (byte - nl - 1) as u32,
+            None => byte as u32,
+        };
+        let cursor_pos = MPosition::new(line, col);
+
+        let other_trees: Vec<(Url, SyntaxTree)> = other_open
+            .iter()
+            .map(|(u, t)| (u.clone(), parse_tree(t)))
+            .collect();
+
+        collect_references(
+            name,
+            cursor_uri,
+            &cursor_tree,
+            &cursor_rope,
+            cursor_pos,
+            &other_trees,
+            wi,
+            include_declaration,
+        )
+    }
+
+    /// Same-file lexical occurrences come back as `Location`s. Even
+    /// without a workspace index, references inside the cursor file
+    /// are returned — the most basic case.
+    #[test]
+    fn references_returns_same_file_occurrences() {
+        let here = url("file:///a.sv");
+        let text = "module m;\n  int foo;\n  initial foo = 1;\nendmodule\n";
+        let wi = WorkspaceIndex::new();
+        let out = run_references("foo", &here, text, &[], &wi, true);
+        assert_eq!(out.len(), 2, "decl + one use");
+        assert!(out.iter().all(|l| l.uri == here));
+    }
+
+    /// Open buffers other than the cursor file contribute whole-file
+    /// lexical matches. The cursor file's hits *and* the other file's
+    /// hits both appear.
+    #[test]
+    fn references_includes_other_open_buffer_usages() {
+        let here = url("file:///a.sv");
+        let other = url("file:///b.sv");
+        let cursor_text = "module a;\n  my_class c;\nendmodule\n";
+        let other_text = "module b;\n  my_class c1;\n  my_class c2;\nendmodule\n";
+        let wi = WorkspaceIndex::new();
+        let out = run_references(
+            "my_class",
+            &here,
+            cursor_text,
+            &[(other.clone(), other_text)],
+            &wi,
+            true,
+        );
+        // 1 in cursor file + 2 in other open buffer.
+        assert_eq!(out.len(), 3);
+        let other_hits = out.iter().filter(|l| l.uri == other).count();
+        assert_eq!(other_hits, 2);
+    }
+
+    /// Workspace-index declarations from filelist-hydrated (non-open)
+    /// files are returned as a fallback. Cursor file has no occurrence
+    /// of the name itself — the only result must come from the index.
+    #[test]
+    fn references_includes_declaration_from_filelist_not_open() {
+        let here = url("file:///a.sv");
+        let elsewhere = url("file:///lib.sv");
+        let cursor_text = "module m;\n  my_class c;\nendmodule\n";
+        let elsewhere_text = "class my_class;\nendclass\n";
+        let wi = workspace_index_from(&[(&elsewhere, elsewhere_text)]);
+        let out = run_references("my_class", &here, cursor_text, &[], &wi, true);
+        // 1 usage in cursor file + 1 declaration site from the index.
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|l| l.uri == elsewhere));
+    }
+
+    /// When a file is both open *and* listed in the filelist, the
+    /// open-buffer scan covers it and the workspace-index declaration
+    /// site is deduped away — no duplicate `Location` returned.
+    #[test]
+    fn references_dedupes_when_file_is_both_open_and_in_filelist() {
+        let here = url("file:///a.sv");
+        let other = url("file:///b.sv");
+        let cursor_text = "module a;\n  my_class c;\nendmodule\n";
+        let other_text = "class my_class;\nendclass\n";
+        // Index has the declaration; open-buffer scan also finds it.
+        let wi = workspace_index_from(&[(&other, other_text)]);
+        let out = run_references(
+            "my_class",
+            &here,
+            cursor_text,
+            &[(other.clone(), other_text)],
+            &wi,
+            true,
+        );
+        // 1 use in cursor file + 1 (deduped) declaration in `other`.
+        assert_eq!(out.len(), 2);
+        let other_hits = out.iter().filter(|l| l.uri == other).count();
+        assert_eq!(other_hits, 1, "open-buffer hit and index decl dedupe");
+    }
+
+    /// `include_declaration = false` strips out locations equal to a
+    /// known declaration `name_range`, but leaves *usages* alone — even
+    /// in the same file as the declaration.
+    #[test]
+    fn references_respects_include_declaration_false() {
+        let here = url("file:///a.sv");
+        let elsewhere = url("file:///lib.sv");
+        let cursor_text = "module m;\n  my_class c;\nendmodule\n";
+        let elsewhere_text = "class my_class;\nendclass\n";
+        let wi = workspace_index_from(&[(&elsewhere, elsewhere_text)]);
+
+        let with_decl = run_references("my_class", &here, cursor_text, &[], &wi, true);
+        let without_decl = run_references("my_class", &here, cursor_text, &[], &wi, false);
+
+        assert!(with_decl.len() > without_decl.len());
+        // The usage in the cursor file is preserved.
+        assert!(without_decl.iter().any(|l| l.uri == here));
+        // The declaration site in the other file is gone.
+        assert!(!without_decl.iter().any(|l| l.uri == elsewhere));
+    }
+
+    /// Truncation kicks in at [`REFERENCES_LIMIT`]. Synthesise a file
+    /// with many usages and assert the cap, plus that we don't blow up.
+    #[test]
+    fn references_caps_at_limit() {
+        let here = url("file:///a.sv");
+        // Build a module body with REFERENCES_LIMIT + 50 references to `foo`.
+        let mut text = String::from("module m;\n  int foo;\n");
+        for _ in 0..(REFERENCES_LIMIT + 50) {
+            text.push_str("  initial foo = 1;\n");
+        }
+        text.push_str("endmodule\n");
+        let wi = WorkspaceIndex::new();
+        let out = run_references("foo", &here, &text, &[], &wi, true);
+        assert_eq!(out.len(), REFERENCES_LIMIT);
+    }
 }
