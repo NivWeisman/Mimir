@@ -587,28 +587,54 @@ impl Backend {
         };
         let line_no = loc.range.start.line;
 
-        // Read the declaration line: open-doc store first, then disk.
-        let line_text: Option<String> = {
+        // Look the resolved location up in the workspace index. When a
+        // matching `Symbol` exists, route through `hover_for_symbol` so
+        // callables get their synthesized signature and macros get their
+        // full multi-line body — the slang path otherwise reads a single
+        // line from disk, which silently truncates multi-line declarations.
+        let workspace_match: Option<(Url, Symbol)> = {
+            let wi = self.workspace_index.read().await;
+            let mut hit = None;
+            for entry in wi.entries() {
+                if entry.url == dest_uri && entry.symbol.name_range.start.line == line_no {
+                    hit = Some((entry.url.clone(), entry.symbol.clone()));
+                    break;
+                }
+            }
+            hit
+        };
+        if let Some((sym_url, sym)) = workspace_match {
+            let docs = self.documents.read().await;
+            if let Some(h) = hover_for_symbol(&sym, &sym_url, &docs) {
+                return Some(h);
+            }
+        }
+
+        // No workspace symbol at the resolved location — fall back to a
+        // multi-line text read so a multi-line declaration still shows
+        // every parameter. `read_declaration_block` reads lines from
+        // `line_no` until the first source line that looks like the end
+        // of the declaration (`;`, `endfunction`, blank line, …).
+        let dest_path = &loc.path;
+        let block: Option<String> = {
             let docs = self.documents.read().await;
             docs.get(&dest_uri).and_then(|state| {
                 let r = Rope::from_str(&state.document.text());
-                read_line_trimmed(&r, line_no)
+                read_declaration_block(&r, line_no)
             })
         }
         .or_else(|| {
-            // Same-file shortcut: if the destination is the URI we already
-            // have a rope for, avoid the disk read.
             if &dest_uri == uri {
-                read_line_trimmed(rope, line_no)
+                read_declaration_block(rope, line_no)
             } else {
-                std::fs::read_to_string(&loc.path)
+                std::fs::read_to_string(dest_path)
                     .ok()
-                    .and_then(|t| read_line_trimmed(&Rope::from_str(&t), line_no))
+                    .and_then(|t| read_declaration_block(&Rope::from_str(&t), line_no))
             }
         });
 
-        let line = line_text?;
-        Some(hover_markdown(&line))
+        let block = block?;
+        Some(hover_markdown(&block))
     }
 
     /// Try to resolve a definition via the slang sidecar.
@@ -3392,6 +3418,105 @@ fn read_line_trimmed(rope: &Rope, line: u32) -> Option<String> {
     Some(raw.trim_end_matches(['\r', '\n']).trim().to_owned())
 }
 
+/// Read a declaration that may span multiple lines, starting from
+/// `start_line` and continuing until we hit what looks like the end of
+/// the declaration. Used by the slang hover fallback so multi-line
+/// function/task/macro declarations don't get truncated to their first
+/// source line.
+///
+/// "End of declaration" is intentionally simple — we stop *after* the
+/// first line that:
+///
+/// * Ends in `;` not preceded by a `\` (so a single-line declaration
+///   reads cleanly and a multi-line C-style `\`-continued macro keeps
+///   going).
+/// * Is exactly empty (after trimming) — a blank line terminates a
+///   `\`-continued macro definition.
+/// * Starts an `endfunction` / `endtask` / `endmodule` / `endclass` /
+///   `end` block (the declaration has flowed into its body).
+///
+/// We cap at 16 lines so a runaway shape never produces a giant hover
+/// popup.
+fn read_declaration_block(rope: &Rope, start_line: u32) -> Option<String> {
+    const MAX_LINES: usize = 16;
+    let total = rope.len_lines();
+    let start = start_line as usize;
+    if start >= total {
+        return None;
+    }
+    let mut collected = Vec::with_capacity(4);
+    let mut prev_ends_with_backslash = false;
+    for offset in 0..MAX_LINES {
+        let idx = start + offset;
+        if idx >= total {
+            break;
+        }
+        let raw: String = rope.line(idx).chars().collect();
+        let line = raw.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim();
+
+        // Stop *before* an empty line that follows a non-continuation —
+        // an empty separator between two top-level decls.
+        if offset > 0 && trimmed.is_empty() && !prev_ends_with_backslash {
+            break;
+        }
+        // Stop *before* an `end*` keyword (we've fallen into the body).
+        if offset > 0
+            && (trimmed.starts_with("endfunction")
+                || trimmed.starts_with("endtask")
+                || trimmed.starts_with("endmodule")
+                || trimmed.starts_with("endclass")
+                || trimmed.starts_with("endpackage")
+                || trimmed.starts_with("endinterface"))
+        {
+            break;
+        }
+
+        collected.push(line.to_owned());
+        let ends_with_backslash = line.trim_end().ends_with('\\');
+        let ends_with_semicolon = line.trim_end().ends_with(';');
+
+        // A semicolon terminates a normal declaration *unless* it's
+        // inside a `\`-continued macro body.
+        if ends_with_semicolon && !prev_ends_with_backslash && !ends_with_backslash {
+            break;
+        }
+        // A line that doesn't continue and isn't part of a continuation
+        // group — single-line declaration, we're done.
+        if !ends_with_backslash && !prev_ends_with_backslash && offset == 0 {
+            // Single-line case: we already pushed it, decide based on
+            // the line's own terminator.
+            if ends_with_semicolon || trimmed.is_empty() {
+                break;
+            }
+        }
+        prev_ends_with_backslash = ends_with_backslash;
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    // Strip leading whitespace consistently across all lines so the
+    // markdown block doesn't show jagged indentation. Use the minimum
+    // leading-whitespace count of the non-empty lines.
+    let common: usize = collected
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.bytes().take_while(|b| *b == b' ' || *b == b'\t').count())
+        .min()
+        .unwrap_or(0);
+    let dedented: Vec<String> = collected
+        .iter()
+        .map(|l| {
+            if l.len() >= common {
+                l[common..].to_owned()
+            } else {
+                l.clone()
+            }
+        })
+        .collect();
+    Some(dedented.join("\n"))
+}
+
 /// Build a `CompletionItem` for a SystemVerilog keyword.
 ///
 /// When the keyword has a registered snippet body in
@@ -5296,6 +5421,48 @@ mod tests {
         };
         // No doc, and the path doesn't exist on disk either → None.
         assert!(hover_for_symbol(&s, &url, &docs).is_none());
+    }
+
+    /// Single-line function declaration: only one source line lands in
+    /// the block.
+    #[test]
+    fn read_declaration_block_single_line() {
+        let rope = ropey::Rope::from_str("function void foo();\n  int x;\nendfunction\n");
+        let block = read_declaration_block(&rope, 0).expect("block");
+        assert_eq!(block, "function void foo();");
+    }
+
+    /// Multi-line `function` declaration whose parameters wrap across
+    /// four source lines: every line must land in the block.
+    #[test]
+    fn read_declaration_block_multi_line_function() {
+        let text = "static function bit get(uvm_component cntxt,\n\
+                    \t\t\t\tstring inst_name,\n\
+                    \t\t\t\tstring field_name,\n\
+                    \t\t\t\tinout T value);\n\
+                    \tint x;\n\
+                    endfunction\n";
+        let rope = ropey::Rope::from_str(text);
+        let block = read_declaration_block(&rope, 0).expect("block");
+        assert!(block.contains("cntxt"), "{block:?}");
+        assert!(block.contains("inst_name"), "{block:?}");
+        assert!(block.contains("field_name"), "{block:?}");
+        assert!(block.contains("inout T value"), "{block:?}");
+        // The body line (`int x;`) and `endfunction` must NOT leak in.
+        assert!(!block.contains("int x"), "{block:?}");
+        assert!(!block.contains("endfunction"), "{block:?}");
+    }
+
+    /// `\\`-continued macro definition: every continuation line lands
+    /// in the block until the first non-continued line.
+    #[test]
+    fn read_declaration_block_multi_line_macro() {
+        let text = "`define UVM_THING(X) \\\n  do_a(X); \\\n  do_b(X); \\\n  do_c(X)\n";
+        let rope = ropey::Rope::from_str(text);
+        let block = read_declaration_block(&rope, 0).expect("block");
+        assert!(block.contains("do_a(X)"));
+        assert!(block.contains("do_b(X)"));
+        assert!(block.contains("do_c(X)"));
     }
 
     /// `read_macro_body` strips the `\`define NAME(args)` header.

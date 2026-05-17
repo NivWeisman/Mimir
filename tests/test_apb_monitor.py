@@ -281,6 +281,41 @@ class ApbMonitorTest(unittest.TestCase):
         result = self._hover(2, 0)
         self.assertIsNone(result)
 
+    def test_hover_uvm_fatal_macro_shows_multi_line_body(self) -> None:
+        """Cursor on `` `uvm_fatal `` at line 57 must return the full
+        multi-line `` `define `` body, not just the first source line
+        of the definition. The slang path resolves to
+        `uvm_message_defines.svh` and the resolved symbol's
+        `full_range` spans several lines."""
+        # Line 57 raw: `            `uvm_fatal("APB/MON/NOVIF", "...")`
+        # `uvm_fatal` starts at char 13.
+        result = self._hover(56, 13)
+        self.assertIsNotNone(result, "no hover for `uvm_fatal`")
+        value = result["contents"]["value"]
+        # The body of `uvm_fatal includes `uvm_report_fatal` on a later
+        # source line — that's the signal that we read more than line 1.
+        self.assertIn("uvm_report_fatal", value)
+
+    def test_hover_get_on_uvm_config_db_returns_full_signature(self) -> None:
+        """Cursor on `get` in `uvm_config_db#(apb_vif)::get(this, ...)`
+        (line 56 / 0-idx 55) should resolve to `uvm_config_db::get` and
+        return its full multi-line signature — the declaration spans four
+        source lines and a single-line read would only show the first
+        comma-terminated line. v1 covers this via signature_for's typed
+        parameter list."""
+        # Line 56 raw: `         if (!uvm_config_db#(apb_vif)::get(this, "", "vif", tmp)) begin`
+        # `get` starts at the position right after `::`.
+        result = self._hover(55, 41)
+        self.assertIsNotNone(result, "no hover for uvm_config_db::get")
+        value = result["contents"]["value"]
+        # All four params must be present, regardless of how the source
+        # wraps them across lines.
+        for param in ("cntxt", "inst_name", "field_name", "value"):
+            self.assertIn(
+                param, value,
+                f"missing param `{param}` in hover content: {value!r}",
+            )
+
     def test_hover_this_field_resolves_via_class(self) -> None:
         """Cursor on `sigs` in `this.sigs.pck` (line 70 / 0-idx 69)
         resolves through the enclosing class to the declaration on
