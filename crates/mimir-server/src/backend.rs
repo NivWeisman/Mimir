@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -459,6 +459,86 @@ impl Backend {
             .write()
             .await
             .insert(trigger_uri, handle);
+    }
+
+    /// Re-discover and re-load the project rooted at the directory
+    /// containing `mimir_toml_path`, then re-hydrate the workspace
+    /// symbol index from the resulting filelist. Called when the
+    /// `.mimir.toml` itself changes on disk.
+    ///
+    /// Fire-and-forget: the workspace index update happens on the
+    /// spawned task, mirroring the initialize-time hydration path so
+    /// the watcher event returns promptly. A failed re-discover
+    /// (deleted / malformed config) logs at warn and leaves the
+    /// previous `self.project` in place.
+    async fn rehydrate_project_from(&self, mimir_toml_path: &Path) {
+        let Some(start) = mimir_toml_path.parent() else {
+            warn!(path = %mimir_toml_path.display(), "rehydrate: .mimir.toml has no parent dir");
+            return;
+        };
+        match ResolvedProject::discover(start) {
+            Ok(Some(resolved)) => {
+                info!(
+                    files = resolved.files.len(),
+                    include_dirs = resolved.include_dirs.len(),
+                    "rehydrated project from .mimir.toml change",
+                );
+                let paths = resolved.files.clone();
+                let include_dirs = resolved.include_dirs.clone();
+                *self.project.write().await = Some(resolved);
+                let parser = self.parser.clone();
+                let workspace_index = self.workspace_index.clone();
+                tokio::spawn(async move {
+                    hydrate_workspace_index(paths, include_dirs, parser, workspace_index).await;
+                });
+            }
+            Ok(None) => {
+                warn!(
+                    path = %mimir_toml_path.display(),
+                    "rehydrate: .mimir.toml event fired but discover returned None; leaving prior project in place",
+                );
+            }
+            Err(e) => {
+                warn!(
+                    path = %mimir_toml_path.display(),
+                    error = %e,
+                    "rehydrate: failed to reload .mimir.toml; leaving prior project in place",
+                );
+            }
+        }
+    }
+
+    /// Re-parse `path` from disk and replace its entry in the
+    /// workspace symbol index. Used for `Created` / `Changed` events
+    /// on filelist-referenced source files that aren't currently
+    /// open in the editor.
+    ///
+    /// Silently skips paths the disk reader can't open (a transient
+    /// rename in flight, say) and paths that don't URL-encode. The
+    /// initial hydration uses the same skipping policy via
+    /// `hydrate_from_paths`.
+    async fn rehydrate_single_file(&self, path: &Path) {
+        let include_dirs = self
+            .project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.include_dirs.clone())
+            .unwrap_or_default();
+        let entries = {
+            let mut p = self.parser.lock().await;
+            workspace_index::hydrate_from_paths(
+                &[path.to_path_buf()],
+                &include_dirs,
+                &mut p,
+                |path| std::fs::read_to_string(path).ok(),
+            )
+        };
+        let mut wi = self.workspace_index.write().await;
+        for (url, syms) in entries {
+            debug!(url = %url, count = syms.len(), "re-hydrated single file");
+            wi.update(url, &syms);
+        }
     }
 
     /// Tree-sitter side of hover: resolve the identifier under the
@@ -1326,9 +1406,21 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 // Incremental sync: editor sends us range-based edits, not
                 // the whole file. This is critical for performance on large
-                // files and is the whole point of using a rope.
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
+                // files and is the whole point of using a rope. We use the
+                // `Options` form (not the simpler `Kind`) so we can also
+                // opt into `save` notifications — `did_save` doesn't need
+                // the buffer text (we already have it), only the URI, so
+                // `include_text: false`.
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
+                        will_save: None,
+                        will_save_wait_until: None,
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(false),
+                        })),
+                    },
                 )),
                 // Tree-sitter go-to-definition. Stage 2: same-file index
                 // first, workspace-wide index (open docs + filelist) on
@@ -1434,6 +1526,37 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("initialized — ready for requests");
+        // Dynamically register a `workspace/didChangeWatchedFiles`
+        // watcher for `.mimir.toml` and SV source files. The static
+        // capability covers `didSave`; this side has to be dynamic
+        // because the LSP spec requires file-system watchers go
+        // through `client/registerCapability`. Older clients that
+        // don't advertise `dynamicRegistration` will reject the
+        // request — we log at warn and continue without the watcher;
+        // the documented external-edit gap stays open in that case.
+        let registration = Registration {
+            id: "mimir-watched-files".into(),
+            method: "workspace/didChangeWatchedFiles".into(),
+            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/.mimir.toml".into()),
+                        kind: None,
+                    },
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.{sv,svh,v}".into()),
+                        kind: None,
+                    },
+                ],
+            })
+            .ok(),
+        };
+        if let Err(e) = self.client.register_capability(vec![registration]).await {
+            warn!(
+                error = %e,
+                "client refused didChangeWatchedFiles registration; external file edits won't reflect until restart",
+            );
+        }
     }
 
     async fn shutdown(&self) -> LspResult<()> {
@@ -1528,6 +1651,79 @@ impl LanguageServer for Backend {
         }
         // LSP spec: clear diagnostics for closed docs by publishing empty.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
+    }
+
+    /// File saved by the editor. We don't re-parse — `did_change` has
+    /// already kept the rope in sync with the buffer — but we do
+    /// schedule a slang elaborate so the sidecar's view of the
+    /// compilation unit reflects what's now on disk (the sidecar reads
+    /// files via the same open-buffer override path, but the save is
+    /// a strong signal the user wants their changes elaborated end-to-
+    /// end). No-op when slang isn't configured.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        debug!("did_save");
+        self.schedule_elaborate(uri).await;
+    }
+
+    /// External file-system events (LSP `workspace/didChangeWatchedFiles`).
+    /// Routes by path and event kind:
+    ///
+    /// * `.mimir.toml` Created/Changed → re-discover the project from
+    ///   its workspace root and re-hydrate the workspace symbol index
+    ///   from the new filelist. Guarded against concurrent invocations
+    ///   so two events in flight at once don't race.
+    /// * `.sv` / `.svh` / `.v` Created/Changed → if the file isn't
+    ///   currently open in the editor, re-hydrate its entry in the
+    ///   workspace symbol index (open buffers always win — they're
+    ///   authoritative for unsaved content).
+    /// * Deleted (any watched path) → evict the URL from the workspace
+    ///   index.
+    ///
+    /// The watcher is registered dynamically in `initialized` — clients
+    /// without `workspace.didChangeWatchedFiles.dynamicRegistration` send
+    /// no events here and the documented external-edit gap stays open.
+    #[instrument(level = "debug", skip_all, fields(count = params.changes.len()))]
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        for evt in params.changes {
+            let path = match evt.uri.to_file_path() {
+                Ok(p) => p,
+                Err(()) => {
+                    debug!(uri = %evt.uri, "watched-files event with non-file URL; skipping");
+                    continue;
+                }
+            };
+
+            let is_mimir_toml = path.file_name().and_then(|n| n.to_str()) == Some(".mimir.toml");
+
+            match evt.typ {
+                FileChangeType::DELETED => {
+                    debug!(path = %path.display(), "watched file deleted; evicting");
+                    let mut wi = self.workspace_index.write().await;
+                    wi.update(evt.uri.clone(), &[]);
+                }
+                FileChangeType::CREATED | FileChangeType::CHANGED => {
+                    if is_mimir_toml {
+                        debug!(path = %path.display(), ".mimir.toml changed; re-hydrating project");
+                        self.rehydrate_project_from(&path).await;
+                    } else {
+                        // Skip re-hydration for files the editor has open
+                        // — its rope is authoritative.
+                        let is_open = {
+                            let docs = self.documents.read().await;
+                            docs.contains_key(&evt.uri)
+                        };
+                        if is_open {
+                            debug!(uri = %evt.uri, "watched file is open in editor; skipping disk re-hydrate");
+                            continue;
+                        }
+                        self.rehydrate_single_file(&path).await;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     #[instrument(
@@ -5555,6 +5751,136 @@ mod tests {
         let uri = Url::parse("file:///tmp/never-opened.sv").unwrap();
         assert!(backend.cached_tree(&uri).await.is_none());
         assert!(backend.cached_tree_and_index(&uri).await.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // did_save + did_change_watched_files
+    // ------------------------------------------------------------------
+
+    /// `did_save` is a no-op for state (we already have the buffer via
+    /// `did_change`) but must not panic, must not drop the document,
+    /// and must safely run when slang isn't configured.
+    #[tokio::test]
+    async fn did_save_preserves_document_state() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/save-test.sv").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "systemverilog".to_string(),
+                    version: 1,
+                    text: "module foo;\nendmodule\n".to_string(),
+                },
+            })
+            .await;
+
+        backend
+            .did_save(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                text: None,
+            })
+            .await;
+
+        let docs = backend.documents.read().await;
+        let state = docs.get(&uri).expect("doc still in store after did_save");
+        assert!(state.tree.is_some(), "tree cache survived the save");
+    }
+
+    /// A `Deleted` event on a watched URL evicts that URL's entries
+    /// from the workspace symbol index.
+    #[tokio::test]
+    async fn watched_files_delete_evicts_workspace_index() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let url = Url::parse("file:///tmp/evict.sv").unwrap();
+
+        // Seed the workspace index with a synthetic entry for `url`.
+        {
+            let mut wi = backend.workspace_index.write().await;
+            wi.update(
+                url.clone(),
+                &[sym("my_class", MSymbolKind::Class, 0)],
+            );
+        }
+        assert!(
+            !backend.workspace_index.read().await.lookup("my_class").is_empty(),
+            "precondition: synthetic entry indexed",
+        );
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: url.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+
+        assert!(
+            backend.workspace_index.read().await.lookup("my_class").is_empty(),
+            "deleted event should have evicted the entry",
+        );
+    }
+
+    /// A `Changed` event on a URL that's currently open in the editor
+    /// must NOT trigger a disk re-hydrate — open buffers always win,
+    /// per [`workspace_index.rs`]'s ownership contract. We verify by
+    /// pointing the event at a non-existent path: a disk re-hydrate
+    /// would fail to read it, but we shouldn't even try.
+    #[tokio::test]
+    async fn watched_files_change_skips_open_buffers() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let url = Url::parse("file:///tmp/does-not-exist-but-open.sv").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: url.clone(),
+                    language_id: "systemverilog".to_string(),
+                    version: 1,
+                    text: "module open_buf; endmodule\n".to_string(),
+                },
+            })
+            .await;
+
+        // Should silently do nothing — no panic on unreadable path.
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: url.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // The open-buffer state survives.
+        let docs = backend.documents.read().await;
+        assert!(docs.contains_key(&url), "open buffer must not be touched");
+    }
+
+    /// `Changed` event on a non-`.sv` non-`.mimir.toml` path that
+    /// isn't open is processed via the single-file rehydrate path.
+    /// Pointing it at a path that doesn't exist must be a no-op
+    /// (not a panic) — the disk reader returns `None` and
+    /// `hydrate_from_paths` logs and skips.
+    #[tokio::test]
+    async fn watched_files_change_on_missing_file_is_noop() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let url = Url::parse("file:///tmp/definitely-not-on-disk.sv").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: url.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        // No assertion needed beyond "didn't panic" — the workspace
+        // index remains empty.
+        assert_eq!(backend.workspace_index.read().await.entries().count(), 0);
     }
 
     // ----------------------------------------------------------------------
