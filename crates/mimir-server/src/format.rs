@@ -9,12 +9,24 @@
 //! lines it rewrites; callers therefore replace the whole document with a
 //! single [`lsp_types::TextEdit`].
 //!
+//! ## Preprocessor handling
+//!
+//! `ifdef`/`ifndef` blocks that span statement boundaries (e.g. simulator
+//! guards where only the `if`-condition is inside the block) cause Verible
+//! parse errors.  [`wrap_ifdefs`] inserts Verible format-off/on pragmas
+//! around every such block before passing the text to the formatter, and
+//! [`strip_mimir_pragmas`] removes them from the output.  Header guards
+//! (a top-level `` `ifndef X `` / `` `define X `` / `` `endif `` spanning
+//! the whole file) are handled specially so only the guard lines themselves
+//! are frozen; the file body is still formatted normally.
+//!
 //! ## Arg construction
 //!
 //! [`build_args`] is a pure function — no I/O — and is the primary target of
 //! unit tests. The integration test (marked `#[ignore]`) needs the real
 //! binary and is activated by `make verible && cargo test -- --include-ignored`.
 
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
@@ -28,6 +40,270 @@ use crate::project::FormatterConfig;
 /// Hard timeout for a single `verible-verilog-format` invocation.
 /// Real SV files rarely exceed a few thousand lines; 5 s is generous.
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Unique tag embedded in injected pragmas so [`strip_mimir_pragmas`] can
+/// remove them without touching any user-written format-off/on comments.
+const MIMIR_TAG: &str = "// mimir:ifdef-wrap";
+
+/// Pragma inserted before an `ifdef/`ifndef block.
+pub const FORMAT_OFF_PRAGMA: &str = "/* verilog_format: off */  // mimir:ifdef-wrap";
+
+/// Pragma inserted after the matching `endif (or header-guard `define).
+pub const FORMAT_ON_PRAGMA: &str = "/* verilog_format: on */  // mimir:ifdef-wrap";
+
+// --------------------------------------------------------------------------
+// Preprocessor detection helpers (pure, unit-testable)
+// --------------------------------------------------------------------------
+
+/// True when `trimmed` is a `` `ifdef `` or `` `ifndef `` directive opener.
+fn is_ifdef_opener(trimmed: &str) -> bool {
+    let Some(rest) = trimmed
+        .strip_prefix("`ifdef")
+        .or_else(|| trimmed.strip_prefix("`ifndef"))
+    else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace())
+}
+
+/// True when `trimmed` is a `` `endif `` directive (possibly with a trailing comment).
+fn is_endif(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("`endif") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == '/')
+}
+
+/// Extract the macro identifier from a `` `ifdef X `` or `` `ifndef X `` line.
+fn ifdef_identifier(trimmed: &str) -> &str {
+    let rest = trimmed
+        .strip_prefix("`ifndef")
+        .or_else(|| trimmed.strip_prefix("`ifdef"))
+        .unwrap_or("")
+        .trim_start();
+    rest.split(|c: char| c.is_whitespace()).next().unwrap_or("")
+}
+
+/// True when `trimmed` is a `` `define IDENT `` for the given `ident`.
+fn is_define_for_ident(trimmed: &str, ident: &str) -> bool {
+    trimmed
+        .strip_prefix("`define")
+        .map(|rest| rest.split_whitespace().next() == Some(ident))
+        .unwrap_or(false)
+}
+
+// --------------------------------------------------------------------------
+// Block-finding
+// --------------------------------------------------------------------------
+
+/// A paired `` `ifdef ``/`` `ifndef `` … `` `endif `` range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IfdefBlock {
+    /// 0-based index of the `` `ifdef ``/`` `ifndef `` line.
+    open_line: usize,
+    /// 0-based index of the matching `` `endif `` line.
+    close_line: usize,
+    /// Nesting depth when this block was opened (0 = top-level in file).
+    depth_at_open: u32,
+}
+
+/// Scan `lines` and return all matched `` `ifdef``/`` `endif`` pairs.
+///
+/// Unmatched `` `ifdef`` openers (depth > 0 at EOF) are silently discarded.
+/// Spurious `` `endif`` lines (stack empty) are ignored.
+/// `` `elsif ``/`` `else `` are transparent: they don't affect depth.
+fn find_blocks(lines: &[&str]) -> Vec<IfdefBlock> {
+    let mut blocks = Vec::new();
+    let mut stack: Vec<(usize, u32)> = Vec::new(); // (open_line, depth_at_open)
+    let mut depth: u32 = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if is_ifdef_opener(trimmed) {
+            stack.push((i, depth));
+            depth += 1;
+        } else if is_endif(trimmed) && !stack.is_empty() {
+            let (open_line, depth_at_open) = stack.pop().unwrap();
+            depth = depth_at_open; // restore (handles malformed nesting gracefully)
+            blocks.push(IfdefBlock { open_line, close_line: i, depth_at_open });
+        }
+    }
+    blocks
+}
+
+// --------------------------------------------------------------------------
+// Header-guard detection
+// --------------------------------------------------------------------------
+
+/// A header guard: a depth-0 `` `ifndef X `` / `` `define X `` pair that spans
+/// most of the file, with the matching `` `endif `` at the very end.
+#[derive(Debug, Clone)]
+struct HeaderGuard {
+    /// 0-based index of the `` `ifndef `` / `` `ifdef `` line.
+    open_line: usize,
+    /// 0-based index of the `` `define `` line immediately following.
+    define_line: usize,
+    /// 0-based index of the matching `` `endif `` line.
+    close_line: usize,
+}
+
+/// Attempt to find a header guard among `blocks`.
+///
+/// Criteria:
+/// * There is exactly one depth-0 block (or the first depth-0 block dominates).
+/// * Its opener is within the first 10 non-blank / non-comment lines.
+/// * The first significant line after the opener is a `` `define `` for the
+///   same identifier.
+/// * The matching `` `endif `` is within the last 5 non-blank lines of the file.
+fn detect_header_guard(lines: &[&str], blocks: &[IfdefBlock]) -> Option<HeaderGuard> {
+    let outer = blocks.iter().find(|b| b.depth_at_open == 0)?;
+
+    let open_line = outer.open_line;
+    let close_line = outer.close_line;
+
+    // Opener must be near the top of the file.
+    let non_blank_before = lines[..open_line]
+        .iter()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*")
+        })
+        .count();
+    if non_blank_before > 10 {
+        return None;
+    }
+
+    // Derive the macro identifier.
+    let ident = ifdef_identifier(lines[open_line].trim());
+    if ident.is_empty() {
+        return None;
+    }
+
+    // The first significant line after the opener must be `define IDENT.
+    let define_line = lines[open_line + 1..]
+        .iter()
+        .enumerate()
+        .find(|(_, l)| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("//")
+        })
+        .and_then(|(offset, l)| {
+            if is_define_for_ident(l.trim(), ident) {
+                Some(open_line + 1 + offset)
+            } else {
+                None
+            }
+        })?;
+
+    // Closer must be near the end of the file.
+    let non_blank_after = lines[close_line + 1..]
+        .iter()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("//")
+        })
+        .count();
+    if non_blank_after > 5 {
+        return None;
+    }
+
+    Some(HeaderGuard { open_line, define_line, close_line })
+}
+
+// --------------------------------------------------------------------------
+// Wrapping / stripping
+// --------------------------------------------------------------------------
+
+/// Wrap `` `ifdef``/`` `ifndef `` blocks in `source` with Verible format-off/on
+/// pragmas so the formatter leaves them verbatim.
+///
+/// * **Without a header guard**: every depth-0 block is fully wrapped.
+/// * **With a header guard**: only the header guard lines themselves
+///   (`` `ifndef ``/`` `define ``) and the closing `` `endif `` are frozen
+///   as single-line wraps; the file body is exposed for normal formatting.
+///   Every depth-1 block inside the guard body is fully wrapped.
+///
+/// Returns `(wrapped_source, has_ifdefs)`.  When `has_ifdefs` is `false`
+/// the source is returned unchanged.
+pub fn wrap_ifdefs(source: &str) -> (String, bool) {
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.is_empty() {
+        return (source.to_owned(), false);
+    }
+
+    let blocks = find_blocks(&lines);
+    if blocks.is_empty() {
+        return (source.to_owned(), false);
+    }
+
+    let header_guard = detect_header_guard(&lines, &blocks);
+
+    // Depth at which blocks are considered "effective top-level" and need wrapping.
+    let wrap_depth: u32 = if header_guard.is_some() { 1 } else { 0 };
+
+    // Each entry: (line_index, is_prepend, pragma_str).
+    // BTreeMap keeps line indices sorted so we iterate in order.
+    let mut prepend: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+    let mut append: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+
+    // Fully wrap every block at effective top-level depth.
+    for block in &blocks {
+        if block.depth_at_open == wrap_depth {
+            prepend.entry(block.open_line).or_default().push(FORMAT_OFF_PRAGMA);
+            append.entry(block.close_line).or_default().push(FORMAT_ON_PRAGMA);
+        }
+    }
+
+    // Header guard: split-wrap the opener pair and the closer individually.
+    if let Some(hg) = &header_guard {
+        // Freeze `ifndef + `define as a unit.
+        prepend.entry(hg.open_line).or_default().insert(0, FORMAT_OFF_PRAGMA);
+        append.entry(hg.define_line).or_default().push(FORMAT_ON_PRAGMA);
+        // Freeze the closing `endif.
+        prepend.entry(hg.close_line).or_default().push(FORMAT_OFF_PRAGMA);
+        append.entry(hg.close_line).or_default().push(FORMAT_ON_PRAGMA);
+    }
+
+    // Reconstruct the source with pragmas spliced in.
+    let mut out = String::with_capacity(source.len() + blocks.len() * 80);
+    for (i, line) in lines.iter().enumerate() {
+        for pragma in prepend.get(&i).into_iter().flatten() {
+            out.push_str(pragma);
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+        for pragma in append.get(&i).into_iter().flatten() {
+            out.push_str(pragma);
+            out.push('\n');
+        }
+    }
+
+    // Restore the original trailing-newline behaviour.
+    if !source.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+
+    (out, true)
+}
+
+/// Remove every line that contains [`MIMIR_TAG`] from `text`.
+///
+/// Only lines injected by [`wrap_ifdefs`] carry the tag, so this never
+/// disturbs user-written `/* verilog_format: off */` comments.
+pub fn strip_mimir_pragmas(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if !line.contains(MIMIR_TAG) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
 
 // --------------------------------------------------------------------------
 // Error type
@@ -317,6 +593,183 @@ mod tests {
         };
         let args = build_args(&cfg, Some(1..=5));
         assert_eq!(args.last().unwrap(), "-");
+    }
+
+    // ------------------------------------------------------------------
+    // find_blocks / detect_header_guard / wrap_ifdefs / strip tests
+    // ------------------------------------------------------------------
+
+    fn lines_of(s: &str) -> Vec<&str> {
+        s.lines().collect()
+    }
+
+    /// No ifdef directives → empty block list.
+    #[test]
+    fn find_blocks_empty_on_plain_code() {
+        let src = "module foo;\nwire x;\nendmodule\n";
+        assert!(find_blocks(&lines_of(src)).is_empty());
+    }
+
+    /// A single flat ifdef/endif pair is found at depth 0.
+    #[test]
+    fn find_blocks_single_flat_block() {
+        let src = "`ifdef VCS\nassign x = 1;\n`endif\n";
+        let blocks = find_blocks(&lines_of(src));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].open_line, 0);
+        assert_eq!(blocks[0].close_line, 2);
+        assert_eq!(blocks[0].depth_at_open, 0);
+    }
+
+    /// Nested ifdefs produce two blocks with correct depths.
+    #[test]
+    fn find_blocks_nested_depths() {
+        let src = "`ifdef A\n`ifdef B\ncode;\n`endif\n`endif\n";
+        let blocks = find_blocks(&lines_of(src));
+        assert_eq!(blocks.len(), 2);
+        // Inner block closes first (depth 1).
+        let inner = blocks.iter().find(|b| b.depth_at_open == 1).unwrap();
+        let outer = blocks.iter().find(|b| b.depth_at_open == 0).unwrap();
+        assert_eq!(inner.open_line, 1);
+        assert_eq!(inner.close_line, 3);
+        assert_eq!(outer.open_line, 0);
+        assert_eq!(outer.close_line, 4);
+    }
+
+    /// `elsif and `else don't affect depth counting.
+    #[test]
+    fn find_blocks_elsif_is_transparent() {
+        let src = "`ifdef A\nassign x = 0;\n`elsif B\nassign x = 1;\n`else\nassign x = 2;\n`endif\n";
+        let blocks = find_blocks(&lines_of(src));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].depth_at_open, 0);
+    }
+
+    /// A classic header guard is detected.
+    #[test]
+    fn detect_header_guard_recognises_classic_guard() {
+        let src = "`ifndef MY_PKG_SV\n`define MY_PKG_SV\n// body\nmodule foo; endmodule\n`endif\n";
+        let ls = lines_of(src);
+        let blocks = find_blocks(&ls);
+        let hg = detect_header_guard(&ls, &blocks);
+        assert!(hg.is_some(), "should detect header guard");
+        let hg = hg.unwrap();
+        assert_eq!(hg.open_line, 0);
+        assert_eq!(hg.define_line, 1);
+        assert_eq!(hg.close_line, 4);
+    }
+
+    /// Plain `ifdef (not a guard) is not detected as a header guard.
+    #[test]
+    fn detect_header_guard_ignores_plain_ifdef() {
+        let src = "module foo;\n`ifdef SIMULATION\nassert(x);\n`endif\nendmodule\n";
+        let ls = lines_of(src);
+        let blocks = find_blocks(&ls);
+        let hg = detect_header_guard(&ls, &blocks);
+        assert!(hg.is_none(), "should not detect header guard in mid-file ifdef");
+    }
+
+    /// Source without ifdefs is returned unchanged, flag = false.
+    #[test]
+    fn wrap_ifdefs_no_ifdefs_returns_unchanged() {
+        let src = "module foo;\nwire x;\nendmodule\n";
+        let (out, flag) = wrap_ifdefs(src);
+        assert!(!flag);
+        assert_eq!(out, src);
+    }
+
+    /// A plain depth-0 ifdef block is fully wrapped.
+    #[test]
+    fn wrap_ifdefs_wraps_depth0_block() {
+        let src = "`ifdef VCS\nassign x = 1;\n`endif\n";
+        let (out, flag) = wrap_ifdefs(src);
+        assert!(flag, "should report has_ifdefs=true");
+        assert!(
+            out.contains(FORMAT_OFF_PRAGMA),
+            "should contain format-off pragma:\n{out}"
+        );
+        assert!(
+            out.contains(FORMAT_ON_PRAGMA),
+            "should contain format-on pragma:\n{out}"
+        );
+        // Original ifdef/endif lines must still be present.
+        assert!(out.contains("`ifdef VCS"), "original ifdef missing:\n{out}");
+        assert!(out.contains("`endif"), "original endif missing:\n{out}");
+    }
+
+    /// Header guard: body lines are NOT wrapped; only guard lines are frozen.
+    #[test]
+    fn wrap_ifdefs_header_guard_exposes_body() {
+        let src = concat!(
+            "`ifndef MY_HDR\n",
+            "`define MY_HDR\n",
+            "module foo;\n",
+            "wire x;\n",
+            "endmodule\n",
+            "`endif\n",
+        );
+        let (out, flag) = wrap_ifdefs(src);
+        assert!(flag);
+        // Body code must NOT be inside format-off (the pragma before `ifndef
+        // and format-on after `define means body is exposed).
+        // Check ordering: FORMAT_OFF appears before `ifndef, FORMAT_ON appears
+        // after `define, then body, then FORMAT_OFF again before `endif.
+        let off_positions: Vec<_> = out.match_indices(FORMAT_OFF_PRAGMA).map(|(i, _)| i).collect();
+        let on_positions: Vec<_> = out.match_indices(FORMAT_ON_PRAGMA).map(|(i, _)| i).collect();
+        // There should be exactly 2 format-off pragmas (before `ifndef and before `endif)
+        // and 2 format-on pragmas (after `define and after `endif).
+        assert_eq!(off_positions.len(), 2, "expected 2 format-off pragmas:\n{out}");
+        assert_eq!(on_positions.len(), 2, "expected 2 format-on pragmas:\n{out}");
+        // The body text (module foo) should appear between the first format-on and
+        // the second format-off.
+        let body_pos = out.find("module foo").unwrap();
+        assert!(
+            on_positions[0] < body_pos && body_pos < off_positions[1],
+            "body should be between first format-on and second format-off:\n{out}"
+        );
+    }
+
+    /// strip_mimir_pragmas removes only injected lines and preserves the rest.
+    #[test]
+    fn strip_mimir_pragmas_removes_injected_lines() {
+        let src = concat!(
+            "/* verilog_format: off */  // mimir:ifdef-wrap\n",
+            "`ifdef VCS\n",
+            "assign x = 1;\n",
+            "`endif\n",
+            "/* verilog_format: on */  // mimir:ifdef-wrap\n",
+        );
+        let stripped = strip_mimir_pragmas(src);
+        assert!(!stripped.contains(MIMIR_TAG), "mimir tag should be gone:\n{stripped}");
+        assert!(stripped.contains("`ifdef VCS"), "ifdef line should remain:\n{stripped}");
+        assert!(stripped.contains("assign x = 1;"), "code line should remain:\n{stripped}");
+    }
+
+    /// strip_mimir_pragmas preserves user-written format-off comments that
+    /// don't carry the mimir tag.
+    #[test]
+    fn strip_mimir_pragmas_preserves_user_pragmas() {
+        let src = "/* verilog_format: off */\nassign x = 1;\n/* verilog_format: on */\n";
+        let stripped = strip_mimir_pragmas(src);
+        assert_eq!(stripped, src, "user pragmas should be untouched:\n{stripped}");
+    }
+
+    /// Round-trip: wrapping then stripping returns the original source.
+    #[test]
+    fn wrap_then_strip_is_identity() {
+        let src = concat!(
+            "`ifndef MY_HDR\n",
+            "`define MY_HDR\n",
+            "module foo;\n",
+            "`ifdef VCS\n",
+            "assign dbg = 1;\n",
+            "`endif\n",
+            "endmodule\n",
+            "`endif\n",
+        );
+        let (wrapped, _) = wrap_ifdefs(src);
+        let restored = strip_mimir_pragmas(&wrapped);
+        assert_eq!(restored, src, "round-trip should be identity:\n{restored}");
     }
 
     /// Integration test: requires a real `verible-verilog-format` binary.

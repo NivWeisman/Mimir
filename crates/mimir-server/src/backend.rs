@@ -61,7 +61,7 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::completion_score;
-use crate::format::invoke_verible;
+use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
 use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
 use crate::workspace_index::{self, WorkspaceIndex};
 
@@ -2495,25 +2495,44 @@ impl LanguageServer for Backend {
             }
         };
         let rope = ropey::Rope::from_str(&source);
-        match invoke_verible(&cfg, &source, None).await {
-            Ok(formatted) if formatted == source => {
-                // Verible exited 0 but returned the input unchanged — almost
-                // always caused by preprocessor guards (`ifdef/`endif) that
-                // span task/function bodies and confuse the parser. Surface
-                // a visible warning so the user isn't left wondering why
-                // "Format Document" appeared to do nothing.
-                warn!("verible-verilog-format produced no changes (likely parse errors; check server log)");
-                self.client
-                    .show_message(
-                        MessageType::WARNING,
-                        "Formatter produced no changes. \
-                         The file may contain preprocessor guards (`ifdef/`endif) that \
-                         verible-verilog-format cannot parse. Check the server log for details.",
-                    )
-                    .await;
-                Ok(None)
+        let (wrapped, has_ifdefs) = wrap_ifdefs(&source);
+        if has_ifdefs {
+            warn!(
+                "formatting: file contains `ifdef/`ifndef blocks; \
+                 wrapping them with format-off pragmas so Verible can parse the rest"
+            );
+        }
+        match invoke_verible(&cfg, &wrapped, None).await {
+            Ok(raw_formatted) => {
+                let formatted = strip_mimir_pragmas(&raw_formatted);
+                if formatted == source {
+                    // Verible returned the file unchanged even after we removed
+                    // the injected pragmas.  This shouldn't happen for well-formed
+                    // code but can occur if every statement is inside an ifdef.
+                    warn!(
+                        "verible-verilog-format produced no changes \
+                         (all code may be inside preprocessor guards)"
+                    );
+                    self.client
+                        .show_message(
+                            MessageType::WARNING,
+                            "Formatter produced no changes — all code may be inside \
+                             preprocessor guards. Check the server log for details.",
+                        )
+                        .await;
+                    return Ok(None);
+                }
+                if has_ifdefs {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            "`ifdef/`ifndef blocks were preserved verbatim; \
+                             only the surrounding code was reformatted.",
+                        )
+                        .await;
+                }
+                Ok(Some(whole_file_edit(&rope, &formatted)))
             }
-            Ok(formatted) => Ok(Some(whole_file_edit(&rope, &formatted))),
             Err(e) => {
                 error!(error = %e, "verible-verilog-format failed; returning no edits");
                 Ok(None)
@@ -2546,20 +2565,40 @@ impl LanguageServer for Backend {
         // LSP line numbers are 0-based; Verible's --lines flag is 1-based.
         let start_line = params.range.start.line + 1;
         let end_line = params.range.end.line + 1;
-        match invoke_verible(&cfg, &source, Some(start_line..=end_line)).await {
-            Ok(formatted) if formatted == source => {
-                warn!("verible-verilog-format produced no changes for range {start_line}-{end_line}");
-                self.client
-                    .show_message(
-                        MessageType::WARNING,
-                        "Formatter produced no changes for the selected range. \
-                         The file may contain preprocessor guards (`ifdef/`endif) that \
-                         verible-verilog-format cannot parse. Check the server log for details.",
-                    )
-                    .await;
-                Ok(None)
+        let (wrapped, has_ifdefs) = wrap_ifdefs(&source);
+        if has_ifdefs {
+            warn!(
+                "range_formatting: file contains `ifdef/`ifndef blocks; \
+                 wrapping them with format-off pragmas"
+            );
+        }
+        match invoke_verible(&cfg, &wrapped, Some(start_line..=end_line)).await {
+            Ok(raw_formatted) => {
+                let formatted = strip_mimir_pragmas(&raw_formatted);
+                if formatted == source {
+                    warn!(
+                        "verible-verilog-format produced no changes for range \
+                         {start_line}-{end_line}"
+                    );
+                    self.client
+                        .show_message(
+                            MessageType::WARNING,
+                            "Formatter produced no changes for the selected range. \
+                             All code in the range may be inside preprocessor guards.",
+                        )
+                        .await;
+                    return Ok(None);
+                }
+                if has_ifdefs {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            "`ifdef/`ifndef blocks in the range were preserved verbatim.",
+                        )
+                        .await;
+                }
+                Ok(Some(whole_file_edit(&rope, &formatted)))
             }
-            Ok(formatted) => Ok(Some(whole_file_edit(&rope, &formatted))),
             Err(e) => {
                 error!(error = %e, "verible-verilog-format failed; returning no edits");
                 Ok(None)
