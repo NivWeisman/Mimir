@@ -470,7 +470,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mimir-core"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "pretty_assertions",
  "ropey",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-server"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "anyhow",
  "mimir-core",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-slang"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "mimir-core",
  "pretty_assertions",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-syntax"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "mimir-core",
  "pretty_assertions",

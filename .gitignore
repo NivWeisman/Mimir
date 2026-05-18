@@ -7,6 +7,9 @@ Cargo.lock.bak
 slang-sidecar/build/
 slang-sidecar/build.log
 
+# Downloaded Verible formatter binary (fetched by `make verible`)
+tools/verible/
+
 # VS Code extension build output
 editors/vscode/node_modules/
 editors/vscode/out/

@@ -1,4 +1,4 @@
-//! Project configuration for slang elaboration.
+//! Project configuration for slang elaboration and formatter integration.
 //!
 //! tree-sitter happily parses one file in isolation; slang can't. UVM
 //! testbenches `` `include `` macros from `uvm_pkg`, pull `+incdir+`
@@ -129,6 +129,20 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub slang: SlangConfig,
 
+    /// Formatter settings — controls how `textDocument/formatting` and
+    /// `textDocument/rangeFormatting` invoke `verible-verilog-format`.
+    /// See [`FormatterConfig`] and `docs/formatter.md` for the full
+    /// option reference.
+    ///
+    /// ```toml
+    /// [formatter]
+    /// binary            = "/opt/verible/bin/verible-verilog-format"
+    /// column_limit      = 120
+    /// indentation_spaces = 4
+    /// ```
+    #[serde(default)]
+    pub formatter: FormatterConfig,
+
     /// Extra environment variables for this workspace. Entries here are
     /// checked first when expanding `${VAR}` in filelist tokens and when
     /// looking up `MIMIR_SLANG_PATH`; the process environment provides
@@ -153,6 +167,7 @@ pub struct ProjectConfig {
     /// semantic_tokens = false           # turn off LSP semantic highlighting entirely
     /// format_specs_in_strings = false   # whole-string color instead of per-`%fmt`
     /// keyword_hover = false             # no popup on `always_ff` / `$display` / …
+    /// formatting    = false             # disable LSP formatting even if verible is present
     /// ```
     #[serde(default)]
     pub features: FeatureToggles,
@@ -190,6 +205,15 @@ pub struct FeatureToggles {
     /// (matches the pre-feature behaviour).
     #[serde(default = "default_true")]
     pub keyword_hover: bool,
+
+    /// LSP document formatting via `verible-verilog-format`. When `false`,
+    /// mimir does not advertise `formattingProvider` or
+    /// `rangeFormattingProvider` in `ServerCapabilities`, so the client
+    /// never sends formatting requests. Useful when the user already runs a
+    /// formatter through a different channel (e.g. conform.nvim, pre-commit)
+    /// and wants to prevent double-formatting.
+    #[serde(default = "default_true")]
+    pub formatting: bool,
 }
 
 fn default_true() -> bool {
@@ -202,6 +226,7 @@ impl Default for FeatureToggles {
             semantic_tokens: true,
             format_specs_in_strings: true,
             keyword_hover: true,
+            formatting: true,
         }
     }
 }
@@ -259,6 +284,129 @@ impl Default for SlangConfig {
     }
 }
 
+/// `[formatter]` section of `.mimir.toml`.
+///
+/// Controls how `textDocument/formatting` and `textDocument/rangeFormatting`
+/// invoke `verible-verilog-format`. Every field is optional (`Option<T>`):
+/// when absent the flag is not passed to Verible, which then uses its own
+/// built-in default. Use `extra_args` for any flag not listed here.
+///
+/// Full option reference: `docs/formatter.md`.
+///
+/// ```toml
+/// [formatter]
+/// binary             = "verible-verilog-format"   # or an absolute path
+/// column_limit       = 100
+/// indentation_spaces = 2
+/// wrap_spaces        = 4
+/// try_wrap_long_lines = false
+/// port_declarations_alignment = "flush-left"      # or "align" / "preserve"
+/// extra_args = ["--expand_coverpoints"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormatterConfig {
+    /// Path or name of the `verible-verilog-format` binary. Resolved via
+    /// `PATH` when just a name is given. Default: `"verible-verilog-format"`.
+    #[serde(default = "FormatterConfig::default_binary")]
+    pub binary: String,
+
+    /// Maximum column width (`--column_limit`). Verible default: 100.
+    #[serde(default)]
+    pub column_limit: Option<u32>,
+
+    /// Spaces per indentation level (`--indentation_spaces`). Verible default: 2.
+    #[serde(default)]
+    pub indentation_spaces: Option<u32>,
+
+    /// Extra indentation spaces for wrapped line continuations
+    /// (`--wrap_spaces`). Verible default: 4.
+    #[serde(default)]
+    pub wrap_spaces: Option<u32>,
+
+    /// When `true`, actively break lines that exceed `column_limit`
+    /// (`--try_wrap_long_lines`). Verible default: false.
+    #[serde(default)]
+    pub try_wrap_long_lines: Option<bool>,
+
+    /// Column alignment for port declaration lists
+    /// (`--port_declarations_alignment`). One of `"flush-left"`, `"align"`,
+    /// or `"preserve"`. Verible default: `"flush-left"`.
+    #[serde(default)]
+    pub port_declarations_alignment: Option<String>,
+
+    /// Column alignment for assignment statements (`=`, `<=`)
+    /// (`--assignment_statement_alignment`). Verible default: `"flush-left"`.
+    #[serde(default)]
+    pub assignment_statement_alignment: Option<String>,
+
+    /// Column alignment for named parameter connections (`.param(value)`)
+    /// (`--named_parameter_alignment`). Verible default: `"flush-left"`.
+    #[serde(default)]
+    pub named_parameter_alignment: Option<String>,
+
+    /// Column alignment for named port connections (`.port(wire)`)
+    /// (`--named_port_alignment`). Verible default: `"flush-left"`.
+    #[serde(default)]
+    pub named_port_alignment: Option<String>,
+
+    /// Column alignment for net/variable declarations inside modules
+    /// (`--module_net_variable_alignment`). Verible default: `"flush-left"`.
+    #[serde(default)]
+    pub module_net_variable_alignment: Option<String>,
+
+    /// Column alignment for formal parameter lists (`#(…)`)
+    /// (`--formal_parameters_alignment`). Verible default: `"flush-left"`.
+    #[serde(default)]
+    pub formal_parameters_alignment: Option<String>,
+
+    /// Column alignment for class member variable declarations
+    /// (`--class_member_variable_alignment`). Verible default: `"flush-left"`.
+    #[serde(default)]
+    pub class_member_variable_alignment: Option<String>,
+
+    /// Column alignment for `struct`/`union` member declarations
+    /// (`--struct_union_members_alignment`). Verible default: `"flush-left"`.
+    #[serde(default)]
+    pub struct_union_members_alignment: Option<String>,
+
+    /// Raw flags appended verbatim to every Verible invocation.
+    /// Values are passed as-is; quote shell-special characters yourself.
+    ///
+    /// ```toml
+    /// extra_args = ["--expand_coverpoints", "--failsafe_success=false"]
+    /// ```
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+impl FormatterConfig {
+    fn default_binary() -> String {
+        "verible-verilog-format".to_owned()
+    }
+}
+
+impl Default for FormatterConfig {
+    fn default() -> Self {
+        Self {
+            binary: Self::default_binary(),
+            column_limit: None,
+            indentation_spaces: None,
+            wrap_spaces: None,
+            try_wrap_long_lines: None,
+            port_declarations_alignment: None,
+            assignment_statement_alignment: None,
+            named_parameter_alignment: None,
+            named_port_alignment: None,
+            module_net_variable_alignment: None,
+            formal_parameters_alignment: None,
+            class_member_variable_alignment: None,
+            struct_union_members_alignment: None,
+            extra_args: Vec::new(),
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 // Resolved project (post-filelist-expansion)
 // --------------------------------------------------------------------------
@@ -301,6 +449,9 @@ pub struct ResolvedProject {
     /// Every flag defaults to `true`, so a project without the table
     /// behaves exactly as it did before the table existed.
     pub features: FeatureToggles,
+    /// Formatter settings (from `[formatter]` in `.mimir.toml`).
+    /// Passed through verbatim to [`crate::format`] at request time.
+    pub formatter: FormatterConfig,
 }
 
 impl ResolvedProject {
@@ -395,6 +546,7 @@ impl ResolvedProject {
             debounce_ms: cfg.slang.debounce_ms,
             env,
             features: cfg.features,
+            formatter: cfg.formatter,
         })
     }
 }
@@ -629,6 +781,7 @@ mod tests {
         assert!(cfg.features.semantic_tokens);
         assert!(cfg.features.format_specs_in_strings);
         assert!(cfg.features.keyword_hover);
+        assert!(cfg.features.formatting);
     }
 
     /// `[features]` table parses; missing fields keep their defaults.
@@ -947,5 +1100,80 @@ mod tests {
         assert_eq!(resolved.defines[1].name, "UVM_OBJECT_MUST_HAVE_CONSTRUCTOR");
         assert_eq!(resolved.top.as_deref(), Some("tb_top"));
         assert_eq!(resolved.debounce_ms, 250);
+    }
+
+    /// Empty `[formatter]` table decodes to all defaults — binary name is
+    /// `"verible-verilog-format"` and every option field is `None`.
+    #[test]
+    fn formatter_config_defaults() {
+        let cfg: ProjectConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.formatter.binary, "verible-verilog-format");
+        assert!(cfg.formatter.column_limit.is_none());
+        assert!(cfg.formatter.indentation_spaces.is_none());
+        assert!(cfg.formatter.wrap_spaces.is_none());
+        assert!(cfg.formatter.try_wrap_long_lines.is_none());
+        assert!(cfg.formatter.port_declarations_alignment.is_none());
+        assert!(cfg.formatter.extra_args.is_empty());
+    }
+
+    /// `[formatter]` fields round-trip correctly including `extra_args`.
+    #[test]
+    fn formatter_config_overrides_decode() {
+        let toml_text = r#"
+            [formatter]
+            binary             = "/opt/verible/bin/verible-verilog-format"
+            column_limit       = 120
+            indentation_spaces = 4
+            wrap_spaces        = 8
+            try_wrap_long_lines = true
+            port_declarations_alignment       = "align"
+            assignment_statement_alignment    = "preserve"
+            named_parameter_alignment         = "align"
+            named_port_alignment              = "align"
+            module_net_variable_alignment     = "align"
+            formal_parameters_alignment       = "align"
+            class_member_variable_alignment   = "align"
+            struct_union_members_alignment    = "align"
+            extra_args = ["--expand_coverpoints", "--failsafe_success=false"]
+        "#;
+        let cfg: ProjectConfig = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.formatter.binary, "/opt/verible/bin/verible-verilog-format");
+        assert_eq!(cfg.formatter.column_limit, Some(120));
+        assert_eq!(cfg.formatter.indentation_spaces, Some(4));
+        assert_eq!(cfg.formatter.wrap_spaces, Some(8));
+        assert_eq!(cfg.formatter.try_wrap_long_lines, Some(true));
+        assert_eq!(
+            cfg.formatter.port_declarations_alignment.as_deref(),
+            Some("align")
+        );
+        assert_eq!(
+            cfg.formatter.assignment_statement_alignment.as_deref(),
+            Some("preserve")
+        );
+        assert_eq!(cfg.formatter.extra_args, ["--expand_coverpoints", "--failsafe_success=false"]);
+    }
+
+    /// Unknown keys inside `[formatter]` are rejected the same way as other
+    /// tables — a typo'd field name fails loudly.
+    #[test]
+    fn formatter_config_rejects_unknown_keys() {
+        let bad = "[formatter]\ncolum_limit = 80\n";
+        assert!(toml::from_str::<ProjectConfig>(bad).is_err());
+    }
+
+    /// `[features] formatting` defaults to `true` and can be set to `false`.
+    #[test]
+    fn feature_toggle_formatting_defaults_true() {
+        let cfg: ProjectConfig = toml::from_str("").unwrap();
+        assert!(cfg.features.formatting);
+    }
+
+    #[test]
+    fn feature_toggle_formatting_can_be_disabled() {
+        let cfg: ProjectConfig = toml::from_str("[features]\nformatting = false\n").unwrap();
+        assert!(!cfg.features.formatting);
+        // Other toggles stay at their defaults.
+        assert!(cfg.features.semantic_tokens);
+        assert!(cfg.features.keyword_hover);
     }
 }

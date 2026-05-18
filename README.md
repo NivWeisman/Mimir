@@ -471,8 +471,8 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 - ⬜ `textDocument/rename`
 - ⬜ `textDocument/codeAction` (quick-fixes)
-- ⬜ `textDocument/formatting`
-- ⬜ `textDocument/rangeFormatting`
+- ✅ `textDocument/formatting` — whole-file via `verible-verilog-format` (see [docs/formatter.md](docs/formatter.md))
+- ✅ `textDocument/rangeFormatting` — selection snapped to whole lines, same backend
 
 ### Verification-focused features (the actual product goals)
 

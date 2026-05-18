@@ -61,7 +61,8 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::completion_score;
-use crate::project::{FeatureToggles, ResolvedProject};
+use crate::format::invoke_verible;
+use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
 use crate::workspace_index::{self, WorkspaceIndex};
 
 /// Per-document state held inside the store.
@@ -205,6 +206,19 @@ impl Backend {
             .await
             .as_ref()
             .map(|p| p.features.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return the current [`FormatterConfig`] from the resolved project config.
+    ///
+    /// Falls back to [`FormatterConfig::default`] (binary = `"verible-verilog-format"`,
+    /// all options unset) when no `.mimir.toml` is present.
+    async fn current_formatter_config(&self) -> FormatterConfig {
+        self.project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.formatter.clone())
             .unwrap_or_default()
     }
 
@@ -1526,6 +1540,12 @@ impl LanguageServer for Backend {
                 // tree-sitter fallback that uses the same workspace symbol
                 // index `definition` / `workspace/symbol` already consume.
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // Document formatting via `verible-verilog-format`. Both
+                // whole-file and range (snapped to whole lines) are supported;
+                // set `[features] formatting = false` in `.mimir.toml` to
+                // suppress these capabilities. See `docs/formatter.md`.
+                document_formatting_provider: Some(OneOf::Left(true)),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
                 // We publish diagnostics as a *push* (via the `Client`) on
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
@@ -2453,6 +2473,71 @@ impl LanguageServer for Backend {
     /// Cheap path: one rope slice on the document text — no parser run,
     /// no workspace scan. If the document isn't open and isn't on disk,
     /// the documentation is left empty.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> LspResult<Option<Vec<TextEdit>>> {
+        let features = self.current_features().await;
+        if !features.formatting {
+            debug!("formatting: disabled by feature toggle");
+            return Ok(None);
+        }
+        let cfg = self.current_formatter_config().await;
+        let source = {
+            let docs = self.documents.read().await;
+            match docs.get(&params.text_document.uri) {
+                Some(state) => state.document.text().to_owned(),
+                None => {
+                    debug!("formatting: URI not in open-doc store");
+                    return Ok(None);
+                }
+            }
+        };
+        let rope = ropey::Rope::from_str(&source);
+        match invoke_verible(&cfg, &source, None).await {
+            Ok(formatted) => Ok(Some(whole_file_edit(&rope, &formatted))),
+            Err(e) => {
+                error!(error = %e, "verible-verilog-format failed; returning no edits");
+                Ok(None)
+            }
+        }
+    }
+
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> LspResult<Option<Vec<TextEdit>>> {
+        let features = self.current_features().await;
+        if !features.formatting {
+            debug!("range_formatting: disabled by feature toggle");
+            return Ok(None);
+        }
+        let cfg = self.current_formatter_config().await;
+        let source = {
+            let docs = self.documents.read().await;
+            match docs.get(&params.text_document.uri) {
+                Some(state) => state.document.text().to_owned(),
+                None => {
+                    debug!("range_formatting: URI not in open-doc store");
+                    return Ok(None);
+                }
+            }
+        };
+        let rope = ropey::Rope::from_str(&source);
+        // LSP line numbers are 0-based; Verible's --lines flag is 1-based.
+        let start_line = params.range.start.line + 1;
+        let end_line = params.range.end.line + 1;
+        match invoke_verible(&cfg, &source, Some(start_line..=end_line)).await {
+            Ok(formatted) => Ok(Some(whole_file_edit(&rope, &formatted))),
+            Err(e) => {
+                error!(error = %e, "verible-verilog-format failed; returning no edits");
+                Ok(None)
+            }
+        }
+    }
+
     #[instrument(level = "debug", skip_all, fields(label = %item.label))]
     async fn completion_resolve(&self, item: CompletionItem) -> LspResult<CompletionItem> {
         let Some(data) = item.data.clone() else {
@@ -2501,6 +2586,31 @@ impl LanguageServer for Backend {
 // --------------------------------------------------------------------------
 // Helpers
 // --------------------------------------------------------------------------
+
+/// Build a single whole-file [`TextEdit`] that replaces the current document
+/// text with `new_text`.
+///
+/// Verible always emits the complete file even when `--lines` constrains which
+/// lines it rewrites, so both `formatting` and `range_formatting` use this
+/// helper to return one encompassing edit. The end position is computed in
+/// UTF-16 code units (the LSP wire format) to satisfy clients that validate
+/// positions against the advertised offset encoding.
+fn whole_file_edit(rope: &ropey::Rope, new_text: &str) -> Vec<TextEdit> {
+    let total_lines = rope.len_lines();
+    let last_line_idx = total_lines.saturating_sub(1);
+    let last_line = rope.line(last_line_idx);
+    let last_col_utf16: u32 = last_line.chars().map(|c| c.len_utf16() as u32).sum();
+    vec![TextEdit {
+        range: Range {
+            start: Position { line: 0, character: 0 },
+            end: Position {
+                line: last_line_idx as u32,
+                character: last_col_utf16,
+            },
+        },
+        new_text: new_text.to_owned(),
+    }]
+}
 
 /// Pick a filesystem path to start `.mimir.toml` discovery from.
 ///
@@ -4660,6 +4770,7 @@ mod tests {
             debounce_ms: 350,
             env: HashMap::new(),
             features: crate::project::FeatureToggles::default(),
+            formatter: crate::project::FormatterConfig::default(),
         }
     }
 
