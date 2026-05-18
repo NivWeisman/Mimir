@@ -2496,6 +2496,23 @@ impl LanguageServer for Backend {
         };
         let rope = ropey::Rope::from_str(&source);
         match invoke_verible(&cfg, &source, None).await {
+            Ok(formatted) if formatted == source => {
+                // Verible exited 0 but returned the input unchanged — almost
+                // always caused by preprocessor guards (`ifdef/`endif) that
+                // span task/function bodies and confuse the parser. Surface
+                // a visible warning so the user isn't left wondering why
+                // "Format Document" appeared to do nothing.
+                warn!("verible-verilog-format produced no changes (likely parse errors; check server log)");
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        "Formatter produced no changes. \
+                         The file may contain preprocessor guards (`ifdef/`endif) that \
+                         verible-verilog-format cannot parse. Check the server log for details.",
+                    )
+                    .await;
+                Ok(None)
+            }
             Ok(formatted) => Ok(Some(whole_file_edit(&rope, &formatted))),
             Err(e) => {
                 error!(error = %e, "verible-verilog-format failed; returning no edits");
@@ -2530,6 +2547,18 @@ impl LanguageServer for Backend {
         let start_line = params.range.start.line + 1;
         let end_line = params.range.end.line + 1;
         match invoke_verible(&cfg, &source, Some(start_line..=end_line)).await {
+            Ok(formatted) if formatted == source => {
+                warn!("verible-verilog-format produced no changes for range {start_line}-{end_line}");
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        "Formatter produced no changes for the selected range. \
+                         The file may contain preprocessor guards (`ifdef/`endif) that \
+                         verible-verilog-format cannot parse. Check the server log for details.",
+                    )
+                    .await;
+                Ok(None)
+            }
             Ok(formatted) => Ok(Some(whole_file_edit(&rope, &formatted))),
             Err(e) => {
                 error!(error = %e, "verible-verilog-format failed; returning no edits");

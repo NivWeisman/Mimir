@@ -181,10 +181,30 @@ pub async fn invoke_verible(
         return Err(FormatError::VeribleFailed { exit_code, stderr });
     }
 
+    // Verible's --failsafe_success (on by default) causes it to exit 0 and
+    // echo the original text unchanged when it encounters parse errors — for
+    // example, files with `ifdef/`endif guards that span task bodies. Log any
+    // stderr warnings so the user can see why formatting was a no-op.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        warn!(
+            stderr = %stderr,
+            "verible-verilog-format exited 0 but reported parse warnings; \
+             output may be unchanged (preprocessor guards often cause this)",
+        );
+    }
+
     let formatted = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    // When Verible can't format a region it echoes it verbatim.  If the
+    // entire output matches the input the caller will produce a no-op edit;
+    // returning the formatted string is still correct, but callers can check
+    // for this case with `formatted == source`.
     debug!(
         input_bytes = source.len(),
         output_bytes = formatted.len(),
+        unchanged = (formatted == source),
         "verible-verilog-format succeeded",
     );
     Ok(formatted)
