@@ -61,7 +61,7 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::completion_score;
-use crate::project::ResolvedProject;
+use crate::project::{FeatureToggles, ResolvedProject};
 use crate::workspace_index::{self, WorkspaceIndex};
 
 /// Per-document state held inside the store.
@@ -192,6 +192,20 @@ impl Backend {
             startup_index_logged: Arc::new(AtomicBool::new(false)),
             workspace_index: Arc::new(RwLock::new(WorkspaceIndex::new())),
         }
+    }
+
+    /// Return the current [`FeatureToggles`] from the resolved project config.
+    ///
+    /// Falls back to [`FeatureToggles::default`] (all toggles `true`) when no
+    /// `.mimir.toml` has been discovered — that keeps every feature on when
+    /// the server is used without a project config file.
+    async fn current_features(&self) -> FeatureToggles {
+        self.project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.features.clone())
+            .unwrap_or_default()
     }
 
     /// Parse the document at `uri` and publish diagnostics to the client.
@@ -1982,7 +1996,12 @@ impl LanguageServer for Backend {
         // (e.g. `always_ff`, `$display`). Runs after slang and the
         // workspace-symbol lookup both miss so it never overrides
         // user-defined symbols that happen to shadow a keyword.
-        Ok(keyword_hover_at(&tree, &rope, target))
+        let features = self.current_features().await;
+        if features.keyword_hover {
+            Ok(keyword_hover_at(&tree, &rope, target))
+        } else {
+            Ok(None)
+        }
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -2063,6 +2082,11 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> LspResult<Option<SemanticTokensResult>> {
+        let features = self.current_features().await;
+        if !features.semantic_tokens {
+            debug!("semantic_tokens_full: disabled by feature toggle");
+            return Ok(None);
+        }
         let uri = params.text_document.uri;
         let Some(tree) = self.cached_tree(&uri).await else {
             debug!("semantic_tokens_full: no tree available");
@@ -2078,7 +2102,11 @@ impl LanguageServer for Backend {
                 }
             }
         };
-        let raw = mimir_syntax::semantic_tokens::semantic_tokens(&tree, &rope);
+        let raw = mimir_syntax::semantic_tokens::semantic_tokens(
+            &tree,
+            &rope,
+            features.format_specs_in_strings,
+        );
         let data = encode_semantic_tokens(&raw);
         debug!(count = data.len(), "semantic_tokens_full returned");
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
@@ -2098,6 +2126,11 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensRangeParams,
     ) -> LspResult<Option<SemanticTokensRangeResult>> {
+        let features = self.current_features().await;
+        if !features.semantic_tokens {
+            debug!("semantic_tokens_range: disabled by feature toggle");
+            return Ok(None);
+        }
         let uri = params.text_document.uri;
         let Some(tree) = self.cached_tree(&uri).await else {
             debug!("semantic_tokens_range: no tree available");
@@ -2128,6 +2161,7 @@ impl LanguageServer for Backend {
             &tree,
             &rope,
             start_byte..end_byte,
+            features.format_specs_in_strings,
         );
         let data = encode_semantic_tokens(&raw);
         debug!(count = data.len(), "semantic_tokens_range returned");
@@ -4625,6 +4659,7 @@ mod tests {
             top: Some("tb_top".into()),
             debounce_ms: 350,
             env: HashMap::new(),
+            features: crate::project::FeatureToggles::default(),
         }
     }
 

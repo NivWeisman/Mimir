@@ -141,6 +141,69 @@ pub struct ProjectConfig {
     /// ```
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Optional per-feature on/off toggles. Lets a workspace turn off
+    /// specific LSP-side helpers when they're unwanted (e.g. semantic
+    /// tokens, format-spec sub-coloring inside strings, keyword hover
+    /// help). All flags default to `true` — an empty `[features]`
+    /// table is equivalent to omitting it.
+    ///
+    /// ```toml
+    /// [features]
+    /// semantic_tokens = false           # turn off LSP semantic highlighting entirely
+    /// format_specs_in_strings = false   # whole-string color instead of per-`%fmt`
+    /// keyword_hover = false             # no popup on `always_ff` / `$display` / …
+    /// ```
+    #[serde(default)]
+    pub features: FeatureToggles,
+}
+
+/// `[features]` section of `.mimir.toml`. Each field gates one
+/// LSP-side helper; `Default::default()` returns "every feature on",
+/// so existing projects that don't yet have the table pick up the
+/// same behaviour they had before this section existed.
+///
+/// Toggles are honoured at *handler* time, not at `initialize`-time
+/// capability-registration time — that way editing `.mimir.toml` to
+/// flip a flag takes effect on the next request after re-hydration,
+/// without needing the client to renegotiate capabilities.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureToggles {
+    /// Master switch for `textDocument/semanticTokens` (full + range).
+    /// When `false`, handlers return `None` so the client falls back
+    /// to its TextMate grammar.
+    #[serde(default = "default_true")]
+    pub semantic_tokens: bool,
+
+    /// Within string literals, emit a separate `regexp`-classified
+    /// sub-token for each `%`-format specifier (`%0d`, `%h`, `%s`, …)
+    /// so themes can color them distinctly from the surrounding
+    /// string body. When `false`, each `string_literal` emits one
+    /// whole-string token (the pre-feature behaviour). Has no effect
+    /// when `semantic_tokens` is `false`.
+    #[serde(default = "default_true")]
+    pub format_specs_in_strings: bool,
+
+    /// Keyword / system-task hover help fallback. When `false`,
+    /// hovering on `always_ff` / `$display` / … returns no popup
+    /// (matches the pre-feature behaviour).
+    #[serde(default = "default_true")]
+    pub keyword_hover: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for FeatureToggles {
+    fn default() -> Self {
+        Self {
+            semantic_tokens: true,
+            format_specs_in_strings: true,
+            keyword_hover: true,
+        }
+    }
 }
 
 /// `[slang]` section of `.mimir.toml`.
@@ -234,6 +297,10 @@ pub struct ResolvedProject {
     /// when looking up `MIMIR_SLANG_PATH`. Empty when no `[env]` table is
     /// present.
     pub env: HashMap<String, String>,
+    /// Per-feature on/off toggles (from `[features]` in `.mimir.toml`).
+    /// Every flag defaults to `true`, so a project without the table
+    /// behaves exactly as it did before the table existed.
+    pub features: FeatureToggles,
 }
 
 impl ResolvedProject {
@@ -327,6 +394,7 @@ impl ResolvedProject {
             top: cfg.slang.top,
             debounce_ms: cfg.slang.debounce_ms,
             env,
+            features: cfg.features,
         })
     }
 }
@@ -557,6 +625,37 @@ mod tests {
         assert!(cfg.slang.top.is_none());
         assert_eq!(cfg.slang.debounce_ms, DEFAULT_DEBOUNCE_MS);
         assert!(cfg.env.is_empty());
+        // Every feature toggle defaults to ON.
+        assert!(cfg.features.semantic_tokens);
+        assert!(cfg.features.format_specs_in_strings);
+        assert!(cfg.features.keyword_hover);
+    }
+
+    /// `[features]` table parses; missing fields keep their defaults.
+    #[test]
+    fn project_config_features_section_decodes() {
+        let toml_text = r#"
+            [features]
+            semantic_tokens = false
+            format_specs_in_strings = false
+        "#;
+        let cfg: ProjectConfig = toml::from_str(toml_text).unwrap();
+        assert!(!cfg.features.semantic_tokens);
+        assert!(!cfg.features.format_specs_in_strings);
+        // Not specified — picks up the default.
+        assert!(cfg.features.keyword_hover);
+    }
+
+    /// Unknown keys inside `[features]` are rejected — same `deny_unknown_fields`
+    /// policy the other tables use, so a typo'd toggle name fails loudly
+    /// instead of silently doing nothing.
+    #[test]
+    fn project_config_features_rejects_unknown_keys() {
+        let bad = r#"
+            [features]
+            semanitc_tokens = true
+        "#;
+        assert!(toml::from_str::<ProjectConfig>(bad).is_err());
     }
 
     /// `[env]` table parses into a key-value map.

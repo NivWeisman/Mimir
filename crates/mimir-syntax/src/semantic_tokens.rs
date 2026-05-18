@@ -88,6 +88,10 @@ pub enum TokenType {
     String = 10,
     /// Numeric literal (integer, real, time).
     Number = 11,
+    /// `%`-format specifier inside a string literal (`%0d`, `%h`, `%s`, …).
+    /// Uses the LSP standard `regexp` token type so themes can colour it
+    /// distinctly from the surrounding string body.
+    Regexp = 12,
 }
 
 impl TokenType {
@@ -109,6 +113,7 @@ impl TokenType {
             Self::Comment => "comment",
             Self::String => "string",
             Self::Number => "number",
+            Self::Regexp => "regexp",
         }
     }
 
@@ -128,6 +133,7 @@ impl TokenType {
             Self::Comment,
             Self::String,
             Self::Number,
+            Self::Regexp,
         ]
     }
 }
@@ -186,10 +192,16 @@ pub struct RawToken {
 /// Returns tokens sorted by `(line, start_col)` — DFS pre-order over
 /// the parse tree produces source order naturally; the contract is
 /// asserted in unit tests.
+///
+/// When `format_specs` is `true` each `string_literal` is split into
+/// alternating [`TokenType::String`] / [`TokenType::Regexp`] sub-tokens
+/// so editors can colour `%`-format specifiers differently from the
+/// surrounding text. Pass `false` to get the pre-feature behaviour (one
+/// whole-string token per literal).
 #[must_use]
-pub fn semantic_tokens(tree: &SyntaxTree, rope: &Rope) -> Vec<RawToken> {
+pub fn semantic_tokens(tree: &SyntaxTree, rope: &Rope, format_specs: bool) -> Vec<RawToken> {
     let mut out = Vec::new();
-    walk(tree.tree.root_node(), rope, None, &mut out);
+    walk(tree.tree.root_node(), rope, None, format_specs, &mut out);
     trace!(count = out.len(), "collected semantic tokens");
     out
 }
@@ -199,15 +211,17 @@ pub fn semantic_tokens(tree: &SyntaxTree, rope: &Rope) -> Vec<RawToken> {
 /// `semanticTokens/range` requests so a huge file's coloring cost
 /// scales with the visible viewport rather than the whole document.
 ///
-/// `byte_range` is `[start, end)` in source bytes.
+/// `byte_range` is `[start, end)` in source bytes. `format_specs` has
+/// the same meaning as in [`semantic_tokens`].
 #[must_use]
 pub fn semantic_tokens_in_range(
     tree: &SyntaxTree,
     rope: &Rope,
     byte_range: std::ops::Range<usize>,
+    format_specs: bool,
 ) -> Vec<RawToken> {
     let mut out = Vec::new();
-    walk(tree.tree.root_node(), rope, Some(byte_range), &mut out);
+    walk(tree.tree.root_node(), rope, Some(byte_range), format_specs, &mut out);
     trace!(count = out.len(), "collected semantic tokens (ranged)");
     out
 }
@@ -227,6 +241,7 @@ fn walk(
     node: Node<'_>,
     rope: &Rope,
     range: Option<std::ops::Range<usize>>,
+    format_specs: bool,
     out: &mut Vec<RawToken>,
 ) {
     // Range filter: skip whole subtrees that don't overlap.
@@ -246,7 +261,11 @@ fn walk(
             return;
         }
         "string_literal" => {
-            push(node, rope, TokenType::String, TokenModifier::NONE, out);
+            if format_specs {
+                emit_string_with_format_specs(node, rope, out);
+            } else {
+                push(node, rope, TokenType::String, TokenModifier::NONE, out);
+            }
             return;
         }
         "integral_number" | "real_number" | "time_literal" => {
@@ -282,7 +301,7 @@ fn walk(
     // ── otherwise descend.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(child, rope, range.clone(), out);
+        walk(child, rope, range.clone(), format_specs, out);
     }
 }
 
@@ -322,6 +341,137 @@ fn push(
         token_type: token_type as u32,
         modifiers: modifiers.0,
     });
+}
+
+/// Push one [`RawToken`] directly from absolute byte offsets rather than a
+/// tree-sitter `Node`. Used for sub-tokens within a `string_literal` where
+/// we have no per-fragment node to hand to [`push`].
+fn push_bytes(
+    start_byte: usize,
+    end_byte: usize,
+    line: u32,
+    line_start_byte: usize,
+    rope: &Rope,
+    token_type: TokenType,
+    out: &mut Vec<RawToken>,
+) {
+    if end_byte <= start_byte {
+        return;
+    }
+    let start_col = utf16_len_between(rope, line_start_byte, start_byte);
+    let length = utf16_len_between(rope, start_byte, end_byte);
+    if length == 0 {
+        return;
+    }
+    out.push(RawToken {
+        line,
+        start_col,
+        length,
+        token_type: token_type as u32,
+        modifiers: TokenModifier::NONE.0,
+    });
+}
+
+/// Returns `true` for the ASCII bytes that legally terminate a SystemVerilog
+/// `%`-format specifier (`%d`, `%0h`, `%8.0f`, …). The set is from IEEE
+/// 1800-2017 §21.2.
+fn is_sv_fmt_type(b: u8) -> bool {
+    matches!(
+        b,
+        b'b' | b'B'
+            | b'o' | b'O'
+            | b'd' | b'D'
+            | b'h' | b'H'
+            | b'x' | b'X'
+            | b's' | b'S'
+            | b'e' | b'E'
+            | b'f' | b'F'
+            | b'g' | b'G'
+            | b't'
+            | b'm' | b'M'
+            | b'p'
+            | b'u'
+            | b'v'
+            | b'z'
+            | b'c'
+            | b'0'
+    )
+}
+
+/// Split `string_literal` node into alternating [`TokenType::String`] and
+/// [`TokenType::Regexp`] tokens, where `Regexp` covers each `%…` format
+/// specifier and `String` covers everything else (including the surrounding
+/// quote characters).
+///
+/// Falls through to a single whole-string token when no recognised specifiers
+/// are present, matching the pre-feature behaviour exactly.
+///
+/// SV string literals are always single-line — `\n` inside a literal is the
+/// two-character escape sequence, not a real newline — so all sub-tokens share
+/// the node's line number.
+fn emit_string_with_format_specs(node: Node<'_>, rope: &Rope, out: &mut Vec<RawToken>) {
+    let start_byte = node.start_byte();
+    let end_byte = node.end_byte();
+    let line = node.start_position().row as u32;
+    let line_start = rope.line_to_byte(line as usize);
+
+    // Collect bytes for ASCII scanning. Format specs are always ASCII so
+    // multi-byte UTF-8 sequences in the surrounding text can't false-match.
+    let text: Vec<u8> = rope.byte_slice(start_byte..end_byte).bytes().collect();
+
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    while i < text.len() {
+        if text[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        let spec_start = i;
+        i += 1;
+        // "%%" is an escaped percent — not a format spec.
+        if i < text.len() && text[i] == b'%' {
+            i += 1;
+            continue;
+        }
+        // Consume optional width / precision: digits and '.'.
+        while i < text.len() && (text[i].is_ascii_digit() || text[i] == b'.') {
+            i += 1;
+        }
+        // Must end with a recognised type character to be a valid spec.
+        if i < text.len() && is_sv_fmt_type(text[i]) {
+            i += 1;
+            push_bytes(
+                start_byte + seg_start,
+                start_byte + spec_start,
+                line,
+                line_start,
+                rope,
+                TokenType::String,
+                out,
+            );
+            push_bytes(
+                start_byte + spec_start,
+                start_byte + i,
+                line,
+                line_start,
+                rope,
+                TokenType::Regexp,
+                out,
+            );
+            seg_start = i;
+        }
+        // Otherwise not a recognised spec — continue scanning.
+    }
+    // Remaining text after the last spec (or the whole literal if none found).
+    push_bytes(
+        start_byte + seg_start,
+        end_byte,
+        line,
+        line_start,
+        rope,
+        TokenType::String,
+        out,
+    );
 }
 
 /// UTF-16 code-unit count between two byte offsets in `rope`.
@@ -462,10 +612,14 @@ mod tests {
     use mimir_core::logging::init_for_tests;
 
     fn classify(src: &str) -> Vec<RawToken> {
+        classify_with(src, false)
+    }
+
+    fn classify_with(src: &str, format_specs: bool) -> Vec<RawToken> {
         init_for_tests();
         let mut parser = SyntaxParser::new().expect("parser");
         let tree = parser.parse(src, None).expect("parse");
-        semantic_tokens(&tree, &Rope::from_str(src))
+        semantic_tokens(&tree, &Rope::from_str(src), format_specs)
     }
 
     fn find_token<'a>(toks: &'a [RawToken], src: &str, needle: &str, rope: &Rope) -> &'a RawToken {
@@ -666,7 +820,7 @@ mod tests {
         init_for_tests();
         let mut parser = SyntaxParser::new().expect("parser");
         let tree = parser.parse(src, None).expect("parse");
-        let toks = semantic_tokens_in_range(&tree, &rope, line1_start..line2_start);
+        let toks = semantic_tokens_in_range(&tree, &rope, line1_start..line2_start, false);
 
         // Every emitted token must lie on line 1.
         for t in &toks {
@@ -683,7 +837,7 @@ mod tests {
     fn legend_length_matches_variant_count() {
         // Adding a TokenType variant without updating `legend()` would
         // make the wire format silently misaligned; this is the canary.
-        assert_eq!(TokenType::legend().len(), 12);
+        assert_eq!(TokenType::legend().len(), 13);
         assert_eq!(TokenModifier::legend_names().len(), 2);
     }
 
@@ -696,5 +850,89 @@ mod tests {
                 *t as u32
             );
         }
+    }
+
+    // ── format-specifier sub-token tests ──────────────────────────────────
+
+    #[test]
+    fn format_spec_tokens_split() {
+        // Two format specs in one string: %0d and %h.
+        // Expected: "hi: " → String, "%0d" → Regexp, " and " → String,
+        //           "%h" → Regexp, "!" → String.
+        let src = "module m;\n  initial $display(\"hi: %0d and %h!\", x, y);\nendmodule\n";
+        let toks = classify_with(src, true);
+        let strings: Vec<_> = toks
+            .iter()
+            .filter(|t| t.token_type == TokenType::String as u32)
+            .collect();
+        let regexps: Vec<_> = toks
+            .iter()
+            .filter(|t| t.token_type == TokenType::Regexp as u32)
+            .collect();
+        assert_eq!(regexps.len(), 2, "expected 2 Regexp tokens, got {toks:#?}");
+        // String tokens: text before first spec, between specs, after last spec.
+        assert_eq!(strings.len(), 3, "expected 3 String tokens, got {toks:#?}");
+        // Tokens must be in source order (left to right by start_col).
+        let line_toks: Vec<_> = toks
+            .iter()
+            .filter(|t| {
+                t.token_type == TokenType::String as u32
+                    || t.token_type == TokenType::Regexp as u32
+            })
+            .filter(|t| t.line == strings[0].line)
+            .collect();
+        for w in line_toks.windows(2) {
+            assert!(
+                w[0].start_col < w[1].start_col,
+                "tokens out of order: {:#?}",
+                line_toks
+            );
+        }
+    }
+
+    #[test]
+    fn string_no_specs_single_token() {
+        // A plain string with no format specs: should produce exactly one
+        // String token covering the whole literal, same as format_specs=false.
+        let src = "module m;\n  string s = \"hello world\";\nendmodule\n";
+        let toks = classify_with(src, true);
+        let rope = Rope::from_str(src);
+        let s = find_token(&toks, src, "\"hello world\"", &rope);
+        assert_eq!(s.token_type, TokenType::String as u32);
+        let on_line: Vec<_> = toks
+            .iter()
+            .filter(|t| t.line == s.line)
+            .filter(|t| t.start_col >= s.start_col && t.start_col < s.start_col + s.length)
+            .collect();
+        assert_eq!(
+            on_line.len(),
+            1,
+            "expected exactly one token in the plain string span, got {on_line:#?}"
+        );
+    }
+
+    #[test]
+    fn double_percent_not_spec() {
+        // "%%" is an escaped percent and must NOT be treated as a format spec.
+        let src = "module m;\n  initial $display(\"100%%\");\nendmodule\n";
+        let toks = classify_with(src, true);
+        assert!(
+            toks.iter().all(|t| t.token_type != TokenType::Regexp as u32),
+            "no Regexp tokens expected for '%%', got {toks:#?}"
+        );
+    }
+
+    #[test]
+    fn format_specs_off_single_token() {
+        // With format_specs=false the whole string_literal is one String token.
+        let src = "module m;\n  initial $display(\"hi: %0d\");\nendmodule\n";
+        let toks = classify_with(src, false);
+        let rope = Rope::from_str(src);
+        let s = find_token(&toks, src, "\"hi: %0d\"", &rope);
+        assert_eq!(s.token_type, TokenType::String as u32);
+        assert!(
+            toks.iter().all(|t| t.token_type != TokenType::Regexp as u32),
+            "no Regexp tokens expected when format_specs=false, got {toks:#?}"
+        );
     }
 }
