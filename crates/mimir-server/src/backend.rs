@@ -2495,16 +2495,25 @@ impl LanguageServer for Backend {
             }
         };
         let rope = ropey::Rope::from_str(&source);
-        let (wrapped, has_ifdefs) = wrap_ifdefs(&source);
-        if has_ifdefs {
-            warn!(
-                "formatting: file contains `ifdef/`ifndef blocks; \
-                 wrapping them with format-off pragmas so Verible can parse the rest"
-            );
-        }
+        let (wrapped, has_ifdefs) = if cfg.wrap_ifdefs {
+            let (w, flag) = wrap_ifdefs(&source);
+            if flag {
+                warn!(
+                    "formatting: file contains `ifdef/`ifndef blocks; \
+                     wrapping them with format-off pragmas so Verible can parse the rest"
+                );
+            }
+            (w, flag)
+        } else {
+            (source.clone(), false)
+        };
         match invoke_verible(&cfg, &wrapped, None).await {
             Ok(raw_formatted) => {
-                let formatted = strip_mimir_pragmas(&raw_formatted);
+                let formatted = if has_ifdefs {
+                    strip_mimir_pragmas(&raw_formatted)
+                } else {
+                    raw_formatted
+                };
                 if formatted == source {
                     // Verible returned the file unchanged even after we removed
                     // the injected pragmas.  This shouldn't happen for well-formed
@@ -2565,16 +2574,25 @@ impl LanguageServer for Backend {
         // LSP line numbers are 0-based; Verible's --lines flag is 1-based.
         let start_line = params.range.start.line + 1;
         let end_line = params.range.end.line + 1;
-        let (wrapped, has_ifdefs) = wrap_ifdefs(&source);
-        if has_ifdefs {
-            warn!(
-                "range_formatting: file contains `ifdef/`ifndef blocks; \
-                 wrapping them with format-off pragmas"
-            );
-        }
+        let (wrapped, has_ifdefs) = if cfg.wrap_ifdefs {
+            let (w, flag) = wrap_ifdefs(&source);
+            if flag {
+                warn!(
+                    "range_formatting: file contains `ifdef/`ifndef blocks; \
+                     wrapping them with format-off pragmas"
+                );
+            }
+            (w, flag)
+        } else {
+            (source.clone(), false)
+        };
         match invoke_verible(&cfg, &wrapped, Some(start_line..=end_line)).await {
             Ok(raw_formatted) => {
-                let formatted = strip_mimir_pragmas(&raw_formatted);
+                let formatted = if has_ifdefs {
+                    strip_mimir_pragmas(&raw_formatted)
+                } else {
+                    raw_formatted
+                };
                 if formatted == source {
                     warn!(
                         "verible-verilog-format produced no changes for range \

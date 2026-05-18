@@ -58,6 +58,32 @@ default, listed in the table below.
 | `class_member_variable_alignment` | `--class_member_variable_alignment` | string | `"flush-left"` | Column alignment for class member variable declarations. |
 | `struct_union_members_alignment` | `--struct_union_members_alignment` | string | `"flush-left"` | Column alignment for `struct` and `union` member declarations. |
 | `extra_args` | _(pass-through)_ | string array | `[]` | Raw flags appended verbatim to every Verible invocation. Use for any flag not listed above. |
+| `wrap_ifdefs` | _(mimir only)_ | bool | `true` | When `true`, mimir wraps `` `ifdef ``/`` `ifndef `` blocks with `/* verilog_format: off/on */` pragmas before invoking Verible. This lets Verible reformat surrounding code even when preprocessor guards span statement boundaries (common in UVM and simulator-specific blocks). Set to `false` to pass source text unmodified. |
+
+### `wrap_ifdefs` details
+
+Verible exits 0 but returns the file unchanged when it encounters `` `ifdef ``
+blocks that span statement boundaries (e.g. simulator guards like `` `ifdef VCS
+if (!triggered) `endif``). With `wrap_ifdefs = true` (default) mimir
+automatically detects these blocks and inserts temporary `/* verilog_format:
+off/on */` markers around them so the rest of the file is still reformatted.
+The markers are stripped from Verible's output before the edit is applied.
+
+**Header guards** (a top-level `` `ifndef X `` / `` `define X `` … `` `endif ``
+spanning the whole file) are handled specially: only the three guard lines
+themselves are frozen; the file body is still formatted normally, and nested
+`` `ifdef `` blocks inside the body are individually wrapped.
+
+`` `else `` and `` `elsif `` branches are transparent — they live inside an
+already-frozen block and do not need separate wrapping.
+
+Set `wrap_ifdefs = false` if you manage format-off pragmas yourself or find the
+automatic wrapping interferes with your workflow:
+
+```toml
+[formatter]
+wrap_ifdefs = false
+```
 
 ### Alignment values
 

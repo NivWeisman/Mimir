@@ -378,6 +378,15 @@ pub struct FormatterConfig {
     /// ```
     #[serde(default)]
     pub extra_args: Vec<String>,
+
+    /// When `true` (default), mimir wraps `` `ifdef ``/`` `ifndef `` blocks
+    /// with `/* verilog_format: off/on */` pragmas before invoking Verible so
+    /// the formatter can still reformat surrounding code even when preprocessor
+    /// guards span statement boundaries.  Set to `false` to pass source text
+    /// to Verible unmodified (the old behaviour; may produce no-op formatting
+    /// on files with simulator guards).
+    #[serde(default = "default_true")]
+    pub wrap_ifdefs: bool,
 }
 
 impl FormatterConfig {
@@ -403,6 +412,7 @@ impl Default for FormatterConfig {
             class_member_variable_alignment: None,
             struct_union_members_alignment: None,
             extra_args: Vec::new(),
+            wrap_ifdefs: true,
         }
     }
 }
@@ -1114,6 +1124,7 @@ mod tests {
         assert!(cfg.formatter.try_wrap_long_lines.is_none());
         assert!(cfg.formatter.port_declarations_alignment.is_none());
         assert!(cfg.formatter.extra_args.is_empty());
+        assert!(cfg.formatter.wrap_ifdefs, "wrap_ifdefs should default to true");
     }
 
     /// `[formatter]` fields round-trip correctly including `extra_args`.
@@ -1151,6 +1162,15 @@ mod tests {
             Some("preserve")
         );
         assert_eq!(cfg.formatter.extra_args, ["--expand_coverpoints", "--failsafe_success=false"]);
+        assert!(cfg.formatter.wrap_ifdefs, "wrap_ifdefs should default to true");
+    }
+
+    /// `wrap_ifdefs = false` round-trips correctly.
+    #[test]
+    fn formatter_config_wrap_ifdefs_can_be_disabled() {
+        let toml_text = "[formatter]\nwrap_ifdefs = false\n";
+        let cfg: ProjectConfig = toml::from_str(toml_text).unwrap();
+        assert!(!cfg.formatter.wrap_ifdefs);
     }
 
     /// Unknown keys inside `[formatter]` are rejected the same way as other
