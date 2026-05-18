@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use mimir_syntax::{Symbol, SyntaxParser};
+use mimir_syntax::{Symbol, SyntaxParser, SyntaxTree};
 use ropey::Rope;
 use tower_lsp::lsp_types::Url;
 use tracing::{debug, trace, warn};
@@ -123,8 +123,10 @@ impl WorkspaceIndex {
 }
 
 /// Parse every path in `paths` (plus everything they `` `include`` ,
-/// transitively) and build a `(Url, Vec<Symbol>)` pair for each one we
-/// could read.
+/// transitively) and build a `(Url, Vec<Symbol>, SyntaxTree)` triple for
+/// each one we could read. The caller receives both the symbol index
+/// (for [`WorkspaceIndex::update`]) and the raw parse tree (for the
+/// workspace tree cache used by `textDocument/references`).
 ///
 /// `include_dirs` is consulted by [`crate::includes::expand_includes`] when
 /// resolving relative `` `include`` filenames; the file's own directory is
@@ -151,9 +153,9 @@ pub fn hydrate_from_paths(
     include_dirs: &[PathBuf],
     parser: &mut SyntaxParser,
     mut read_disk: impl FnMut(&Path) -> Option<String>,
-) -> Vec<(Url, Vec<Symbol>)> {
+) -> Vec<(Url, Vec<Symbol>, SyntaxTree)> {
     let all_paths = crate::includes::expand_includes(paths, include_dirs, &mut read_disk);
-    let mut out: Vec<(Url, Vec<Symbol>)> = Vec::with_capacity(all_paths.len());
+    let mut out: Vec<(Url, Vec<Symbol>, SyntaxTree)> = Vec::with_capacity(all_paths.len());
     for path in &all_paths {
         let Some(text) = read_disk(path) else {
             warn!(path = %path.display(), "workspace index: file unreadable; skipping");
@@ -172,7 +174,7 @@ pub fn hydrate_from_paths(
                     count = symbols.len(),
                     "workspace index: parsed",
                 );
-                out.push((url, symbols));
+                out.push((url, symbols, tree));
             }
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "workspace index: parse failed");
@@ -288,13 +290,13 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         // a.sv -> module 'a'
-        let (u_a, syms_a) = &result[0];
+        let (u_a, syms_a, _tree_a) = &result[0];
         assert_eq!(u_a, &Url::from_file_path(&p1).unwrap());
         assert!(syms_a
             .iter()
             .any(|s| s.name == "a" && s.kind == SymbolKind::Module));
         // b.sv -> class 'b'
-        let (u_b, syms_b) = &result[1];
+        let (u_b, syms_b, _tree_b) = &result[1];
         assert_eq!(u_b, &Url::from_file_path(&p2).unwrap());
         assert!(syms_b
             .iter()
@@ -373,7 +375,7 @@ mod tests {
         assert_eq!(result.len(), 2);
         let names: Vec<String> = result
             .iter()
-            .flat_map(|(_, syms)| syms.iter().map(|s| s.name.clone()))
+            .flat_map(|(_, syms, _)| syms.iter().map(|s| s.name.clone()))
             .collect();
         assert!(
             names.contains(&"uvm_pkg".to_string()),

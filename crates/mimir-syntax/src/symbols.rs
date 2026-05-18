@@ -1077,6 +1077,34 @@ fn walk_for_occurrences(
     }
 }
 
+/// Find all occurrences of `name` in the file, pruning subtrees where
+/// `name` is locally re-declared (shadowing). Unlike [`occurrences_of_at`],
+/// which anchors to a specific cursor position and returns only occurrences
+/// visible from that position's scope, this variant returns *all*
+/// non-shadowed occurrences file-wide — suitable for cross-file reference
+/// scanning where there is no cursor anchor.
+///
+/// Calls [`walk_for_occurrences_scoped`] from the file root so any nested
+/// scope that introduces its own binding for `name` is pruned: a local
+/// `int foo;` inside `function bar` will not pollute results when the
+/// caller is searching for a module-level `foo`.
+///
+/// Returns an empty `Vec` for an empty `name` (defensive — saves the walk).
+#[must_use]
+pub fn occurrences_of_scoped(tree: &SyntaxTree, rope: &Rope, name: &str) -> Vec<Range> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk_for_occurrences_scoped(tree.tree.root_node(), tree.source(), rope, name, &mut out, true);
+    trace!(
+        name,
+        count = out.len(),
+        "collected scope-pruned identifier occurrences"
+    );
+    out
+}
+
 // --------------------------------------------------------------------------
 // occurrences_of_at  (scope-aware)
 // --------------------------------------------------------------------------
@@ -1235,9 +1263,13 @@ fn walk_for_occurrences_scoped(
         }
         return;
     }
+    // Propagate `is_root` through non-scope intermediate nodes (e.g. `source_file`)
+    // so the guard reaches the first scope boundary. Once inside a scope
+    // (is_root consumed), children are always `false`.
+    let child_is_root = is_root && !is_scope_kind(node.kind());
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_for_occurrences_scoped(child, source, rope, name, out, false);
+        walk_for_occurrences_scoped(child, source, rope, name, out, child_is_root);
     }
 }
 
@@ -1768,6 +1800,15 @@ endclass
         occurrences_of_at(&tree, &rope, Position::new(line, col))
     }
 
+    /// Helper: parse `src` and return shadow-pruned file-wide occurrences
+    /// of `name`. Mirrors what `collect_references` uses for non-cursor files.
+    fn occ_scoped(src: &str, name: &str) -> Vec<Range> {
+        init_for_tests();
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        occurrences_of_scoped(&tree, &Rope::from_str(src), name)
+    }
+
     #[test]
     fn occurrences_finds_all_uses() {
         // `W` appears 3 times: declaration, in `[W-1:0]`, and on the RHS
@@ -1836,6 +1877,51 @@ endpackage
             hits.len(),
             4,
             "expected 4 x occurrences (2 decls + 2 assigns), got {hits:#?}",
+        );
+    }
+
+    #[test]
+    fn occurrences_of_scoped_prunes_shadowing_scope() {
+        // `foo` is declared locally in function `f` — its occurrences inside
+        // `f` must be pruned. The file-level `foo` reference (instantiation)
+        // must still be returned.
+        let src = "\
+module top;
+  foo u_foo(.clk(clk));
+  function void f();
+    int foo;
+    foo = 1;
+  endfunction
+endmodule
+";
+        let hits = occ_scoped(src, "foo");
+        // Only the instantiation `foo` at the top level.
+        // The local `int foo` declaration and `foo = 1` inside `f` are pruned.
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected 1 scoped occurrence (instantiation only), got {hits:#?}"
+        );
+    }
+
+    #[test]
+    fn occurrences_of_scoped_includes_file_level_and_non_shadowed() {
+        // `W` is not re-declared in any inner scope, so all occurrences are
+        // returned — same as occurrences_of for this case.
+        let src = "\
+module m;
+  parameter int W = 8;
+  logic [W-1:0] x;
+  function void f();
+    logic [W-1:0] y;
+  endfunction
+endmodule
+";
+        let hits = occ_scoped(src, "W");
+        assert_eq!(
+            hits.len(),
+            3,
+            "expected 3 W occurrences (decl + x range + f's y range), got {hits:#?}"
         );
     }
 

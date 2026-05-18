@@ -170,6 +170,15 @@ pub(crate) struct Backend {
     /// [`workspace_index`] for the data structure and the open-vs-disk
     /// precedence rules.
     workspace_index: Arc<RwLock<WorkspaceIndex>>,
+
+    /// Cached parse trees for all known files (filelist-hydrated and open
+    /// documents). Updated alongside `workspace_index` on every hydration
+    /// pass and on every successful `reparse_and_publish` for open files,
+    /// so that closing a file after editing it does not introduce a
+    /// stale-tree window. The `references` handler queries this for closed
+    /// files (those absent from the open-document store), replacing the
+    /// former "declaration sites only" fallback with full occurrence scans.
+    workspace_trees: Arc<RwLock<HashMap<Url, SyntaxTree>>>,
 }
 
 impl Backend {
@@ -192,6 +201,7 @@ impl Backend {
             last_elaborate_input_hash: Arc::new(RwLock::new(None)),
             startup_index_logged: Arc::new(AtomicBool::new(false)),
             workspace_index: Arc::new(RwLock::new(WorkspaceIndex::new())),
+            workspace_trees: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -268,8 +278,14 @@ impl Backend {
         // the version we parsed is still the live one — otherwise a
         // `did_change` landed mid-parse and our results are already stale.
         // When the write does happen, also fold the new symbols into the
-        // workspace index so cross-file F12 sees them.
+        // workspace index and update the workspace tree cache so that
+        // closing this file after editing it doesn't leave a stale tree.
         if let Some((index, tree)) = new_state {
+            // Clone the tree before moving it into the doc store so the
+            // workspace tree cache gets the same fresh snapshot.
+            // `SyntaxTree` clones cheaply — `tree_sitter::Tree` is backed
+            // by a reference-counted C struct.
+            let tree_for_cache = tree.clone();
             let updated = {
                 let mut docs = self.documents.write().await;
                 match docs.get_mut(&uri) {
@@ -283,11 +299,13 @@ impl Backend {
                 }
             };
             if updated {
-                // Workspace lock acquired *after* the doc-store lock is
+                // Workspace locks acquired *after* the doc-store lock is
                 // dropped — no nested locks, no risk of an ordering
                 // deadlock with the hydration task.
                 let mut wi = self.workspace_index.write().await;
                 wi.update(uri.clone(), &index);
+                let mut wt = self.workspace_trees.write().await;
+                wt.insert(uri.clone(), tree_for_cache);
             }
         }
 
@@ -516,8 +534,16 @@ impl Backend {
                 *self.project.write().await = Some(resolved);
                 let parser = self.parser.clone();
                 let workspace_index = self.workspace_index.clone();
+                let workspace_trees = self.workspace_trees.clone();
                 tokio::spawn(async move {
-                    hydrate_workspace_index(paths, include_dirs, parser, workspace_index).await;
+                    hydrate_workspace_index(
+                        paths,
+                        include_dirs,
+                        parser,
+                        workspace_index,
+                        workspace_trees,
+                    )
+                    .await;
                 });
             }
             Ok(None) => {
@@ -563,9 +589,11 @@ impl Backend {
             )
         };
         let mut wi = self.workspace_index.write().await;
-        for (url, syms) in entries {
+        let mut wt = self.workspace_trees.write().await;
+        for (url, syms, tree) in entries {
             debug!(url = %url, count = syms.len(), "re-hydrated single file");
-            wi.update(url, &syms);
+            wi.update(url.clone(), &syms);
+            wt.insert(url, tree);
         }
     }
 
@@ -1391,11 +1419,19 @@ impl LanguageServer for Backend {
                     let include_dirs = resolved.include_dirs.clone();
                     let parser = self.parser.clone();
                     let workspace_index = self.workspace_index.clone();
+                    let workspace_trees = self.workspace_trees.clone();
                     // Snapshot the first project file before the move so we
                     // can build a stable startup-elaborate trigger URI.
                     let first_project_file = paths.first().cloned();
                     tokio::spawn(async move {
-                        hydrate_workspace_index(paths, include_dirs, parser, workspace_index).await;
+                        hydrate_workspace_index(
+                            paths,
+                            include_dirs,
+                            parser,
+                            workspace_index,
+                            workspace_trees,
+                        )
+                        .await;
                     });
                     *self.project.write().await = Some(resolved);
 
@@ -1455,6 +1491,11 @@ impl LanguageServer for Backend {
                 // miss. Stage 3 will route to slang when the sidecar is
                 // configured.
                 definition_provider: Some(OneOf::Left(true)),
+                // textDocument/declaration: slang-first (reuses definition
+                // RPC, which resolves to declaration sites) with tree-sitter
+                // workspace-index fallback. Prototype-vs-body distinction
+                // (`extern function` / `pure virtual`) is a v2 slice.
+                declaration_provider: Some(DeclarationCapability::Simple(true)),
                 // `documentSymbol` reuses the same cached index — same data,
                 // free checkbox. The editor uses it to render the outline
                 // view and to drive symbol-aware navigation shortcuts.
@@ -1736,6 +1777,8 @@ impl LanguageServer for Backend {
                     debug!(path = %path.display(), "watched file deleted; evicting");
                     let mut wi = self.workspace_index.write().await;
                     wi.update(evt.uri.clone(), &[]);
+                    let mut wt = self.workspace_trees.write().await;
+                    wt.remove(&evt.uri);
                 }
                 FileChangeType::CREATED | FileChangeType::CHANGED => {
                     if is_mimir_toml {
@@ -1781,6 +1824,38 @@ impl LanguageServer for Backend {
         match route_definition(outcome) {
             DefinitionRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang definition resolved");
+                Ok(slang_locations_to_response(locs))
+            }
+            DefinitionRoute::UseSyntaxFallback => Ok(self.syntax_definition(&uri, target).await),
+        }
+    }
+
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
+    async fn goto_declaration(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> LspResult<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        // Slang's `definition` RPC resolves to declaration sites (the
+        // identifier token where a symbol is declared, not a body start).
+        // Reuse it here — no dedicated `declaration` RPC exists in the
+        // sidecar protocol. Transport errors fall through to the tree-sitter
+        // workspace index, same as `goto_definition`.
+        //
+        // v2 deferral: prototype-vs-body distinction for `extern function` /
+        // `pure virtual` requires either a dedicated slang RPC or
+        // `is_prototype` tracking in the symbol index.
+        let outcome = self.try_slang_definition(&uri, target).await;
+        match route_definition(outcome) {
+            DefinitionRoute::UseSlangResult(locs) => {
+                debug!(count = locs.len(), "slang declaration resolved");
                 Ok(slang_locations_to_response(locs))
             }
             DefinitionRoute::UseSyntaxFallback => Ok(self.syntax_definition(&uri, target).await),
@@ -1946,6 +2021,30 @@ impl LanguageServer for Backend {
                 .collect()
         };
 
+        // Collect closed-file trees from the workspace tree cache: all
+        // URLs present in the cache that aren't the cursor file and aren't
+        // already covered by the open-document store. Open files are
+        // authoritative; closed-file trees carry the last successfully
+        // parsed content from disk.
+        let open_urls: HashSet<&Url> = other_open
+            .iter()
+            .map(|(u, _)| u)
+            .chain(std::iter::once(&uri))
+            .collect();
+        let closed_trees: Vec<(Url, SyntaxTree)> = {
+            let wt = self.workspace_trees.read().await;
+            wt.iter()
+                .filter(|(url, _)| !open_urls.contains(url))
+                .map(|(url, tree)| (url.clone(), tree.clone()))
+                .collect()
+        };
+
+        // Merge: open-buffer trees first (scope-aware cursor file is
+        // handled separately inside collect_references), then closed-file
+        // trees. All are scanned with occurrences_of_scoped.
+        let all_other_trees: Vec<(Url, SyntaxTree)> =
+            other_open.into_iter().chain(closed_trees).collect();
+
         let wi = self.workspace_index.read().await;
         let locations = collect_references(
             &name,
@@ -1953,7 +2052,7 @@ impl LanguageServer for Backend {
             &cursor_tree,
             &cursor_rope,
             target,
-            &other_open,
+            &all_other_trees,
             &wi,
             include_declaration,
         );
@@ -2764,6 +2863,7 @@ async fn hydrate_workspace_index(
     include_dirs: Vec<PathBuf>,
     parser: Arc<Mutex<SyntaxParser>>,
     workspace_index: Arc<RwLock<WorkspaceIndex>>,
+    workspace_trees: Arc<RwLock<HashMap<Url, SyntaxTree>>>,
 ) {
     let count_requested = paths.len();
     let entries = {
@@ -2776,8 +2876,10 @@ async fn hydrate_workspace_index(
     let parsed = entries.len();
     {
         let mut wi = workspace_index.write().await;
-        for (url, syms) in entries {
-            wi.update(url, &syms);
+        let mut wt = workspace_trees.write().await;
+        for (url, syms, tree) in entries {
+            wi.update(url.clone(), &syms);
+            wt.insert(url, tree);
         }
     }
     info!(
@@ -3748,7 +3850,7 @@ fn collect_references(
     cursor_tree: &SyntaxTree,
     cursor_rope: &Rope,
     cursor_pos: MPosition,
-    other_open: &[(Url, SyntaxTree)],
+    other_trees: &[(Url, SyntaxTree)],
     wi: &WorkspaceIndex,
     include_declaration: bool,
 ) -> Vec<Location> {
@@ -3795,10 +3897,14 @@ fn collect_references(
         }
     }
 
-    // 2. Other open buffers — whole-file lexical match.
-    'outer: for (other_uri, other_tree) in other_open {
+    // 2. Other trees (open buffers + closed filelist files) — scope-pruned
+    //    file-wide match. occurrences_of_scoped skips occurrences inside
+    //    nested scopes that locally re-declare `name`, so a local
+    //    `int foo` inside a function won't pollute results when the caller
+    //    is searching for a module-level `foo`.
+    'outer: for (other_uri, other_tree) in other_trees {
         let other_rope = Rope::from_str(other_tree.source());
-        for r in mimir_syntax::symbols::occurrences_of(other_tree, &other_rope, name) {
+        for r in mimir_syntax::symbols::occurrences_of_scoped(other_tree, &other_rope, name) {
             if !push(&mut out, &mut seen, &mut truncated, other_uri, r) {
                 break 'outer;
             }
@@ -6719,6 +6825,37 @@ mod tests {
         // 1 usage in cursor file + 1 declaration site from the index.
         assert_eq!(out.len(), 2);
         assert!(out.iter().any(|l| l.uri == elsewhere));
+    }
+
+    /// A file present in `other_trees` (simulating a closed filelist file
+    /// cached in `workspace_trees`) contributes all occurrence sites —
+    /// declaration *and* usages — not just the declaration the workspace
+    /// index knows about.
+    #[test]
+    fn references_returns_usages_from_closed_file() {
+        let here = url("file:///a.sv");
+        let closed = url("file:///lib.sv");
+        let cursor_text = "module m;\n  my_class c;\nendmodule\n";
+        // closed file: 1 declaration + 2 usages of my_class.
+        let closed_text =
+            "class my_class;\nendclass\nmodule uses;\n  my_class x;\n  my_class y;\nendmodule\n";
+        let wi = workspace_index_from(&[(&closed, closed_text)]);
+        // Pass closed file via other_trees (simulates workspace_trees cache).
+        let out = run_references(
+            "my_class",
+            &here,
+            cursor_text,
+            &[(closed.clone(), closed_text)],
+            &wi,
+            true,
+        );
+        let closed_hits = out.iter().filter(|l| l.uri == closed).count();
+        // The scoped scan must return all 3 occurrences (decl + 2 usages),
+        // not just the 1 declaration the workspace index alone would provide.
+        assert!(
+            closed_hits > 1,
+            "expected usages from closed file, not just declaration; got {closed_hits}"
+        );
     }
 
     /// When a file is both open *and* listed in the filelist, the
