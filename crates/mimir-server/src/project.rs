@@ -527,11 +527,21 @@ impl ResolvedProject {
 
         // Expand ${VAR} within env values so entries can reference sibling
         // keys (e.g. `INC = "${ROOT}/include"` where ROOT is also in [env]).
-        let raw_env = cfg.env.clone();
-        let env: HashMap<String, String> = raw_env
-            .iter()
-            .map(|(k, v)| (k.clone(), expand_env_vars(v, &raw_env)))
-            .collect();
+        // Multi-pass: iterate until stable so chains like
+        //   A="/base", B="${A}/sub", C="${B}/deep"
+        // fully resolve rather than stopping at one level of indirection.
+        // Capped at 16 passes to prevent runaway expansion on circular refs.
+        let mut env = cfg.env.clone();
+        for _ in 0..16 {
+            let next: HashMap<String, String> = env
+                .iter()
+                .map(|(k, v)| (k.clone(), expand_env_vars(v, &env)))
+                .collect();
+            if next == env {
+                break;
+            }
+            env = next;
+        }
 
         for (k, v) in &env {
             debug!(key = %k, value = %v, "toml env var");
@@ -1369,5 +1379,337 @@ mod tests {
         // Other toggles stay at their defaults.
         assert!(cfg.features.semantic_tokens);
         assert!(cfg.features.keyword_hover);
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-level env-var expansion
+    // ------------------------------------------------------------------
+
+    /// Two-level chain: B references A, C references B.
+    /// After expansion C must resolve all the way to /base/sub/deep.
+    #[test]
+    fn env_vars_two_level_chain_expands_correctly() {
+        let dir = tempdir().unwrap();
+        let toml_text = r#"
+            [env]
+            A = "/base"
+            B = "${A}/sub"
+            C = "${B}/deep"
+        "#;
+        let toml_path = dir.path().join(".mimir.toml");
+        fs::write(&toml_path, toml_text).unwrap();
+        let resolved = ResolvedProject::load(&toml_path).unwrap();
+
+        assert_eq!(resolved.env.get("A").map(|s| s.as_str()), Some("/base"));
+        assert_eq!(resolved.env.get("B").map(|s| s.as_str()), Some("/base/sub"));
+        assert_eq!(resolved.env.get("C").map(|s| s.as_str()), Some("/base/sub/deep"));
+    }
+
+    /// Three-level chain: D references C which references B which references A.
+    #[test]
+    fn env_vars_three_level_chain_expands_correctly() {
+        let dir = tempdir().unwrap();
+        let toml_text = r#"
+            [env]
+            A = "/root"
+            B = "${A}/tier1"
+            C = "${B}/tier2"
+            D = "${C}/tier3"
+        "#;
+        let toml_path = dir.path().join(".mimir.toml");
+        fs::write(&toml_path, toml_text).unwrap();
+        let resolved = ResolvedProject::load(&toml_path).unwrap();
+
+        assert_eq!(resolved.env.get("D").map(|s| s.as_str()), Some("/root/tier1/tier2/tier3"));
+    }
+
+    /// Multi-level env vars whose final expanded value is an absolute path
+    /// are used verbatim in filelist file entries (not prefixed with the
+    /// filelist's directory).
+    #[test]
+    fn env_vars_multi_level_expand_in_filelist_file_entries() {
+        let dir = tempdir().unwrap();
+        // Create the actual source file at the absolute path.
+        let src_dir = dir.path().join("ip/rtl");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("dut.sv"), "").unwrap();
+
+        let toml_text = format!(
+            r#"
+            [env]
+            BASE     = "{base}"
+            IP_ROOT  = "${{BASE}}/ip"
+            RTL_DIR  = "${{IP_ROOT}}/rtl"
+
+            [slang]
+            filelist = "project.f"
+            "#,
+            base = dir.path().display()
+        );
+        fs::write(dir.path().join(".mimir.toml"), &toml_text).unwrap();
+        // Reference the file using a multi-level-expanded var.
+        fs::write(dir.path().join("project.f"), "${RTL_DIR}/dut.sv\n").unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.files.len(), 1);
+        let got = &resolved.files[0];
+        assert!(
+            got.ends_with("ip/rtl/dut.sv"),
+            "expected ip/rtl/dut.sv in path, got {:?}",
+            got
+        );
+        assert!(got.is_absolute(), "resolved path must be absolute");
+    }
+
+    /// Multi-level env vars in +incdir+ tokens expand fully.
+    #[test]
+    fn env_vars_multi_level_expand_in_incdir_tokens() {
+        let dir = tempdir().unwrap();
+        let inc_dir = dir.path().join("verif/uvm/src");
+        fs::create_dir_all(&inc_dir).unwrap();
+
+        let toml_text = format!(
+            r#"
+            [env]
+            PROJ     = "{proj}"
+            VERIF    = "${{PROJ}}/verif"
+            UVM_SRC  = "${{VERIF}}/uvm/src"
+
+            [slang]
+            filelist = "project.f"
+            "#,
+            proj = dir.path().display()
+        );
+        fs::write(dir.path().join(".mimir.toml"), &toml_text).unwrap();
+        fs::write(dir.path().join("project.f"), "+incdir+${UVM_SRC}\n").unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.include_dirs.len(), 1);
+        let got = &resolved.include_dirs[0];
+        assert!(
+            got.ends_with("verif/uvm/src"),
+            "expected verif/uvm/src, got {:?}",
+            got
+        );
+        assert!(got.is_absolute());
+    }
+
+    /// Multi-level env vars in +define+ values also expand fully.
+    #[test]
+    fn env_vars_multi_level_expand_in_define_values() {
+        let dir = tempdir().unwrap();
+        let toml_text = r#"
+            [env]
+            VER_MAJOR = "4"
+            VER_MINOR = "2"
+            VERSION   = "${VER_MAJOR}.${VER_MINOR}"
+
+            [slang]
+            filelist = "project.f"
+        "#;
+        fs::write(dir.path().join(".mimir.toml"), toml_text).unwrap();
+        fs::write(dir.path().join("project.f"), "+define+VERSION=${VERSION}\n").unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.defines.len(), 1);
+        assert_eq!(resolved.defines[0].name, "VERSION");
+        assert_eq!(resolved.defines[0].value.as_deref(), Some("4.2"));
+    }
+
+    /// An env value that references a process environment variable and is
+    /// then referenced by another env key still fully resolves.
+    #[test]
+    fn env_vars_chain_through_process_env() {
+        let dir = tempdir().unwrap();
+        // Set a real process env var.
+        std::env::set_var("MIMIR_TEST_BASE_DIR", dir.path().to_str().unwrap());
+        let toml_text = r#"
+            [env]
+            PROJECT = "${MIMIR_TEST_BASE_DIR}/project"
+            SRC     = "${PROJECT}/src"
+        "#;
+        let toml_path = dir.path().join(".mimir.toml");
+        fs::write(&toml_path, toml_text).unwrap();
+        let resolved = ResolvedProject::load(&toml_path).unwrap();
+        std::env::remove_var("MIMIR_TEST_BASE_DIR");
+
+        let expected_src = format!("{}/project/src", dir.path().display());
+        assert_eq!(resolved.env.get("SRC").map(|s| s.as_str()), Some(expected_src.as_str()));
+    }
+
+    // ------------------------------------------------------------------
+    // Path-resolution fallback: full-path / absolute paths are preserved
+    // ------------------------------------------------------------------
+
+    /// `absolutise_filelist` returns an absolute path unchanged even when
+    /// the file doesn't exist on disk — callers use the path as a forward
+    /// reference and we must not prefix it with the filelist directory.
+    #[test]
+    fn absolutise_filelist_absolute_path_returned_unchanged() {
+        let dir = tempdir().unwrap();
+        // Use a path that definitely does not exist.
+        let abs = PathBuf::from("/nonexistent/absolute/path/file.sv");
+        let result = absolutise_filelist(dir.path(), dir.path(), &abs);
+        assert_eq!(result, abs, "absolute path must pass through unchanged");
+    }
+
+    /// When a filelist entry resolves to an absolute path via env expansion,
+    /// the full-path result is returned even when that file doesn't exist yet.
+    #[test]
+    fn filelist_absolute_path_via_env_not_prefixed() {
+        let dir = tempdir().unwrap();
+        // Note: the file does NOT exist on disk.
+        let toml_text = r#"
+            [env]
+            ABS_FILE = "/some/absolute/path/tb_top.sv"
+
+            [slang]
+            filelist = "project.f"
+        "#;
+        fs::write(dir.path().join(".mimir.toml"), toml_text).unwrap();
+        fs::write(dir.path().join("project.f"), "${ABS_FILE}\n").unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.files.len(), 1);
+        assert_eq!(
+            resolved.files[0],
+            PathBuf::from("/some/absolute/path/tb_top.sv"),
+            "env-expanded absolute path must not be prefixed with the filelist dir"
+        );
+    }
+
+    /// When a relative path in the filelist doesn't exist relative to the
+    /// filelist directory but DOES exist relative to the TOML root, the
+    /// TOML-root version is returned (not the raw relative path joined to CWD).
+    #[test]
+    fn filelist_falls_back_to_toml_root_not_cwd() {
+        let dir = tempdir().unwrap();
+        // Filelist is in a sub-directory; file lives at the project root level.
+        let sub = dir.path().join("sim");
+        fs::create_dir_all(&sub).unwrap();
+        let rtl = dir.path().join("rtl");
+        fs::create_dir_all(&rtl).unwrap();
+        fs::write(rtl.join("chip.sv"), "").unwrap();
+
+        fs::write(sub.join("tb.f"), "rtl/chip.sv\n").unwrap();
+        let toml_text = "[slang]\nfilelist = \"sim/tb.f\"\n";
+        fs::write(dir.path().join(".mimir.toml"), toml_text).unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.files.len(), 1);
+        let got = &resolved.files[0];
+        // Must be the TOML-root-relative version, not an arbitrary CWD join.
+        assert_eq!(*got, rtl.join("chip.sv"), "expected TOML-root fallback");
+        assert!(got.is_absolute());
+    }
+
+    /// A path that is not found relative to the filelist dir, not found
+    /// relative to the TOML root, and is not absolute falls back to the
+    /// filelist-base join (forward reference — the file may not exist yet).
+    #[test]
+    fn filelist_unknown_relative_path_defaults_to_filelist_base() {
+        let dir = tempdir().unwrap();
+        // File does NOT exist anywhere.
+        fs::write(dir.path().join("project.f"), "nonexistent/future.sv\n").unwrap();
+        fs::write(dir.path().join(".mimir.toml"), "[slang]\nfilelist = \"project.f\"\n").unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.files.len(), 1);
+        let got = &resolved.files[0];
+        // Should be filelist_dir/nonexistent/future.sv, not a raw relative path.
+        assert_eq!(*got, dir.path().join("nonexistent/future.sv"));
+        assert!(got.is_absolute(), "default join must produce an absolute path");
+    }
+
+    /// Absolute paths listed directly in `[slang] files` (not through a filelist)
+    /// are preserved without being re-joined to the TOML root.
+    #[test]
+    fn inline_absolute_file_path_preserved() {
+        let dir = tempdir().unwrap();
+        let toml_text = r#"
+            [slang]
+            files = ["/absolute/path/to/a.sv"]
+        "#;
+        fs::write(dir.path().join(".mimir.toml"), toml_text).unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.files.len(), 1);
+        assert_eq!(resolved.files[0], PathBuf::from("/absolute/path/to/a.sv"));
+    }
+
+    /// An env-expanded absolute path in `[slang] files` survives the
+    /// absolutise pass unchanged.
+    #[test]
+    fn inline_env_expanded_absolute_file_path_preserved() {
+        let dir = tempdir().unwrap();
+        let toml_text = r#"
+            [env]
+            ROOT = "/opt/verif"
+
+            [slang]
+            files = ["${ROOT}/tb/top.sv"]
+        "#;
+        fs::write(dir.path().join(".mimir.toml"), toml_text).unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.files.len(), 1);
+        assert_eq!(resolved.files[0], PathBuf::from("/opt/verif/tb/top.sv"));
+    }
+
+    /// End-to-end: a deeply nested env hierarchy feeds both the filelist path
+    /// and entries inside the filelist, all resolving to correct absolute paths.
+    #[test]
+    fn end_to_end_deep_env_hierarchy_with_filelist() {
+        let dir = tempdir().unwrap();
+
+        // Build a realistic directory tree.
+        let rtl = dir.path().join("hw/rtl");
+        let tb = dir.path().join("hw/tb");
+        let inc = dir.path().join("hw/inc");
+        let sim = dir.path().join("sim");
+        for d in &[&rtl, &tb, &inc, &sim] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(rtl.join("dut.sv"), "").unwrap();
+        fs::write(tb.join("tb_top.sv"), "").unwrap();
+
+        // Filelist lives in sim/; uses multi-level vars for all paths.
+        let filelist_content = format!(
+            "${{{RTL}}}/dut.sv\n${{{TB}}}/tb_top.sv\n+incdir+${{{INC}}}\n+define+SIM_BUILD\n",
+            RTL = "RTL_DIR",
+            TB = "TB_DIR",
+            INC = "INC_DIR",
+        );
+        fs::write(sim.join("project.f"), &filelist_content).unwrap();
+
+        let toml_text = format!(
+            r#"
+            [env]
+            HW_ROOT = "{hw}"
+            RTL_DIR = "${{HW_ROOT}}/rtl"
+            TB_DIR  = "${{HW_ROOT}}/tb"
+            INC_DIR = "${{HW_ROOT}}/inc"
+
+            [slang]
+            filelist = "sim/project.f"
+            "#,
+            hw = dir.path().join("hw").display()
+        );
+        fs::write(dir.path().join(".mimir.toml"), &toml_text).unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+
+        assert_eq!(resolved.files.len(), 2, "should have dut.sv and tb_top.sv");
+        assert!(resolved.files[0].ends_with("hw/rtl/dut.sv"), "got {:?}", resolved.files[0]);
+        assert!(resolved.files[1].ends_with("hw/tb/tb_top.sv"), "got {:?}", resolved.files[1]);
+        assert!(resolved.files[0].is_absolute());
+        assert!(resolved.files[1].is_absolute());
+
+        assert_eq!(resolved.include_dirs.len(), 1);
+        assert!(resolved.include_dirs[0].ends_with("hw/inc"), "got {:?}", resolved.include_dirs[0]);
+        assert!(resolved.include_dirs[0].is_absolute());
+
+        assert_eq!(resolved.defines.len(), 1);
+        assert_eq!(resolved.defines[0].name, "SIM_BUILD");
     }
 }

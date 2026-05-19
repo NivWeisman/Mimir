@@ -248,9 +248,12 @@ Full schema (every field is optional; the canonical types live in
 # Workspace-local environment variables.  Checked before the process env
 # when expanding ${VAR} in filelist tokens, inline paths, and when looking
 # up MIMIR_SLANG_PATH.  Process env always overrides.
-# Values may reference other [env] keys using the same ${VAR} syntax:
+# Values may reference other [env] keys — full chain expansion, so
+# multi-level hierarchies like the one below all resolve correctly:
 [env]
 PROJECT_ROOT     = "/work/my_project"
+IP_ROOT          = "${PROJECT_ROOT}/ip"         # → /work/my_project/ip
+RTL_DIR          = "${IP_ROOT}/rtl"             # → /work/my_project/ip/rtl
 MIMIR_SLANG_PATH = "${PROJECT_ROOT}/bin/mimir-slang-sidecar"
 
 [slang]
