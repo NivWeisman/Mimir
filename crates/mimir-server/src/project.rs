@@ -564,6 +564,7 @@ impl ResolvedProject {
             expand_filelist(
                 &absolute,
                 0,
+                &root,
                 &mut visited,
                 &mut files,
                 &mut include_dirs,
@@ -730,6 +731,43 @@ fn absolutise(base: &Path, p: &Path) -> PathBuf {
     }
 }
 
+/// Absolutise `p` inside a filelist, with a three-level fallback chain:
+///
+/// 1. Already absolute → return as-is.
+/// 2. `filelist_base.join(p)` exists → use it (normal case: path relative to the `.f`).
+/// 3. `toml_root.join(p)` exists → use it (filelist written relative to the project root).
+/// 4. `p` exists as written (CWD-relative or absolute after env expansion) → use it.
+/// 5. Default: `filelist_base.join(p)` (path doesn't exist yet; forward-reference is OK).
+fn absolutise_filelist(filelist_base: &Path, toml_root: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let joined = filelist_base.join(p);
+    if joined.exists() {
+        return joined;
+    }
+    if filelist_base != toml_root {
+        let via_root = toml_root.join(p);
+        if via_root.exists() {
+            debug!(
+                path = %p.display(),
+                via = %via_root.display(),
+                "path not found relative to filelist dir; resolved via TOML root"
+            );
+            return via_root;
+        }
+    }
+    if p.exists() {
+        debug!(
+            path = %p.display(),
+            tried = %joined.display(),
+            "path not found relative to filelist dir or TOML root; using path as written"
+        );
+        return p.to_path_buf();
+    }
+    joined
+}
+
 /// Recursively expand a filelist. Pushes results into the accumulator
 /// vectors so a top-level filelist with five `-f` includes builds a
 /// single flat output rather than a tree the caller has to walk.
@@ -740,6 +778,7 @@ fn absolutise(base: &Path, p: &Path) -> PathBuf {
 fn expand_filelist(
     path: &Path,
     depth: usize,
+    toml_root: &Path,
     visited: &mut HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
     include_dirs: &mut Vec<PathBuf>,
@@ -779,7 +818,7 @@ fn expand_filelist(
         let token = &tokens[i];
         if let Some(rest) = token.strip_prefix("+incdir+") {
             for dir in rest.split('+').filter(|s| !s.is_empty()) {
-                include_dirs.push(absolutise(&base, Path::new(&expand_env_vars(dir, env))));
+                include_dirs.push(absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(dir, env))));
             }
             i += 1;
         } else if let Some(rest) = token.strip_prefix("+define+") {
@@ -793,20 +832,20 @@ fn expand_filelist(
                 warn!("trailing `-f` with no filelist path; ignoring");
                 break;
             };
-            let nested = absolutise(&base, Path::new(&expand_env_vars(next, env)));
-            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines, env)?;
+            let nested = absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(next, env)));
+            expand_filelist(&nested, depth + 1, toml_root, visited, files, include_dirs, defines, env)?;
             i += 2;
         } else if let Some(rest) = token.strip_prefix("-f") {
             // One-token form: `-fnested.f`.
-            let nested = absolutise(&base, Path::new(&expand_env_vars(rest, env)));
-            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines, env)?;
+            let nested = absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(rest, env)));
+            expand_filelist(&nested, depth + 1, toml_root, visited, files, include_dirs, defines, env)?;
             i += 1;
         } else if let Some(rest) = token.strip_prefix("-F") {
-            let nested = absolutise(&base, Path::new(&expand_env_vars(rest, env)));
-            expand_filelist(&nested, depth + 1, visited, files, include_dirs, defines, env)?;
+            let nested = absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(rest, env)));
+            expand_filelist(&nested, depth + 1, toml_root, visited, files, include_dirs, defines, env)?;
             i += 1;
         } else {
-            files.push(absolutise(&base, Path::new(&expand_env_vars(token, env))));
+            files.push(absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(token, env))));
             i += 1;
         }
     }
@@ -1040,7 +1079,7 @@ mod tests {
         let mut incs = Vec::new();
         let mut defs = Vec::new();
         let mut visited = HashSet::new();
-        expand_filelist(&f, 0, &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
+        expand_filelist(&f, 0, dir.path(), &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
 
         assert_eq!(files.len(), 2);
         assert!(files[0].ends_with("a.sv"));
@@ -1068,7 +1107,7 @@ mod tests {
         let mut incs = Vec::new();
         let mut defs = Vec::new();
         let mut visited = HashSet::new();
-        expand_filelist(&outer, 0, &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
+        expand_filelist(&outer, 0, dir.path(), &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
 
         // Order is: outer.sv, inner.sv (from nested), after.sv. The nested
         // include lands between the outer files that bracket the `-f`.
@@ -1078,6 +1117,34 @@ mod tests {
         assert!(files[2].ends_with("after.sv"));
         assert_eq!(incs.len(), 1);
         assert!(incs[0].ends_with("nested_inc"));
+    }
+
+    /// Paths in a filelist that don't exist relative to the `.f`'s directory
+    /// but do exist relative to the TOML root are resolved via the TOML root.
+    #[test]
+    fn expand_filelist_falls_back_to_toml_root() {
+        let dir = tempdir().unwrap();
+        // .mimir.toml lives in dir; the filelist lives in dir/sim/
+        let sim = dir.path().join("sim");
+        fs::create_dir_all(&sim).unwrap();
+        // Source file is at dir/rtl/dut.sv — relative to TOML root, not to sim/
+        let rtl = dir.path().join("rtl");
+        fs::create_dir_all(&rtl).unwrap();
+        fs::write(rtl.join("dut.sv"), "").unwrap();
+
+        let f = sim.join("project.f");
+        // "rtl/dut.sv" is relative to the project root, not to sim/ — the
+        // filelist writer assumed the tool runs from the project root.
+        fs::write(&f, "rtl/dut.sv\n").unwrap();
+
+        let mut files = Vec::new();
+        let mut incs = Vec::new();
+        let mut defs = Vec::new();
+        let mut visited = HashSet::new();
+        expand_filelist(&f, 0, dir.path(), &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("rtl/dut.sv"), "expected TOML-root fallback path, got {:?}", files[0]);
     }
 
     /// A filelist that `-f`-includes itself fails with `FilelistCycle`,
@@ -1092,7 +1159,7 @@ mod tests {
         let mut incs = Vec::new();
         let mut defs = Vec::new();
         let mut visited = HashSet::new();
-        let err = expand_filelist(&f, 0, &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new())
+        let err = expand_filelist(&f, 0, dir.path(), &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new())
             .expect_err("self-include should fail");
         assert!(matches!(err, ProjectError::FilelistCycle { .. }));
     }
