@@ -533,6 +533,10 @@ impl ResolvedProject {
             .map(|(k, v)| (k.clone(), expand_env_vars(v, &raw_env)))
             .collect();
 
+        for (k, v) in &env {
+            debug!(key = %k, value = %v, "toml env var");
+        }
+
         // Inline files listed directly in [slang] files = [...] come first.
         let mut files: Vec<PathBuf> = cfg
             .slang
