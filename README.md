@@ -246,15 +246,22 @@ Full schema (every field is optional; the canonical types live in
 
 ```toml
 # Workspace-local environment variables.  Checked before the process env
-# when expanding ${VAR} in filelist tokens, inline include_dirs/defines,
-# and when looking up MIMIR_SLANG_PATH.  Process env always overrides.
+# when expanding ${VAR} in filelist tokens, inline paths, and when looking
+# up MIMIR_SLANG_PATH.  Process env always overrides.
+# Values may reference other [env] keys using the same ${VAR} syntax:
 [env]
-MIMIR_SLANG_PATH = "/opt/mimir/bin/mimir-slang-sidecar"
 PROJECT_ROOT     = "/work/my_project"
+MIMIR_SLANG_PATH = "${PROJECT_ROOT}/bin/mimir-slang-sidecar"
 
 [slang]
 # Path to a .f filelist, relative to .mimir.toml.
 filelist     = "${PROJECT_ROOT}/sim/uvm.f"
+
+# Source files listed directly in the TOML — no separate .f required.
+# Useful for per-workspace additions on top of a shared team filelist.
+# Relative paths resolve against .mimir.toml; ${VAR} is expanded.
+# Inline entries are prepended before filelist entries.
+files        = ["tb/extra_tb.sv", "${PROJECT_ROOT}/stubs/axi_stub.sv"]
 
 # Extra include search paths, on top of anything the filelist contributes.
 # Relative entries resolve against .mimir.toml's directory.
@@ -271,10 +278,13 @@ top          = "tb_top"
 debounce_ms  = 350
 ```
 
-Inline `include_dirs` and `defines` are merged with whatever the filelist
-pulls in — inline values come first, filelist values after. Unknown keys
-are an error, not silently ignored, so a typo (`includ_dirs`) fails loudly
-instead of disabling your config.
+Inline `files`, `include_dirs`, and `defines` are merged with whatever the
+filelist pulls in — inline values come first, filelist values after.
+If a relative path doesn't exist under the TOML's directory, mimir retries
+it as written (useful when a path becomes absolute after `${VAR}` expansion
+or is intentionally CWD-relative). Unknown keys are an error, not silently
+ignored, so a typo (`includ_dirs`) fails loudly instead of disabling your
+config.
 
 ### Filelists (`.f`)
 
@@ -365,7 +375,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (303 today)
+cargo test   --workspace                    # run all unit tests (387 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
 make integration                            # python LSP tests against the local UVM example
@@ -488,7 +498,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Project / build integration
 
-- ✅ Filelist (`.f` / `-f`) parsing for compilation units (via `.mimir.toml`'s `slang.filelist`)
+- ✅ Filelist (`.f` / `-f`) parsing for compilation units (via `.mimir.toml`'s `slang.filelist`); inline `slang.files` list for per-workspace additions without a separate `.f`
 - ✅ `+define+` / `+incdir+` macro & include path config
 - ✅ Multi-file elaboration & cross-file symbol resolution. Slang elaborates the whole compilation unit; the server kicks off a workspace-wide elaborate on `initialize` (before the user opens any file) so semantic features are warm by the time the first request lands. Cross-file goto-definition is wired through both engines (slang primary, tree-sitter workspace index fallback). The server hashes the `ElaborateParams` inputs (file texts + include dirs + defines + `top`) and skips the slang round-trip when a subsequent `did_open` / `did_change` produces an identical hash — `did_open`-ing a file that was already part of the startup elaborate is a cache hit, not another ~500KB diagnostics dump. On the first successful elaborate the server emits one `info!("indexed by startup slang elaborate", file=...)` per file slang now has compiled.
 - ⬜ Integration with simulator-specific build files (Verilator, Xcelium, VCS, Questa)

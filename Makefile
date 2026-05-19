@@ -6,6 +6,12 @@ RUST_TARGET_DIR   := target
 RELEASE_BIN       := $(RUST_TARGET_DIR)/release/mimir-server
 SIDECAR_BIN       := $(SIDECAR_BUILD_DIR)/mimir-slang-sidecar
 
+# CMake generator for the sidecar.  Defaults to Ninja when ninja is on PATH;
+# falls back to the platform default (Unix Makefiles on Linux/macOS) otherwise.
+# Override on the command line to force a specific generator:
+#   make sidecar CMAKE_GENERATOR="-G Unix Makefiles"
+CMAKE_GENERATOR ?= $(shell command -v ninja >/dev/null 2>&1 && echo "-G Ninja")
+
 # Verible formatter (for running integration tests; not required for the server itself)
 # Override VERIBLE_VERSION to pin a different release.
 VERIBLE_VERSION  ?= v0.0-4053-g89d4d98a
@@ -20,7 +26,7 @@ help:
 	@echo ""
 	@echo "  make all         - build server and sidecar"
 	@echo "  make server      - build Rust server (release)"
-	@echo "  make sidecar     - build C++ sidecar"
+	@echo "  make sidecar     - build C++ sidecar (auto-selects Ninja or Make)"
 	@echo "  make verible     - download verible-verilog-format for integration tests"
 	@echo "  make check       - cargo check"
 	@echo "  make test        - run all cargo unit tests"
@@ -28,6 +34,9 @@ help:
 	@echo "  make clippy      - run cargo clippy linter"
 	@echo "  make clean       - remove build artifacts (keep dependencies)"
 	@echo "  make clean-all   - full clean (removes downloaded dependencies)"
+	@echo ""
+	@echo "Override the CMake generator (e.g. if ninja is absent):"
+	@echo "  make sidecar CMAKE_GENERATOR=\"-G Unix Makefiles\""
 	@echo ""
 	@echo "To run formatter integration tests:"
 	@echo "  make verible"
@@ -47,7 +56,7 @@ $(RELEASE_BIN):
 sidecar: $(SIDECAR_BIN)
 
 $(SIDECAR_BIN):
-	cmake -G Ninja -S slang-sidecar -B $(SIDECAR_BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
+	cmake $(CMAKE_GENERATOR) -S slang-sidecar -B $(SIDECAR_BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
 	cmake --build $(SIDECAR_BUILD_DIR)
 
 # Download verible-verilog-format for local development and integration tests.
