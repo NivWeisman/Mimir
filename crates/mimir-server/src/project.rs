@@ -148,10 +148,13 @@ pub struct ProjectConfig {
     /// looking up `MIMIR_SLANG_PATH`; the process environment provides
     /// fallbacks (so CI can still override by setting the real env var).
     ///
+    /// Values may themselves reference other `[env]` keys or process env
+    /// vars using the same `${VAR}` syntax (one level of indirection):
+    ///
     /// ```toml
     /// [env]
-    /// MIMIR_SLANG_PATH = "/opt/mimir/bin/mimir-slang-sidecar"
     /// PROJECT_ROOT     = "/work/my_project"
+    /// MIMIR_SLANG_PATH = "${PROJECT_ROOT}/bin/mimir-slang-sidecar"
     /// ```
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -247,6 +250,22 @@ pub struct SlangConfig {
     #[serde(default)]
     pub filelist: Option<PathBuf>,
 
+    /// Source files to compile, listed directly in the TOML without a
+    /// separate `.f` filelist. Relative paths are resolved against the
+    /// `.mimir.toml`'s directory; `${VAR}` is expanded the same way as
+    /// in filelist tokens.
+    ///
+    /// Inline entries are prepended before any filelist entries so you
+    /// can mix a shared team filelist with per-workspace additions:
+    ///
+    /// ```toml
+    /// [slang]
+    /// files    = ["tb/my_extra_tb.sv", "${VERIF_HOME}/stubs/axi_stub.sv"]
+    /// filelist = "sim/project.f"
+    /// ```
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+
     /// Extra include search paths. Relative entries are resolved against
     /// the `.mimir.toml`'s directory.
     #[serde(default)]
@@ -276,6 +295,7 @@ impl Default for SlangConfig {
     fn default() -> Self {
         Self {
             filelist: None,
+            files: Vec::new(),
             include_dirs: Vec::new(),
             defines: Vec::new(),
             top: None,
@@ -505,9 +525,21 @@ impl ResolvedProject {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
 
-        let env = cfg.env.clone();
+        // Expand ${VAR} within env values so entries can reference sibling
+        // keys (e.g. `INC = "${ROOT}/include"` where ROOT is also in [env]).
+        let raw_env = cfg.env.clone();
+        let env: HashMap<String, String> = raw_env
+            .iter()
+            .map(|(k, v)| (k.clone(), expand_env_vars(v, &raw_env)))
+            .collect();
 
-        let mut files: Vec<PathBuf> = Vec::new();
+        // Inline files listed directly in [slang] files = [...] come first.
+        let mut files: Vec<PathBuf> = cfg
+            .slang
+            .files
+            .iter()
+            .map(|p| absolutise(&root, Path::new(&expand_env_vars(&p.to_string_lossy(), &env))))
+            .collect();
         let mut include_dirs: Vec<PathBuf> = cfg
             .slang
             .include_dirs
@@ -672,13 +704,25 @@ fn parse_define(s: &str) -> MacroDefine {
 }
 
 /// Absolutise `p` against `base`. Already-absolute paths are returned
-/// unchanged. Doesn't canonicalise — that requires the path to exist on
-/// disk and we're sometimes building paths ahead of `read_to_string`.
+/// unchanged. For relative paths, tries `base.join(p)` first; if that path
+/// does not exist on disk but `p` itself does (e.g. the raw string is
+/// reachable from the current working directory or becomes absolute after
+/// env-var expansion), the raw path is returned so callers don't silently
+/// swallow a misconfigured TOML-relative prefix.
 fn absolutise(base: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let joined = base.join(p);
+    if !joined.exists() && p.exists() {
+        debug!(
+            path = %p.display(),
+            tried = %joined.display(),
+            "path not found relative to TOML root; using path as written"
+        );
         p.to_path_buf()
     } else {
-        base.join(p)
+        joined
     }
 }
 
@@ -1179,6 +1223,65 @@ mod tests {
     fn formatter_config_rejects_unknown_keys() {
         let bad = "[formatter]\ncolum_limit = 80\n";
         assert!(toml::from_str::<ProjectConfig>(bad).is_err());
+    }
+
+    /// `[slang] files` entries are prepended before filelist entries.
+    #[test]
+    fn inline_files_prepended_before_filelist() {
+        let dir = tempdir().unwrap();
+        let extra = dir.path().join("extra.sv");
+        fs::write(&extra, "").unwrap();
+        fs::write(dir.path().join("tb_top.sv"), "").unwrap();
+        fs::write(dir.path().join("project.f"), "tb_top.sv\n").unwrap();
+        fs::write(
+            dir.path().join(".mimir.toml"),
+            r#"
+                [slang]
+                files    = ["extra.sv"]
+                filelist = "project.f"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedProject::load(&dir.path().join(".mimir.toml")).unwrap();
+        assert_eq!(resolved.files.len(), 2);
+        assert!(resolved.files[0].ends_with("extra.sv"), "inline file must come first");
+        assert!(resolved.files[1].ends_with("tb_top.sv"), "filelist file must come second");
+    }
+
+    /// Env values may reference sibling `[env]` keys with `${VAR}` syntax.
+    #[test]
+    fn env_vars_compose_within_env_section() {
+        let toml_text = r#"
+            [env]
+            ROOT    = "/work/project"
+            INC_DIR = "${ROOT}/include"
+            SIDECAR = "${ROOT}/bin/mimir-slang-sidecar"
+        "#;
+        let dir = tempdir().unwrap();
+        // Write TOML so we can call ResolvedProject::load (which does the expansion).
+        let toml_path = dir.path().join(".mimir.toml");
+        fs::write(&toml_path, toml_text).unwrap();
+        let resolved = ResolvedProject::load(&toml_path).unwrap();
+        assert_eq!(resolved.env.get("ROOT").map(|s| s.as_str()), Some("/work/project"));
+        assert_eq!(resolved.env.get("INC_DIR").map(|s| s.as_str()), Some("/work/project/include"));
+        assert_eq!(resolved.env.get("SIDECAR").map(|s| s.as_str()), Some("/work/project/bin/mimir-slang-sidecar"));
+    }
+
+    /// `absolutise` falls back to the path as-is when the TOML-relative
+    /// joined path does not exist but the path itself does (e.g. an absolute
+    /// path that was still registered as relative text).
+    #[test]
+    fn absolutise_falls_back_when_joined_missing() {
+        let dir = tempdir().unwrap();
+        let fake_base = dir.path().join("nonexistent_subdir");
+        // Create a file in `dir` directly; `fake_base/file.sv` won't exist.
+        let real_file = dir.path().join("real.sv");
+        fs::write(&real_file, "").unwrap();
+        // Pass the absolute path as a relative-looking path object.
+        let result = absolutise(&fake_base, &real_file);
+        // Should return the path itself, not fake_base/real_file.
+        assert_eq!(result, real_file);
     }
 
     /// `[features] formatting` defaults to `true` and can be set to `false`.
