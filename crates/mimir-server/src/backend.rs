@@ -98,6 +98,41 @@ struct DocumentState {
     index_version: i32,
 }
 
+/// Cached on-disk source texts for closed project files.
+///
+/// `build_definition_params` and `build_elaborate_params` send every project
+/// file's text to the slang sidecar on each hover/definition/completion call.
+/// For files that are not open in the editor the only way to get their text
+/// is a `std::fs::read_to_string` call — expensive when repeated N times per
+/// request. This cache stores those texts so the disk read happens at most
+/// once per file per session.
+///
+/// ## Correctness invariant
+///
+/// The cache **only covers files that are not currently open**. Open files
+/// are always sourced from the live rope (`open_text` in
+/// `build_definition_params`), which takes precedence over the disk cache
+/// inside `assemble_elaborate_params`. Unsaved edits are therefore always
+/// reflected correctly.
+///
+/// ## Invalidation events
+///
+/// | Event | Action |
+/// |---|---|
+/// | `did_open` | Drop entire cache — file moves closed→open; a future `did_close` must re-read disk |
+/// | `did_close` | Drop entire cache — file moves open→closed; disk may have changed via another editor |
+/// | `did_change` | **No invalidation** — changed file is in `open_text`, not the cache |
+/// | `did_change_watched_files` CHANGED/CREATED | Evict the specific `PathBuf` entry |
+/// | Project reload | Drop entire cache — filelist may have changed |
+#[derive(Debug, Clone, Default)]
+struct ClosedFileDiskCache {
+    /// `path → source_text` for every closed project file successfully read
+    /// from disk. Files that returned `None` from `read_to_string` are absent;
+    /// the caller treats absence the same as an empty string (matching
+    /// `assemble_elaborate_params`'s `unwrap_or_default` semantics).
+    texts: HashMap<PathBuf, String>,
+}
+
 /// The tower-lsp [`LanguageServer`] implementation.
 ///
 /// Pub only inside the crate; `main.rs` constructs it via `Backend::new`.
@@ -168,6 +203,13 @@ pub(crate) struct Backend {
     /// `trees` are guaranteed to be in sync. See [`WorkspaceState`] and
     /// [`workspace_index`] for the full data-structure contract.
     workspace: Arc<RwLock<WorkspaceState>>,
+
+    /// Cached on-disk source texts for closed project files. Eliminates
+    /// repeated `std::fs::read_to_string` calls in `build_definition_params`
+    /// and `build_elaborate_params` on every hover/definition/completion
+    /// request. `None` means "not yet populated or deliberately invalidated".
+    /// See [`ClosedFileDiskCache`] for the full invalidation contract.
+    closed_file_cache: Arc<RwLock<Option<ClosedFileDiskCache>>>,
 }
 
 impl Backend {
@@ -190,6 +232,7 @@ impl Backend {
             last_elaborate_input_hash: Arc::new(RwLock::new(None)),
             startup_index_logged: Arc::new(AtomicBool::new(false)),
             workspace: Arc::new(RwLock::new(WorkspaceState::default())),
+            closed_file_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -423,6 +466,7 @@ impl Backend {
         let startup_logged = self.startup_index_logged.clone();
         let lsp_client = self.client.clone();
         let trigger_for_task = trigger_uri.clone();
+        let closed_file_cache = self.closed_file_cache.clone();
 
         let handle = tokio::spawn(async move {
             tokio::time::sleep(debounce).await;
@@ -430,7 +474,8 @@ impl Backend {
             // Build the elaborate request from project config + the
             // currently-open documents (their in-memory text overrides
             // anything on disk so unsaved changes participate).
-            let (params, files_in_request) = build_elaborate_params(&project, &documents).await;
+            let (params, files_in_request) =
+                build_elaborate_params(&project, &documents, &closed_file_cache).await;
 
             // Hash the inputs that determine slang's answer. If we've
             // already sent slang exactly this set of files+config and got
@@ -519,6 +564,9 @@ impl Backend {
                 let paths = resolved.files.clone();
                 let include_dirs = resolved.include_dirs.clone();
                 *self.project.write().await = Some(resolved);
+                // The filelist may have changed — drop the entire disk cache
+                // so the next request re-reads all closed project files.
+                *self.closed_file_cache.write().await = None;
                 let parser = self.parser.clone();
                 let workspace = self.workspace.clone();
                 tokio::spawn(async move {
@@ -670,7 +718,7 @@ impl Backend {
         let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
-        let (params, _) = build_definition_params(&project, &self.documents, uri, target).await?;
+        let (params, _) = build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, target).await?;
 
         let result = match slang.definition(&params).await {
             Ok(r) => r,
@@ -763,7 +811,7 @@ impl Backend {
         // `None` if the URI has no filesystem path (e.g. an `untitled:`
         // buffer); slang can't address those.
         let (params, _files_in_request) =
-            build_definition_params(&project, &self.documents, uri, target).await?;
+            build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, target).await?;
 
         match slang.definition(&params).await {
             Ok(result) => {
@@ -796,7 +844,7 @@ impl Backend {
         let project = self.project.read().await.clone()?;
 
         let (def_params, _) =
-            build_definition_params(&project, &self.documents, uri, target).await?;
+            build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, target).await?;
         let params = SlangTypeDefinitionParams {
             files: def_params.files,
             include_dirs: def_params.include_dirs,
@@ -837,7 +885,7 @@ impl Backend {
         let project = self.project.read().await.clone()?;
 
         let (def_params, _) =
-            build_definition_params(&project, &self.documents, uri, target).await?;
+            build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, target).await?;
         let params = SlangImplementationParams {
             files: def_params.files,
             include_dirs: def_params.include_dirs,
@@ -943,7 +991,7 @@ impl Backend {
         let slang = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
         let (mut def_params, _) =
-            build_definition_params(&project, &self.documents, uri, pos).await?;
+            build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, pos).await?;
         if let Some(patch) = patch {
             apply_target_text_patch(&mut def_params, &patch);
         }
@@ -1107,7 +1155,7 @@ impl Backend {
         let client = self.slang.read().await.clone()?;
         let project = self.project.read().await.clone()?;
 
-        let (def_params, _) = build_definition_params(&project, &self.documents, uri, pos).await?;
+        let (def_params, _) = build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, pos).await?;
         let params = SlangSignatureHelpParams {
             files: def_params.files,
             include_dirs: def_params.include_dirs,
@@ -1623,6 +1671,10 @@ impl LanguageServer for Backend {
 
         debug!(language_id, version, bytes = text.len(), "did_open");
 
+        // A file moving closed→open means future did_close must re-read it
+        // from disk. Drop the entire cache so that path is not served stale.
+        *self.closed_file_cache.write().await = None;
+
         {
             let mut docs = self.documents.write().await;
             docs.insert(
@@ -1697,6 +1749,10 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.write().await;
             docs.remove(&uri);
         }
+        // A file moving open→closed becomes disk-authoritative again. The
+        // user may have changed it via another editor since we last read it,
+        // so drop the entire cache rather than risk serving stale text.
+        *self.closed_file_cache.write().await = None;
         // LSP spec: clear diagnostics for closed docs by publishing empty.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
@@ -1766,6 +1822,19 @@ impl LanguageServer for Backend {
                         if is_open {
                             debug!(uri = %evt.uri, "watched file is open in editor; skipping disk re-hydrate");
                             continue;
+                        }
+                        // A closed project file changed on disk — evict its
+                        // cached text so the next request re-reads from disk.
+                        {
+                            let mut guard = self.closed_file_cache.write().await;
+                            if let Some(cache) = guard.as_mut() {
+                                if cache.texts.remove(&path).is_some() {
+                                    debug!(
+                                        path = %path.display(),
+                                        "closed_file_cache: evicted stale entry"
+                                    );
+                                }
+                            }
                         }
                         self.rehydrate_single_file(&path).await;
                     }
@@ -2893,6 +2962,7 @@ fn hash_elaborate_inputs(params: &ElaborateParams) -> u64 {
 async fn build_elaborate_params(
     project: &ResolvedProject,
     documents: &Arc<RwLock<HashMap<Url, DocumentState>>>,
+    closed_file_cache: &Arc<RwLock<Option<ClosedFileDiskCache>>>,
 ) -> (ElaborateParams, Vec<Url>) {
     // Snapshot open document text under the read lock; release before
     // any disk I/O. `text()` clones the rope into a String — cheap
@@ -2908,9 +2978,63 @@ async fn build_elaborate_params(
             .collect()
     };
 
-    assemble_elaborate_params(project, &open_text, |path| {
-        std::fs::read_to_string(path).ok()
-    })
+    assemble_with_cache(project, &open_text, closed_file_cache).await
+}
+
+/// Assemble [`ElaborateParams`] using the [`ClosedFileDiskCache`].
+///
+/// Uses a three-phase approach so no lock is held across disk I/O:
+///
+/// 1. **Read phase** — snapshot cached texts under `read().await`.
+/// 2. **Work phase** — call [`assemble_elaborate_params`] with a closure
+///    that reads from the snapshot first, falls back to
+///    `std::fs::read_to_string` for misses, and collects newly-read texts.
+///    No lock held during disk reads.
+/// 3. **Write phase** — merge newly-read texts back into the cache under
+///    `write().await`.
+///
+/// Open-file texts (`open_text`) always shadow the cache: they come from the
+/// live rope and are passed directly to [`assemble_elaborate_params`], which
+/// checks `open_text` before calling the disk reader. Unsaved edits are
+/// therefore always reflected correctly regardless of cache state.
+async fn assemble_with_cache(
+    project: &ResolvedProject,
+    open_text: &HashMap<PathBuf, (Url, String)>,
+    closed_file_cache: &Arc<RwLock<Option<ClosedFileDiskCache>>>,
+) -> (ElaborateParams, Vec<Url>) {
+    // Phase 1: snapshot existing cached texts (cheap read lock).
+    let cached_texts: HashMap<PathBuf, String> = closed_file_cache
+        .read()
+        .await
+        .as_ref()
+        .map(|c| c.texts.clone())
+        .unwrap_or_default();
+
+    // Phase 2: assemble params — no lock held; disk reads happen here.
+    let mut new_entries: HashMap<PathBuf, String> = HashMap::new();
+    let result = assemble_elaborate_params(project, open_text, |path| {
+        if let Some(text) = cached_texts.get(path) {
+            return Some(text.clone());
+        }
+        let text = std::fs::read_to_string(path).ok()?;
+        new_entries.insert(path.to_path_buf(), text.clone());
+        Some(text)
+    });
+
+    // Phase 3: merge newly-read texts into the cache (write lock, no I/O).
+    // Always ensure the cache is Some after the first call so subsequent
+    // calls skip the write lock entirely on a fully-warm cache.
+    {
+        let mut guard = closed_file_cache.write().await;
+        let cache = guard.get_or_insert_with(ClosedFileDiskCache::default);
+        cache.texts.extend(new_entries);
+        debug!(
+            count = cache.texts.len(),
+            "closed_file_cache: warm after merge"
+        );
+    }
+
+    result
 }
 
 /// Pure version of [`build_elaborate_params`]: given the project, a
@@ -3009,6 +3133,7 @@ fn assemble_elaborate_params(
 async fn build_definition_params(
     project: &ResolvedProject,
     documents: &Arc<RwLock<HashMap<Url, DocumentState>>>,
+    closed_file_cache: &Arc<RwLock<Option<ClosedFileDiskCache>>>,
     target_uri: &Url,
     target_position: MPosition,
 ) -> Option<(SlangDefinitionParams, Vec<Url>)> {
@@ -3024,9 +3149,8 @@ async fn build_definition_params(
             })
             .collect()
     };
-    let (elab, files_in_request) = assemble_elaborate_params(project, &open_text, |path| {
-        std::fs::read_to_string(path).ok()
-    });
+    let (elab, files_in_request) =
+        assemble_with_cache(project, &open_text, closed_file_cache).await;
     let params = SlangDefinitionParams {
         files: elab.files,
         include_dirs: elab.include_dirs,
@@ -5054,6 +5178,85 @@ mod tests {
 
         let paths: Vec<&str> = params.files.iter().map(|sf| sf.path.as_str()).collect();
         assert_eq!(paths, vec!["/proj/uvm.sv"]);
+    }
+
+    // ── closed_file_cache tests ───────────────────────────────────────────
+
+    /// The cache is `None` before the first call and `Some` after — even
+    /// when all files are unreadable (missing from disk). The contract is
+    /// that `Some` means "we attempted a population", not "we found data".
+    #[tokio::test]
+    async fn closed_file_cache_populated_on_first_call_skipped_on_second() {
+        let f = PathBuf::from("/proj/a.sv");
+        let project = project_with_files(vec![f.clone()]);
+        let open_text: HashMap<PathBuf, (Url, String)> = HashMap::new();
+        let cache: Arc<RwLock<Option<ClosedFileDiskCache>>> = Arc::new(RwLock::new(None));
+
+        assert!(cache.read().await.is_none(), "cache starts empty");
+        let _ = assemble_with_cache(&project, &open_text, &cache).await;
+
+        // After the first call the cache must be populated (Some).
+        assert!(
+            cache.read().await.is_some(),
+            "cache should be Some after first call"
+        );
+
+        let text_before = cache.read().await.as_ref().unwrap().texts.get(&f).cloned();
+        let _ = assemble_with_cache(&project, &open_text, &cache).await;
+        let text_after = cache.read().await.as_ref().unwrap().texts.get(&f).cloned();
+        assert_eq!(
+            text_before, text_after,
+            "cache entry must be identical on second call (no re-read)"
+        );
+    }
+
+    /// Setting the cache to `None` causes the next call to re-populate it.
+    #[tokio::test]
+    async fn closed_file_cache_invalidation_resets_state() {
+        let f = PathBuf::from("/proj/a.sv");
+        let project = project_with_files(vec![f]);
+        let open_text: HashMap<PathBuf, (Url, String)> = HashMap::new();
+        let cache: Arc<RwLock<Option<ClosedFileDiskCache>>> = Arc::new(RwLock::new(None));
+
+        let _ = assemble_with_cache(&project, &open_text, &cache).await;
+        assert!(cache.read().await.is_some());
+
+        // Simulate an invalidation event (e.g. did_open).
+        *cache.write().await = None;
+        assert!(cache.read().await.is_none(), "cache must be None after invalidation");
+
+        let _ = assemble_with_cache(&project, &open_text, &cache).await;
+        assert!(
+            cache.read().await.is_some(),
+            "cache must be re-populated after next call"
+        );
+    }
+
+    /// Targeted eviction preserves unrelated entries — only the evicted
+    /// path is gone; other cached paths survive.
+    #[tokio::test]
+    async fn closed_file_cache_targeted_eviction_preserves_other_entries() {
+        let fa = PathBuf::from("/proj/a.sv");
+        let fb = PathBuf::from("/proj/b.sv");
+
+        let mut initial = ClosedFileDiskCache::default();
+        initial.texts.insert(fa.clone(), "module a; endmodule".into());
+        initial.texts.insert(fb.clone(), "module b; endmodule".into());
+        let cache: Arc<RwLock<Option<ClosedFileDiskCache>>> =
+            Arc::new(RwLock::new(Some(initial)));
+
+        // Targeted eviction of /proj/a.sv (simulating a CHANGED event).
+        {
+            let mut guard = cache.write().await;
+            if let Some(c) = guard.as_mut() {
+                c.texts.remove(&fa);
+            }
+        }
+
+        let guard = cache.read().await;
+        let c = guard.as_ref().unwrap();
+        assert!(!c.texts.contains_key(&fa), "evicted entry must be absent");
+        assert!(c.texts.contains_key(&fb), "non-evicted entry must still be present");
     }
 
     /// Plan: every requested file gets a publish, including files with
