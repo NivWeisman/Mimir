@@ -378,20 +378,22 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (387 today)
+cargo test   --workspace                    # run all unit tests (431 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
-make integration                            # python LSP tests against the local UVM example
+make integration                            # python LSP tests against the riscv-dv example
 ```
 
 Unit tests live in-tree (`#[cfg(test)] mod tests` per file). End-to-end
 LSP tests live under `tests/` and drive the release server over stdio
 exactly like an editor — `make integration` builds the release binary,
-opens `examples/uvm-1.2/.../apb_monitor.sv` (skipped if the local copy
-is absent — the UVM sources aren't bundled), and fires every implemented
-LSP feature request. Known-broken cases are marked
-`@unittest.expectedFailure` with a one-line diagnosis pointing at the
-underlying bug.
+opens files from `examples/riscv-dv/` (skipped if the local clone is
+absent — the riscv-dv sources aren't bundled), and exercises every
+implemented LSP feature: diagnostics, semantic tokens, hover, completion,
+go-to-definition, references, signature help, inlay hints, document
+highlights, document symbols, workspace symbols, and folding ranges.
+Two tests are known incomplete (SV keyword and cross-file class
+completion) and are left failing to track the gap.
 
 A typical inner-loop while adding a feature:
 

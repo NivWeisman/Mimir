@@ -201,6 +201,15 @@ class MimirLspClient:
             return [p for _, p in self._notifications]
         return [p for m, p in self._notifications if m == method]
 
+    def clear_notifications(self, method: str | None = None) -> None:
+        """Remove queued notifications so the next ``wait_for_notification``
+        blocks until a truly new message arrives."""
+        if method is None:
+            self._notifications.clear()
+        else:
+            self._notifications = [(m, p) for m, p in self._notifications
+                                   if m != method]
+
     def wait_for_notification(
         self, method: str, timeout: float = 3.0
     ) -> dict | None:
@@ -222,6 +231,34 @@ class MimirLspClient:
                 self._notifications.append((msg["method"], msg.get("params", {})))
                 if msg["method"] == method:
                     return msg.get("params", {})
+        return None
+
+    def wait_for_fresh_diagnostics(
+        self, uri: str, timeout: float = 8.0
+    ) -> dict | None:
+        """Block until a **new** ``publishDiagnostics`` for ``uri`` arrives.
+
+        Drains any already-queued notifications for ``uri`` first, then
+        reads from the stream until a matching notification arrives.
+        Notifications for other URIs are queued and not returned.
+        """
+        # Discard stale notifications for this URI so we wait for a truly new one.
+        self._notifications = [
+            (m, p) for m, p in self._notifications
+            if not (m == "textDocument/publishDiagnostics" and p.get("uri") == uri)
+        ]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                msg = self._recv(timeout=deadline - time.monotonic())
+            except TimeoutError:
+                return None
+            if "method" in msg and "id" not in msg:
+                params = msg.get("params", {})
+                self._notifications.append((msg["method"], params))
+                if (msg["method"] == "textDocument/publishDiagnostics"
+                        and params.get("uri") == uri):
+                    return params
         return None
 
     # -------- internals --------
