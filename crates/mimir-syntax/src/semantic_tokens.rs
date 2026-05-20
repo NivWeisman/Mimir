@@ -567,6 +567,41 @@ fn classify_identifier(node: Node<'_>) -> (TokenType, TokenModifier) {
             // `type_declaration`.
             (TokenType::Type, TokenModifier::DECLARATION)
         }
+        "data_type" => {
+            // A `simple_identifier` directly under `data_type` is a
+            // user-defined type reference (typedef alias, enum, struct, or
+            // class name). Built-in types (`int`, `logic`, `bit`, …)
+            // appear as anonymous keyword nodes — they never reach this
+            // branch. For package-scoped types (`pkg::MyType`), the
+            // package qualifier appears as a sibling with a following `::`
+            // token; classify it as Namespace so it colours consistently.
+            if node.next_sibling().is_some_and(|s| s.kind() == "::") {
+                (TokenType::Namespace, TokenModifier::NONE)
+            } else {
+                (TokenType::Type, TokenModifier::NONE)
+            }
+        }
+        "hierarchical_identifier" => {
+            // Both `foo(args)` and `obj.method(args)` produce a `tf_call`
+            // whose first named child is `hierarchical_identifier`.
+            // The *last* `simple_identifier` in that node is the callee;
+            // earlier ones form the receiver chain and stay Variable.
+            // Non-call uses of `hierarchical_identifier` (e.g. signal
+            // references in expressions) have a different grandparent and
+            // also fall through to Variable.
+            let is_call = parent.parent().is_some_and(|gp| gp.kind() == "tf_call");
+            if is_call && is_last_named_kind(parent, "simple_identifier", node) {
+                (TokenType::Function, TokenModifier::NONE)
+            } else {
+                (TokenType::Variable, TokenModifier::NONE)
+            }
+        }
+        "method_call_body" => {
+            // `super.method(args)` / `this.method(args)` — the method
+            // name `simple_identifier` is the `name:` field of
+            // `method_call_body` (child of `method_call`).
+            (TokenType::Function, TokenModifier::NONE)
+        }
         _ => (TokenType::Variable, TokenModifier::NONE),
     }
 }
@@ -584,6 +619,21 @@ fn is_first_named_kind(parent: Node<'_>, kind: &str, target: Node<'_>) -> bool {
         }
     }
     false
+}
+
+/// True if `target` is the **last** child of `parent` whose `kind()`
+/// equals `kind`. Used to identify the callee name in a
+/// `hierarchical_identifier`: for `obj.method()`, `method` is the last
+/// `simple_identifier`; earlier ones form the receiver chain.
+fn is_last_named_kind(parent: Node<'_>, kind: &str, target: Node<'_>) -> bool {
+    let mut last_id: Option<usize> = None;
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if child.kind() == kind {
+            last_id = Some(child.id());
+        }
+    }
+    last_id == Some(target.id())
 }
 
 /// Parent kinds that turn an inner anonymous keyword token into a
@@ -831,6 +881,126 @@ mod tests {
         let rope = Rope::from_str(src);
         let mname = find_token(&toks, src, "MY_MACRO", &rope);
         assert_eq!(mname.token_type, TokenType::Macro as u32);
+    }
+
+    // ── typedef declaration & reference tests ────────────────────────────
+
+    #[test]
+    fn typedef_decl_alias_is_type_with_declaration() {
+        // `typedef logic [7:0] byte_t;` — the alias name must be Type+DECLARATION.
+        let src = "package p;\ntypedef logic [7:0] byte_t;\nendpackage\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let alias = find_token(&toks, src, "byte_t", &rope);
+        assert_eq!(alias.token_type, TokenType::Type as u32, "typedef alias should be Type");
+        assert_eq!(alias.modifiers, TokenModifier::DECLARATION.0, "typedef alias should have DECLARATION");
+    }
+
+    #[test]
+    fn typedef_ref_in_variable_decl_is_type() {
+        // `uvm_status_e status;` — typedef'd type in a variable declaration.
+        let src = "module m;\n  uvm_status_e status;\nendmodule\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let ty = find_token(&toks, src, "uvm_status_e", &rope);
+        assert_eq!(ty.token_type, TokenType::Type as u32, "uvm_status_e should be Type, got {:?}", ty);
+    }
+
+    #[test]
+    fn typedef_ref_as_task_output_param_is_type() {
+        // `task foo(output uvm_status_e s);` — typedef in parameter type position.
+        let src = "class c;\n  task foo(output uvm_status_e s);\n  endtask\nendclass\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let ty = find_token(&toks, src, "uvm_status_e", &rope);
+        assert_eq!(ty.token_type, TokenType::Type as u32, "uvm_status_e param type should be Type");
+    }
+
+    #[test]
+    fn typedef_ref_as_function_return_type_is_type() {
+        // `function uvm_status_e get();` — typedef in function return type.
+        let src = "class c;\n  function uvm_status_e get();\n  endfunction\nendclass\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let ty = find_token(&toks, src, "uvm_status_e", &rope);
+        assert_eq!(ty.token_type, TokenType::Type as u32, "uvm_status_e return type should be Type");
+    }
+
+    #[test]
+    fn rand_field_typedef_is_type() {
+        // `rand uvm_reg_data_t value;` — UVM rand field with typedef type.
+        let src = "class c;\n  rand uvm_reg_data_t value;\nendclass\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let ty = find_token(&toks, src, "uvm_reg_data_t", &rope);
+        assert_eq!(ty.token_type, TokenType::Type as u32, "uvm_reg_data_t should be Type");
+    }
+
+    // ── function / method call-site tests ────────────────────────────────
+
+    #[test]
+    fn standalone_function_call_is_function() {
+        // `foo()` — bare function call; the callee name must be Function.
+        let src = "module m;\n  initial begin\n    foo();\n  end\nendmodule\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let callee = find_token(&toks, src, "foo", &rope);
+        assert_eq!(callee.token_type, TokenType::Function as u32, "foo() callee should be Function");
+        assert_eq!(callee.modifiers, TokenModifier::NONE.0);
+    }
+
+    #[test]
+    fn method_call_name_is_function() {
+        // `obj.method()` — the method name must be Function.
+        let src = "module m;\n  initial begin\n    obj.method();\n  end\nendmodule\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let callee = find_token(&toks, src, "method", &rope);
+        assert_eq!(callee.token_type, TokenType::Function as u32, "method should be Function");
+        assert_eq!(callee.modifiers, TokenModifier::NONE.0);
+    }
+
+    #[test]
+    fn method_call_receiver_is_variable() {
+        // `obj.method()` — the receiver object must stay Variable.
+        let src = "module m;\n  initial begin\n    obj.method();\n  end\nendmodule\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let receiver = find_token(&toks, src, "obj", &rope);
+        assert_eq!(receiver.token_type, TokenType::Variable as u32, "obj receiver should be Variable");
+    }
+
+    #[test]
+    fn super_dot_method_is_function() {
+        // `super.run_phase(ph)` — method name via implicit_class_handle must be Function.
+        // There are two occurrences of `run_phase`: declaration (Function+DECLARATION)
+        // and the super call (Function, no DECLARATION).
+        let src = "class c;\n  task run_phase(int ph);\n    super.run_phase(ph);\n  endtask\nendclass\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let matches: Vec<_> = toks
+            .iter()
+            .filter(|t| {
+                let line_start = rope.line_to_byte(t.line as usize);
+                let line_start_char = rope.byte_to_char(line_start);
+                let start_char = rope.utf16_cu_to_char(
+                    rope.char_to_utf16_cu(line_start_char) + t.start_col as usize,
+                );
+                let end_char = rope.utf16_cu_to_char(
+                    rope.char_to_utf16_cu(line_start_char) + (t.start_col + t.length) as usize,
+                );
+                let start_byte = rope.char_to_byte(start_char);
+                let end_byte = rope.char_to_byte(end_char);
+                src.get(start_byte..end_byte) == Some("run_phase")
+            })
+            .collect();
+        assert_eq!(matches.len(), 2, "expected two run_phase tokens, got {matches:#?}");
+        // First: task declaration — Function + DECLARATION.
+        assert_eq!(matches[0].token_type, TokenType::Function as u32);
+        assert_eq!(matches[0].modifiers, TokenModifier::DECLARATION.0);
+        // Second: super call — Function, no DECLARATION.
+        assert_eq!(matches[1].token_type, TokenType::Function as u32, "super.run_phase should be Function");
+        assert_eq!(matches[1].modifiers, TokenModifier::NONE.0, "super.run_phase should have no modifiers");
     }
 
     #[test]
