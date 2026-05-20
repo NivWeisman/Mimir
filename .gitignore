@@ -29,5 +29,7 @@ current-plan.md
 __pycache__/
 *.pyc
 
-# Other generated files
+# Example workspace repos are locally cloned external git repos; gitignore the
+# whole directory.  Users follow README "Setup examples" to clone them and the
+# .mimir.toml config is written by `make setup-examples` (or copied manually).
 examples/
