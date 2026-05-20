@@ -54,6 +54,7 @@ use mimir_syntax::{
 };
 use ropey::Rope;
 use tokio::sync::{Mutex, RwLock};
+use tree_sitter::InputEdit;
 use tokio::task::JoinHandle;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
@@ -268,12 +269,22 @@ impl Backend {
     /// Called after every store mutation. Errors are logged and swallowed —
     /// we never propagate a parse failure back to the editor as an LSP
     /// error, because the editor doesn't know what to do with it.
+    ///
+    /// `edits` are `tree_sitter::InputEdit`s that correspond to the changes
+    /// already applied to the rope. When non-empty and a prior tree exists,
+    /// we mutate the tree with each edit and pass it as `previous` to the
+    /// parser so tree-sitter can reuse unchanged subtrees. When empty (full
+    /// sync or first open), we do a full re-parse from scratch.
     #[instrument(level = "debug", skip(self), fields(uri = %uri))]
-    async fn reparse_and_publish(&self, uri: Url) {
-        let (text, version) = {
+    async fn reparse_and_publish(&self, uri: Url, edits: Vec<InputEdit>) {
+        let (text, version, prior_tree) = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
-                Some(state) => (state.document.text(), state.document.version()),
+                Some(state) => (
+                    state.document.text(),
+                    state.document.version(),
+                    state.tree.clone(),
+                ),
                 None => {
                     // Race: document was closed between the edit and our
                     // reparse. Nothing to do.
@@ -286,7 +297,20 @@ impl Backend {
         // Run the parse outside the doc-store lock.
         let parse_result = {
             let mut parser = self.parser.lock().await;
-            parser.parse(&text, None)
+            // Apply edits to a clone of the prior tree so tree-sitter can
+            // reuse subtrees that did not change. Full sync or first open
+            // leaves `edits` empty and we fall through to a full parse.
+            let prev: Option<SyntaxTree> = if !edits.is_empty() {
+                prior_tree.map(|mut t| {
+                    for edit in &edits {
+                        t.tree.edit(edit);
+                    }
+                    t
+                })
+            } else {
+                None
+            };
+            parser.parse(&text, prev.as_ref().map(|t| &t.tree))
         };
 
         let (diags, new_state) = match parse_result {
@@ -1388,6 +1412,55 @@ impl Backend {
 }
 
 // --------------------------------------------------------------------------
+// Incremental re-parse helpers
+// --------------------------------------------------------------------------
+
+/// Build a `tree_sitter::InputEdit` for an LSP incremental change.
+///
+/// Must be called on the **pre-edit** rope so that `start_byte` and
+/// `old_end_byte` refer to offsets in the old text, as tree-sitter requires.
+/// Returns `None` when the LSP range is out of bounds (we fall back to a
+/// full re-parse in that case).
+fn make_input_edit(rope: &Rope, range: MRange, new_text: &str) -> Option<InputEdit> {
+    let start_byte = range.start.to_byte_offset(rope).ok()?;
+    let old_end_byte = range.end.to_byte_offset(rope).ok()?;
+    let new_end_byte = start_byte + new_text.len();
+
+    let start_row = range.start.line as usize;
+    let start_col = start_byte - rope.line_to_byte(start_row);
+
+    let old_end_row = range.end.line as usize;
+    let old_end_col = old_end_byte - rope.line_to_byte(old_end_row);
+
+    // Where does the inserted text end in the new document?
+    let newline_count = new_text.bytes().filter(|&b| b == b'\n').count();
+    let (new_end_row, new_end_col) = if newline_count == 0 {
+        (start_row, start_col + new_text.len())
+    } else {
+        let last_nl = new_text.rfind('\n').unwrap();
+        (start_row + newline_count, new_text.len() - last_nl - 1)
+    };
+
+    Some(InputEdit {
+        start_byte,
+        old_end_byte,
+        new_end_byte,
+        start_position: tree_sitter::Point {
+            row: start_row,
+            column: start_col,
+        },
+        old_end_position: tree_sitter::Point {
+            row: old_end_row,
+            column: old_end_col,
+        },
+        new_end_position: tree_sitter::Point {
+            row: new_end_row,
+            column: new_end_col,
+        },
+    })
+}
+
+// --------------------------------------------------------------------------
 // LanguageServer impl — wires LSP requests/notifications to our store.
 // --------------------------------------------------------------------------
 
@@ -1685,7 +1758,7 @@ impl LanguageServer for Backend {
             );
         }
 
-        self.reparse_and_publish(uri.clone()).await;
+        self.reparse_and_publish(uri.clone(), Vec::new()).await;
         self.schedule_elaborate(uri).await;
     }
 
@@ -1698,6 +1771,12 @@ impl LanguageServer for Backend {
         // sent in document order — earlier ones must be applied before
         // later ones. We use a write lock for the whole batch so partial
         // states aren't observable to a concurrent reparse.
+        //
+        // We also build `tree_sitter::InputEdit`s so `reparse_and_publish`
+        // can hand them to the parser for incremental reuse of unchanged
+        // subtrees. A full-sync change (no `range`) resets the edits to
+        // empty, signalling a full re-parse.
+        let mut edits: Vec<InputEdit> = Vec::new();
         {
             let mut docs = self.documents.write().await;
             let Some(state) = docs.get_mut(&uri) else {
@@ -1710,7 +1789,8 @@ impl LanguageServer for Backend {
                     None => {
                         // Full sync (only happens if the client opted out
                         // of incremental sync — we advertise INCREMENTAL,
-                        // but be defensive).
+                        // but be defensive). Reset edits; full re-parse.
+                        edits.clear();
                         state.document.replace_all(&change.text, new_version);
                     }
                     Some(range) => {
@@ -1718,6 +1798,17 @@ impl LanguageServer for Backend {
                             MPosition::new(range.start.line, range.start.character),
                             MPosition::new(range.end.line, range.end.character),
                         );
+                        // Compute the InputEdit before mutating the rope so
+                        // byte offsets still refer to the pre-edit text.
+                        if let Some(edit) =
+                            make_input_edit(state.document.rope(), m_range, &change.text)
+                        {
+                            edits.push(edit);
+                        } else {
+                            // Could not compute edit (out-of-bounds position).
+                            // Fall back to full re-parse for safety.
+                            edits.clear();
+                        }
                         if let Err(e) = state.document.apply_incremental_edit(
                             m_range,
                             &change.text,
@@ -1728,13 +1819,14 @@ impl LanguageServer for Backend {
                             // diagnostics for this version will be wrong
                             // but the next full sync should resync us.
                             error!(error = %e, "incremental edit failed");
+                            edits.clear();
                         }
                     }
                 }
             }
         }
 
-        self.reparse_and_publish(uri.clone()).await;
+        self.reparse_and_publish(uri.clone(), edits).await;
         self.schedule_elaborate(uri).await;
     }
 
