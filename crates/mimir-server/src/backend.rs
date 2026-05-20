@@ -1294,8 +1294,12 @@ impl Backend {
             scored.push((s, make_item(sym.name, s, data)));
         }
 
+        // O(n) top-k selection instead of O(n log n) full sort.
+        if scored.len() > MAX_ITEMS {
+            scored.select_nth_unstable_by(MAX_ITEMS - 1, |a, b| b.0.cmp(&a.0));
+            scored.truncate(MAX_ITEMS);
+        }
         scored.sort_by_key(|e| std::cmp::Reverse(e.0));
-        scored.truncate(MAX_ITEMS);
         let items: Vec<CompletionItem> = scored.into_iter().map(|(_, it)| it).collect();
 
         debug!(
@@ -1397,8 +1401,12 @@ impl Backend {
             scored.push((demoted, item));
         }
 
+        // O(n) top-k selection instead of O(n log n) full sort.
+        if scored.len() > MAX_ITEMS {
+            scored.select_nth_unstable_by(MAX_ITEMS - 1, |a, b| b.0.cmp(&a.0));
+            scored.truncate(MAX_ITEMS);
+        }
         scored.sort_by_key(|e| std::cmp::Reverse(e.0));
-        scored.truncate(MAX_ITEMS);
         let items: Vec<CompletionItem> = scored.into_iter().map(|(_, it)| it).collect();
 
         debug!(
