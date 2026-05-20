@@ -1838,4 +1838,54 @@ mod tests {
         assert_eq!(resolved.defines.len(), 1);
         assert_eq!(resolved.defines[0].name, "SIM_BUILD");
     }
+
+    // ── example-workspace smoke tests ─────────────────────────────────────
+    // These tests load the real .mimir.toml files from examples/ to confirm
+    // they parse, resolve, and yield at least one source file.  The tests
+    // are skipped gracefully when the repos have not been cloned (e.g. in CI
+    // that doesn't carry the gitignored directories).
+
+    #[test]
+    fn example_riscv_dv_toml_loads_clean() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("examples/riscv-dv/.mimir.toml");
+        if !path.exists() {
+            eprintln!("SKIP: examples/riscv-dv not cloned — run `git clone` to enable");
+            return;
+        }
+        let proj = ResolvedProject::load(&path)
+            .expect("examples/riscv-dv/.mimir.toml should load without error");
+        assert!(!proj.files.is_empty(), "expected at least one resolved source file");
+        eprintln!(
+            "riscv-dv: {} files, {} include_dirs, {} defines",
+            proj.files.len(),
+            proj.include_dirs.len(),
+            proj.defines.len()
+        );
+    }
+
+    #[test]
+    fn example_ibex_toml_loads_clean() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("examples/ibex/.mimir.toml");
+        if !path.exists() {
+            eprintln!("SKIP: examples/ibex not cloned — run `git clone` to enable");
+            return;
+        }
+        let proj = ResolvedProject::load(&path)
+            .expect("examples/ibex/.mimir.toml should load without error");
+        assert!(!proj.files.is_empty(), "expected at least one resolved source file");
+        eprintln!(
+            "ibex: {} files, {} include_dirs, {} defines",
+            proj.files.len(),
+            proj.include_dirs.len(),
+            proj.defines.len()
+        );
+    }
 }
