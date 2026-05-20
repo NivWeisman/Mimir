@@ -148,14 +148,29 @@ Emacs (eglot picks up the parent process's environment):
 
 ```toml
 [env]
+# Absolute path — works everywhere:
 MIMIR_SLANG_PATH = "/absolute/path/to/slang-sidecar/build/mimir-slang-sidecar"
+
+# Relative path — resolved against the .mimir.toml directory:
+MIMIR_SLANG_PATH = "../../slang-sidecar/build/mimir-slang-sidecar"
+```
+
+Relative paths in `MIMIR_SLANG_PATH` are resolved against the directory that
+contains the `.mimir.toml`, so a project can ship a ready-to-use config that
+"just works" when the mimir repo is cloned alongside it.
+
+The [example workspace configs](#example-workspaces) already include this
+setting pointing at the standard sidecar build output:
+
+```toml
+[env]
+MIMIR_SLANG_PATH = "../../slang-sidecar/build/mimir-slang-sidecar"
 ```
 
 The process environment always takes precedence over `.mimir.toml`'s `[env]`
 section, so CI can override the project config by exporting `MIMIR_SLANG_PATH`.
 
-Without a sidecar path mimir falls back to tree-sitter-only diagnostics
-and any `.mimir.toml` in the project is ignored.
+Without a sidecar path mimir falls back to tree-sitter-only diagnostics.
 
 ### 3a. Configure VS Code
 
@@ -336,6 +351,51 @@ Slang elaboration is opt-in: build the sidecar and set `MIMIR_SLANG_PATH`
 the server uses your `.mimir.toml` automatically. Without it, mimir falls
 back to tree-sitter-only diagnostics and the `.mimir.toml` is simply
 ignored.
+
+### Example workspaces
+
+Two real-world RTL/DV projects are used as test subjects. Clone them into
+`examples/` after cloning mimir, then drop in the matching `.mimir.toml`:
+
+**chipsalliance/riscv-dv** (SV/UVM instruction generator, ~200 files):
+
+```bash
+git clone --depth=1 https://github.com/chipsalliance/riscv-dv examples/riscv-dv
+```
+
+`examples/riscv-dv/.mimir.toml`:
+
+```toml
+[env]
+RISCV_DV_ROOT    = "."
+MIMIR_SLANG_PATH = "../../slang-sidecar/build/mimir-slang-sidecar"
+
+[slang]
+filelist     = "files.f"
+include_dirs = ["target/rv32imc"]
+```
+
+**lowRISC/ibex** (32-bit RISC-V CPU, ~159 files):
+
+```bash
+git clone --depth=1 --no-recurse-submodules https://github.com/lowRISC/ibex examples/ibex
+```
+
+`examples/ibex/.mimir.toml`:
+
+```toml
+[env]
+MIMIR_SLANG_PATH = "../../slang-sidecar/build/mimir-slang-sidecar"
+
+[slang]
+filelist = "mimir.f"
+```
+
+`MIMIR_SLANG_PATH` in the `[env]` table is resolved relative to the
+`.mimir.toml` directory, so `../../slang-sidecar/build/mimir-slang-sidecar`
+points at the standard sidecar build output regardless of where you cloned
+mimir. If the sidecar binary isn't built yet, mimir falls back to
+tree-sitter-only mode silently — build it first with `make sidecar`.
 
 ---
 

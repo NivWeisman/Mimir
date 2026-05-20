@@ -1497,19 +1497,35 @@ impl LanguageServer for Backend {
                     // check whether the project's [env] table provides
                     // MIMIR_SLANG_PATH and try to spawn from there.
                     if self.slang.read().await.is_none() {
-                        if let Some(path) = resolved.env.get(crate::SLANG_PATH_ENV) {
-                            match mimir_slang::Client::spawn(path, std::iter::empty::<&str>()).await
+                        if let Some(raw) = resolved.env.get(crate::SLANG_PATH_ENV) {
+                            // Resolve relative paths against the .mimir.toml
+                            // directory so `MIMIR_SLANG_PATH =
+                            // "../../slang-sidecar/build/mimir-slang-sidecar"`
+                            // works regardless of the server's CWD.
+                            let abs_path = {
+                                let p = std::path::Path::new(raw);
+                                if p.is_absolute() {
+                                    p.to_path_buf()
+                                } else {
+                                    resolved.root.join(p)
+                                }
+                            };
+                            match mimir_slang::Client::spawn(
+                                &abs_path,
+                                std::iter::empty::<&str>(),
+                            )
+                            .await
                             {
                                 Ok(client) => {
                                     info!(
-                                        path = %path,
+                                        path = %abs_path.display(),
                                         "slang sidecar spawned from .mimir.toml [env]",
                                     );
                                     *self.slang.write().await = Some(Arc::new(client));
                                 }
                                 Err(e) => {
                                     warn!(
-                                        path = %path,
+                                        path = %abs_path.display(),
                                         error = %e,
                                         "could not spawn slang sidecar from .mimir.toml [env]; \
                                          continuing without",
