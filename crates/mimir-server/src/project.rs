@@ -1841,11 +1841,15 @@ mod tests {
 
     // ── example-workspace smoke tests ─────────────────────────────────────
     // These tests load the real .mimir.toml files from examples/ to confirm
-    // they parse, resolve, and yield at least one source file.  The tests
-    // are skipped gracefully when the repos have not been cloned (e.g. in CI
-    // that doesn't carry the gitignored directories).
+    // they parse, resolve, and yield at least one source file.
+    //
+    // Marked #[ignore] because the repos live in gitignored directories and
+    // are NOT present in CI.  Run manually with:
+    //   cargo test -p mimir-server -- --ignored example_
+    // after cloning the repos into examples/.
 
     #[test]
+    #[ignore = "requires locally cloned examples/riscv-dv (gitignored, not in CI)"]
     fn example_riscv_dv_toml_loads_clean() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1868,6 +1872,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires locally cloned examples/ibex (gitignored, not in CI)"]
     fn example_ibex_toml_loads_clean() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
