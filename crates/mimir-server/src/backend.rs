@@ -2365,11 +2365,7 @@ impl LanguageServer for Backend {
             Some(s) => Some(s),
             None => {
                 let ws = self.workspace.read().await;
-                let found = ws
-                    .index
-                    .entries()
-                    .find(|e| e.symbol.name == call.name)
-                    .map(|e| e.symbol.clone());
+                let found = ws.index.lookup(&call.name).first().map(|e| e.symbol.clone());
                 drop(ws);
                 found
             }
@@ -2504,10 +2500,7 @@ impl LanguageServer for Backend {
             let same_file_hit = index.iter().find(|s| s.name == call.name).cloned();
             // Workspace-wide (filelist + include-chain hydration) fallback.
             let workspace_hit = if same_file_hit.is_none() {
-                ws.index
-                    .entries()
-                    .find(|e| e.symbol.name == call.name)
-                    .map(|e| e.symbol.clone())
+                ws.index.lookup(&call.name).first().map(|e| e.symbol.clone())
             } else {
                 None
             };
