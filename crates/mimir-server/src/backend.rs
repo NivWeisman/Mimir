@@ -63,7 +63,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::completion_score;
 use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
 use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
-use crate::workspace_index::{self, WorkspaceIndex};
+use crate::workspace_index::{self, WorkspaceIndex, WorkspaceState};
 
 /// Per-document state held inside the store.
 ///
@@ -162,23 +162,12 @@ pub(crate) struct Backend {
     /// every edit.
     startup_index_logged: Arc<AtomicBool>,
 
-    /// Workspace-wide tree-sitter symbol index. Populated from two sources:
-    /// every `reparse_and_publish` for an open document folds that doc's
-    /// fresh `Vec<Symbol>` in, and `initialize` spawns a one-shot
-    /// hydration over `ResolvedProject.files` so cross-file F12 works
-    /// against the filelist before the user opens those files. See
-    /// [`workspace_index`] for the data structure and the open-vs-disk
-    /// precedence rules.
-    workspace_index: Arc<RwLock<WorkspaceIndex>>,
-
-    /// Cached parse trees for all known files (filelist-hydrated and open
-    /// documents). Updated alongside `workspace_index` on every hydration
-    /// pass and on every successful `reparse_and_publish` for open files,
-    /// so that closing a file after editing it does not introduce a
-    /// stale-tree window. The `references` handler queries this for closed
-    /// files (those absent from the open-document store), replacing the
-    /// former "declaration sites only" fallback with full occurrence scans.
-    workspace_trees: Arc<RwLock<HashMap<Url, SyntaxTree>>>,
+    /// Combined workspace symbol index and parse trees under a single lock.
+    ///
+    /// The two halves are always updated atomically so reads of `index` and
+    /// `trees` are guaranteed to be in sync. See [`WorkspaceState`] and
+    /// [`workspace_index`] for the full data-structure contract.
+    workspace: Arc<RwLock<WorkspaceState>>,
 }
 
 impl Backend {
@@ -200,8 +189,7 @@ impl Backend {
             slang_published: Arc::new(RwLock::new(HashSet::new())),
             last_elaborate_input_hash: Arc::new(RwLock::new(None)),
             startup_index_logged: Arc::new(AtomicBool::new(false)),
-            workspace_index: Arc::new(RwLock::new(WorkspaceIndex::new())),
-            workspace_trees: Arc::new(RwLock::new(HashMap::new())),
+            workspace: Arc::new(RwLock::new(WorkspaceState::default())),
         }
     }
 
@@ -299,13 +287,12 @@ impl Backend {
                 }
             };
             if updated {
-                // Workspace locks acquired *after* the doc-store lock is
+                // Workspace lock acquired *after* the doc-store lock is
                 // dropped — no nested locks, no risk of an ordering
                 // deadlock with the hydration task.
-                let mut wi = self.workspace_index.write().await;
-                wi.update(uri.clone(), &index);
-                let mut wt = self.workspace_trees.write().await;
-                wt.insert(uri.clone(), tree_for_cache);
+                let mut ws = self.workspace.write().await;
+                ws.index.update(uri.clone(), &index);
+                ws.trees.insert(uri.clone(), tree_for_cache);
             }
         }
 
@@ -533,17 +520,9 @@ impl Backend {
                 let include_dirs = resolved.include_dirs.clone();
                 *self.project.write().await = Some(resolved);
                 let parser = self.parser.clone();
-                let workspace_index = self.workspace_index.clone();
-                let workspace_trees = self.workspace_trees.clone();
+                let workspace = self.workspace.clone();
                 tokio::spawn(async move {
-                    hydrate_workspace_index(
-                        paths,
-                        include_dirs,
-                        parser,
-                        workspace_index,
-                        workspace_trees,
-                    )
-                    .await;
+                    hydrate_workspace_index(paths, include_dirs, parser, workspace).await;
                 });
             }
             Ok(None) => {
@@ -588,12 +567,11 @@ impl Backend {
                 |path| std::fs::read_to_string(path).ok(),
             )
         };
-        let mut wi = self.workspace_index.write().await;
-        let mut wt = self.workspace_trees.write().await;
+        let mut ws = self.workspace.write().await;
         for (url, syms, tree) in entries {
             debug!(url = %url, count = syms.len(), "re-hydrated single file");
-            wi.update(url.clone(), &syms);
-            wt.insert(url, tree);
+            ws.index.update(url.clone(), &syms);
+            ws.trees.insert(url, tree);
         }
     }
 
@@ -626,11 +604,11 @@ impl Backend {
         let resolved: Option<(Url, Symbol)> = match &receiver {
             Some(mimir_syntax::symbols::HoverReceiver::This) => {
                 let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, target)?;
-                let wi = self.workspace_index.read().await;
-                find_method_in_class(&wi, &info.class_name, name)
-                    .or_else(|| find_field_in_class(&wi, &info.class_name, name))
+                let ws = self.workspace.read().await;
+                find_method_in_class(&ws.index, &info.class_name, name)
+                    .or_else(|| find_field_in_class(&ws.index, &info.class_name, name))
                     .map(|sym| {
-                        let url = method_url_in_class(&wi, &info.class_name, &sym)
+                        let url = method_url_in_class(&ws.index, &info.class_name, &sym)
                             .unwrap_or_else(|| uri.clone());
                         (url, sym)
                     })
@@ -638,12 +616,12 @@ impl Backend {
             Some(mimir_syntax::symbols::HoverReceiver::Super) => {
                 let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, target)?;
                 let parent = info.parent_class_name?;
-                let wi = self.workspace_index.read().await;
-                find_method_in_class(&wi, &parent, name)
-                    .or_else(|| find_field_in_class(&wi, &parent, name))
+                let ws = self.workspace.read().await;
+                find_method_in_class(&ws.index, &parent, name)
+                    .or_else(|| find_field_in_class(&ws.index, &parent, name))
                     .map(|sym| {
-                        let url =
-                            method_url_in_class(&wi, &parent, &sym).unwrap_or_else(|| uri.clone());
+                        let url = method_url_in_class(&ws.index, &parent, &sym)
+                            .unwrap_or_else(|| uri.clone());
                         (url, sym)
                     })
             }
@@ -651,12 +629,12 @@ impl Backend {
                 let ty =
                     mimir_syntax::symbols::find_variable_type_at(tree, rope, target, recv_name)?;
                 let cls = mimir_syntax::symbols::normalize_type_name(&ty)?;
-                let wi = self.workspace_index.read().await;
-                find_method_in_class(&wi, &cls, name)
-                    .or_else(|| find_field_in_class(&wi, &cls, name))
+                let ws = self.workspace.read().await;
+                find_method_in_class(&ws.index, &cls, name)
+                    .or_else(|| find_field_in_class(&ws.index, &cls, name))
                     .map(|sym| {
-                        let url =
-                            method_url_in_class(&wi, &cls, &sym).unwrap_or_else(|| uri.clone());
+                        let url = method_url_in_class(&ws.index, &cls, &sym)
+                            .unwrap_or_else(|| uri.clone());
                         (url, sym)
                     })
             }
@@ -665,8 +643,9 @@ impl Backend {
                 if let Some(sym) = same_file_index.iter().find(|s| s.name == name).cloned() {
                     Some((uri.clone(), sym))
                 } else {
-                    let wi = self.workspace_index.read().await;
-                    wi.lookup(name)
+                    let ws = self.workspace.read().await;
+                    ws.index
+                        .lookup(name)
                         .first()
                         .map(|e| (e.url.clone(), e.symbol.clone()))
                 }
@@ -717,9 +696,9 @@ impl Backend {
         // full multi-line body — the slang path otherwise reads a single
         // line from disk, which silently truncates multi-line declarations.
         let workspace_match: Option<(Url, Symbol)> = {
-            let wi = self.workspace_index.read().await;
+            let ws = self.workspace.read().await;
             let mut hit = None;
-            for entry in wi.entries() {
+            for entry in ws.index.entries() {
                 if entry.url == dest_uri && entry.symbol.name_range.start.line == line_no {
                     hit = Some((entry.url.clone(), entry.symbol.clone()));
                     break;
@@ -904,8 +883,9 @@ impl Backend {
         // lock (lock-then-clone) so the resolver runs without holding
         // either lock. Empty slice when there's no workspace match.
         let workspace_hits: Vec<(Url, Symbol)> = {
-            let wi = self.workspace_index.read().await;
-            wi.lookup(name)
+            let ws = self.workspace.read().await;
+            ws.index
+                .lookup(name)
                 .iter()
                 .map(|e| (e.url.clone(), e.symbol.clone()))
                 .collect()
@@ -1177,8 +1157,9 @@ impl Backend {
         };
 
         let cross_file: Vec<(Url, Symbol)> = {
-            let wi = self.workspace_index.read().await;
-            wi.entries()
+            let ws = self.workspace.read().await;
+            ws.index
+                .entries()
                 .filter(|e| keep(&e.symbol))
                 .map(|e| (e.url.clone(), e.symbol.clone()))
                 .collect()
@@ -1418,20 +1399,12 @@ impl LanguageServer for Backend {
                     let paths = resolved.files.clone();
                     let include_dirs = resolved.include_dirs.clone();
                     let parser = self.parser.clone();
-                    let workspace_index = self.workspace_index.clone();
-                    let workspace_trees = self.workspace_trees.clone();
+                    let workspace = self.workspace.clone();
                     // Snapshot the first project file before the move so we
                     // can build a stable startup-elaborate trigger URI.
                     let first_project_file = paths.first().cloned();
                     tokio::spawn(async move {
-                        hydrate_workspace_index(
-                            paths,
-                            include_dirs,
-                            parser,
-                            workspace_index,
-                            workspace_trees,
-                        )
-                        .await;
+                        hydrate_workspace_index(paths, include_dirs, parser, workspace).await;
                     });
                     *self.project.write().await = Some(resolved);
 
@@ -1775,10 +1748,9 @@ impl LanguageServer for Backend {
             match evt.typ {
                 FileChangeType::DELETED => {
                     debug!(path = %path.display(), "watched file deleted; evicting");
-                    let mut wi = self.workspace_index.write().await;
-                    wi.update(evt.uri.clone(), &[]);
-                    let mut wt = self.workspace_trees.write().await;
-                    wt.remove(&evt.uri);
+                    let mut ws = self.workspace.write().await;
+                    ws.index.update(evt.uri.clone(), &[]);
+                    ws.trees.remove(&evt.uri);
                 }
                 FileChangeType::CREATED | FileChangeType::CHANGED => {
                     if is_mimir_toml {
@@ -2032,8 +2004,9 @@ impl LanguageServer for Backend {
             .chain(std::iter::once(&uri))
             .collect();
         let closed_trees: Vec<(Url, SyntaxTree)> = {
-            let wt = self.workspace_trees.read().await;
-            wt.iter()
+            let ws = self.workspace.read().await;
+            ws.trees
+                .iter()
                 .filter(|(url, _)| !open_urls.contains(url))
                 .map(|(url, tree)| (url.clone(), tree.clone()))
                 .collect()
@@ -2045,7 +2018,7 @@ impl LanguageServer for Backend {
         let all_other_trees: Vec<(Url, SyntaxTree)> =
             other_open.into_iter().chain(closed_trees).collect();
 
-        let wi = self.workspace_index.read().await;
+        let ws = self.workspace.read().await;
         let locations = collect_references(
             &name,
             &uri,
@@ -2053,7 +2026,7 @@ impl LanguageServer for Backend {
             &cursor_rope,
             target,
             &all_other_trees,
-            &wi,
+            &ws.index,
             include_declaration,
         );
         debug!(count = locations.len(), name = %name, "references returned");
@@ -2161,8 +2134,8 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
-        let wi = self.workspace_index.read().await;
-        let results = rank_workspace_symbols(&params.query, wi.entries());
+        let ws = self.workspace.read().await;
+        let results = rank_workspace_symbols(&params.query, ws.index.entries());
         debug!(returned = results.len(), "workspace/symbol returned");
         Ok(Some(results))
     }
@@ -2326,12 +2299,13 @@ impl LanguageServer for Backend {
         let sym: Option<Symbol> = match index.iter().find(|s| s.name == call.name).cloned() {
             Some(s) => Some(s),
             None => {
-                let wi = self.workspace_index.read().await;
-                let found = wi
+                let ws = self.workspace.read().await;
+                let found = ws
+                    .index
                     .entries()
                     .find(|e| e.symbol.name == call.name)
                     .map(|e| e.symbol.clone());
-                drop(wi);
+                drop(ws);
                 found
             }
         };
@@ -2394,7 +2368,7 @@ impl LanguageServer for Backend {
             "inlay_hint trace: scanning AST for call sites in viewport",
         );
 
-        let wi = self.workspace_index.read().await;
+        let ws = self.workspace.read().await;
         let mut hints: Vec<InlayHint> = Vec::new();
 
         for call in &call_sites {
@@ -2416,7 +2390,7 @@ impl LanguageServer for Backend {
             //   * `obj.X(...)`    → resolve via the AST-declared type of `obj`
             if matches!(call.kind, CallKind::Method { .. }) {
                 let recv = receiver.unwrap_or("");
-                let resolved = resolve_method_symbol(call, recv, &tree, &rope, &index, &wi);
+                let resolved = resolve_method_symbol(call, recv, &tree, &rope, &index, &ws.index);
                 match resolved {
                     MethodResolution::Resolved(sym, source_label) => {
                         let labels = hints_for(call, &sym);
@@ -2465,7 +2439,8 @@ impl LanguageServer for Backend {
             let same_file_hit = index.iter().find(|s| s.name == call.name).cloned();
             // Workspace-wide (filelist + include-chain hydration) fallback.
             let workspace_hit = if same_file_hit.is_none() {
-                wi.entries()
+                ws.index
+                    .entries()
                     .find(|e| e.symbol.name == call.name)
                     .map(|e| e.symbol.clone())
             } else {
@@ -2862,8 +2837,7 @@ async fn hydrate_workspace_index(
     paths: Vec<PathBuf>,
     include_dirs: Vec<PathBuf>,
     parser: Arc<Mutex<SyntaxParser>>,
-    workspace_index: Arc<RwLock<WorkspaceIndex>>,
-    workspace_trees: Arc<RwLock<HashMap<Url, SyntaxTree>>>,
+    workspace: Arc<RwLock<WorkspaceState>>,
 ) {
     let count_requested = paths.len();
     let entries = {
@@ -2875,11 +2849,10 @@ async fn hydrate_workspace_index(
 
     let parsed = entries.len();
     {
-        let mut wi = workspace_index.write().await;
-        let mut wt = workspace_trees.write().await;
+        let mut ws = workspace.write().await;
         for (url, syms, tree) in entries {
-            wi.update(url.clone(), &syms);
-            wt.insert(url, tree);
+            ws.index.update(url.clone(), &syms);
+            ws.trees.insert(url, tree);
         }
     }
     info!(
@@ -6136,14 +6109,14 @@ mod tests {
 
         // Seed the workspace index with a synthetic entry for `url`.
         {
-            let mut wi = backend.workspace_index.write().await;
-            wi.update(
+            let mut ws = backend.workspace.write().await;
+            ws.index.update(
                 url.clone(),
                 &[sym("my_class", MSymbolKind::Class, 0)],
             );
         }
         assert!(
-            !backend.workspace_index.read().await.lookup("my_class").is_empty(),
+            !backend.workspace.read().await.index.lookup("my_class").is_empty(),
             "precondition: synthetic entry indexed",
         );
 
@@ -6157,7 +6130,7 @@ mod tests {
             .await;
 
         assert!(
-            backend.workspace_index.read().await.lookup("my_class").is_empty(),
+            backend.workspace.read().await.index.lookup("my_class").is_empty(),
             "deleted event should have evicted the entry",
         );
     }
@@ -6218,7 +6191,7 @@ mod tests {
             .await;
         // No assertion needed beyond "didn't panic" — the workspace
         // index remains empty.
-        assert_eq!(backend.workspace_index.read().await.entries().count(), 0);
+        assert_eq!(backend.workspace.read().await.index.entries().count(), 0);
     }
 
     // ----------------------------------------------------------------------
@@ -6721,7 +6694,7 @@ mod tests {
     /// pairs. Mirrors how the eager hydration pass folds parsed-from-disk
     /// files into the index on `initialize`.
     fn workspace_index_from(files: &[(&Url, &str)]) -> WorkspaceIndex {
-        let mut wi = WorkspaceIndex::new();
+        let mut wi = WorkspaceIndex::default();
         for (u, text) in files {
             let tree = parse_tree(text);
             let rope = Rope::from_str(text);
@@ -6781,7 +6754,7 @@ mod tests {
     fn references_returns_same_file_occurrences() {
         let here = url("file:///a.sv");
         let text = "module m;\n  int foo;\n  initial foo = 1;\nendmodule\n";
-        let wi = WorkspaceIndex::new();
+        let wi = WorkspaceIndex::default();
         let out = run_references("foo", &here, text, &[], &wi, true);
         assert_eq!(out.len(), 2, "decl + one use");
         assert!(out.iter().all(|l| l.uri == here));
@@ -6796,7 +6769,7 @@ mod tests {
         let other = url("file:///b.sv");
         let cursor_text = "module a;\n  my_class c;\nendmodule\n";
         let other_text = "module b;\n  my_class c1;\n  my_class c2;\nendmodule\n";
-        let wi = WorkspaceIndex::new();
+        let wi = WorkspaceIndex::default();
         let out = run_references(
             "my_class",
             &here,
@@ -6915,7 +6888,7 @@ mod tests {
             text.push_str("  initial foo = 1;\n");
         }
         text.push_str("endmodule\n");
-        let wi = WorkspaceIndex::new();
+        let wi = WorkspaceIndex::default();
         let out = run_references("foo", &here, &text, &[], &wi, true);
         assert_eq!(out.len(), REFERENCES_LIMIT);
     }

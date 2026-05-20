@@ -57,13 +57,21 @@ pub struct WorkspaceIndex {
     per_url: HashMap<Url, Vec<String>>,
 }
 
-impl WorkspaceIndex {
-    /// Empty index. Backend constructs one of these in `Backend::new`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+/// Combined workspace symbol index and parse trees, held under a single lock.
+///
+/// By merging [`WorkspaceIndex`] and the parse-tree map into one guarded
+/// struct, callers acquire exactly one lock instead of two, eliminating the
+/// lock-ordering constraint that previously existed between the old
+/// `workspace_index` and `workspace_trees` fields on `Backend`.
+#[derive(Debug, Default)]
+pub struct WorkspaceState {
+    /// Symbol index — maps declaration names to the files that declare them.
+    pub index: WorkspaceIndex,
+    /// Parse tree cache — maps URLs to their most recent successful tree.
+    pub trees: HashMap<Url, SyntaxTree>,
+}
 
+impl WorkspaceIndex {
     /// Replace every entry registered for `url` with the supplied
     /// `symbols`. An empty `symbols` slice removes `url` from the index
     /// entirely.
@@ -221,7 +229,7 @@ mod tests {
     /// must not append duplicates.
     #[test]
     fn update_replaces_prior_entries_for_url() {
-        let mut idx = WorkspaceIndex::new();
+        let mut idx = WorkspaceIndex::default();
         let u = url("file:///a.sv");
         idx.update(u.clone(), &[sym("foo", SymbolKind::Module, 0)]);
         idx.update(u.clone(), &[sym("bar", SymbolKind::Class, 0)]);
@@ -239,7 +247,7 @@ mod tests {
     /// entirely. Used when a parse fails or a doc is closed-then-cleared.
     #[test]
     fn update_with_empty_removes_url_entries() {
-        let mut idx = WorkspaceIndex::new();
+        let mut idx = WorkspaceIndex::default();
         let u = url("file:///a.sv");
         idx.update(u.clone(), &[sym("foo", SymbolKind::Module, 0)]);
         idx.update(u, &[]);
@@ -249,7 +257,7 @@ mod tests {
     /// Lookup returns matches across multiple URLs, in update order.
     #[test]
     fn lookup_returns_matches_across_urls() {
-        let mut idx = WorkspaceIndex::new();
+        let mut idx = WorkspaceIndex::default();
         let a = url("file:///a.sv");
         let b = url("file:///b.sv");
         idx.update(a.clone(), &[sym("shared", SymbolKind::Class, 1)]);
@@ -265,7 +273,7 @@ mod tests {
     /// Lookup of an unknown name returns the empty slice (not a panic).
     #[test]
     fn lookup_missing_name_returns_empty() {
-        let idx = WorkspaceIndex::new();
+        let idx = WorkspaceIndex::default();
         assert!(idx.lookup("whatever").is_empty());
     }
 
@@ -308,7 +316,7 @@ mod tests {
     /// appear exactly once.
     #[test]
     fn entries_yields_every_registered_entry() {
-        let mut idx = WorkspaceIndex::new();
+        let mut idx = WorkspaceIndex::default();
         idx.update(
             url("file:///a.sv"),
             &[
