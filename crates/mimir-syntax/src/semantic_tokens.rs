@@ -507,7 +507,17 @@ fn classify_identifier(node: Node<'_>) -> (TokenType, TokenModifier) {
                 (TokenType::Variable, TokenModifier::NONE)
             }
         }
-        "class_type" => (TokenType::Class, TokenModifier::NONE),
+        "class_type" => {
+            // In `pkg::ClassName`, both identifiers are direct children of
+            // `class_type`. Distinguish the package qualifier (its next
+            // sibling is `::`) from the actual class name (after `::` or
+            // the only identifier).
+            if node.next_sibling().is_some_and(|s| s.kind() == "::") {
+                (TokenType::Namespace, TokenModifier::NONE)
+            } else {
+                (TokenType::Class, TokenModifier::NONE)
+            }
+        }
         "function_body_declaration" | "task_body_declaration" => {
             if is_first_named_kind(parent, "simple_identifier", node) {
                 (TokenType::Function, TokenModifier::DECLARATION)
@@ -670,6 +680,32 @@ mod tests {
         let base = find_token(&toks, src, "base", &rope);
         assert_eq!(base.token_type, TokenType::Class as u32);
         assert_eq!(base.modifiers, TokenModifier::NONE.0);
+    }
+
+    #[test]
+    fn package_scoped_class_qualifier_is_namespace_class_is_class() {
+        // `pkg::my_class x;` — `pkg` is the package qualifier so it must
+        // be Namespace; `my_class` is the class reference so it must be Class.
+        let src = "module m;\n  pkg::my_class x;\nendmodule\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let pkg = find_token(&toks, src, "pkg", &rope);
+        assert_eq!(pkg.token_type, TokenType::Namespace as u32, "pkg should be Namespace");
+        let cls = find_token(&toks, src, "my_class", &rope);
+        assert_eq!(cls.token_type, TokenType::Class as u32, "my_class should be Class");
+        assert_eq!(cls.modifiers, TokenModifier::NONE.0);
+    }
+
+    #[test]
+    fn package_scoped_extends_qualifier_is_namespace() {
+        // `class c extends pkg::base;` — same scoping rule in extends clause.
+        let src = "class c extends pkg::base;\nendclass\n";
+        let toks = classify(src);
+        let rope = Rope::from_str(src);
+        let pkg = find_token(&toks, src, "pkg", &rope);
+        assert_eq!(pkg.token_type, TokenType::Namespace as u32, "pkg should be Namespace in extends");
+        let base = find_token(&toks, src, "base", &rope);
+        assert_eq!(base.token_type, TokenType::Class as u32, "base should be Class in extends");
     }
 
     #[test]
