@@ -48,13 +48,22 @@ pub struct Entry {
 
 /// Workspace-wide symbol map.
 ///
-/// Internally two structures kept in sync: `by_name` for lookups, `per_url`
-/// to drop a URL's previous entries on re-index without scanning the whole
-/// map.
+/// Internally four structures kept in sync:
+/// - `by_name` for name lookups,
+/// - `per_url` to drop a URL's previous entries on re-index without scanning the whole map,
+/// - `by_location` for O(1) `(url, line)` → `Entry` lookup used by `try_slang_hover`,
+/// - `per_url_lines` to drop location entries on re-index without a full scan.
 #[derive(Debug, Default)]
 pub struct WorkspaceIndex {
     by_name: HashMap<String, Vec<Entry>>,
     per_url: HashMap<Url, Vec<String>>,
+    /// Reverse index: `(url, declaration_line)` → symbol name. Enables O(1)
+    /// resolution in `try_slang_hover` which receives a file URL and line
+    /// number from slang and needs to find the matching `Symbol`.
+    by_location: HashMap<(Url, u32), String>,
+    /// Tracks which `(url, line)` pairs were registered for each `url` so
+    /// `update` can evict the old location entries without a full scan.
+    per_url_lines: HashMap<Url, Vec<u32>>,
 }
 
 /// Combined workspace symbol index and parse trees, held under a single lock.
@@ -90,14 +99,24 @@ impl WorkspaceIndex {
                 }
             }
         }
+        if let Some(prior_lines) = self.per_url_lines.remove(&url) {
+            for line in prior_lines {
+                self.by_location.remove(&(url.clone(), line));
+            }
+        }
 
         if symbols.is_empty() {
             return;
         }
 
         let mut new_names: Vec<String> = Vec::with_capacity(symbols.len());
+        let mut new_lines: Vec<u32> = Vec::with_capacity(symbols.len());
         for sym in symbols {
             new_names.push(sym.name.clone());
+            let line = sym.name_range.start.line;
+            new_lines.push(line);
+            self.by_location
+                .insert((url.clone(), line), sym.name.clone());
             self.by_name
                 .entry(sym.name.clone())
                 .or_default()
@@ -106,7 +125,22 @@ impl WorkspaceIndex {
                     symbol: sym.clone(),
                 });
         }
-        self.per_url.insert(url, new_names);
+        self.per_url.insert(url.clone(), new_names);
+        self.per_url_lines.insert(url, new_lines);
+    }
+
+    /// Look up the entry whose declaration starts at `(url, line)`.
+    ///
+    /// O(1) via the reverse location index. Used by `try_slang_hover` to
+    /// convert a slang-returned `(path, line)` pair into the matching
+    /// `Symbol` without scanning the entire index.
+    #[must_use]
+    pub fn lookup_by_location(&self, url: &Url, line: u32) -> Option<&Entry> {
+        let name = self.by_location.get(&(url.clone(), line))?;
+        self.by_name
+            .get(name)?
+            .iter()
+            .find(|e| &e.url == url && e.symbol.name_range.start.line == line)
     }
 
     /// All entries registered under `name`. Empty slice on miss.
@@ -393,5 +427,55 @@ mod tests {
             names.contains(&"uvm_object".to_string()),
             "expected uvm_object in {names:?}"
         );
+    }
+
+    // ── lookup_by_location tests ──────────────────────────────────────────
+
+    /// `lookup_by_location` finds the symbol whose declaration starts at the
+    /// exact `(url, line)` pair.
+    #[test]
+    fn lookup_by_location_finds_exact_match() {
+        let mut idx = WorkspaceIndex::default();
+        let u = url("file:///a.sv");
+        idx.update(u.clone(), &[sym("my_module", SymbolKind::Module, 5)]);
+
+        let entry = idx.lookup_by_location(&u, 5).expect("should find at line 5");
+        assert_eq!(entry.symbol.name, "my_module");
+        assert_eq!(entry.url, u);
+    }
+
+    /// `lookup_by_location` returns `None` for a line with no declaration.
+    #[test]
+    fn lookup_by_location_miss_on_unknown_line() {
+        let mut idx = WorkspaceIndex::default();
+        let u = url("file:///a.sv");
+        idx.update(u.clone(), &[sym("my_module", SymbolKind::Module, 5)]);
+
+        assert!(idx.lookup_by_location(&u, 99).is_none());
+    }
+
+    /// Re-indexing a URL replaces the old location entries — the old line
+    /// must no longer be found.
+    #[test]
+    fn lookup_by_location_replaced_on_reindex() {
+        let mut idx = WorkspaceIndex::default();
+        let u = url("file:///a.sv");
+        idx.update(u.clone(), &[sym("foo", SymbolKind::Module, 3)]);
+        // Re-index at a different line.
+        idx.update(u.clone(), &[sym("foo", SymbolKind::Module, 7)]);
+
+        assert!(idx.lookup_by_location(&u, 3).is_none(), "old line evicted");
+        assert!(idx.lookup_by_location(&u, 7).is_some(), "new line present");
+    }
+
+    /// `update` with an empty slice evicts all location entries for the URL.
+    #[test]
+    fn lookup_by_location_cleared_on_empty_update() {
+        let mut idx = WorkspaceIndex::default();
+        let u = url("file:///a.sv");
+        idx.update(u.clone(), &[sym("foo", SymbolKind::Module, 2)]);
+        idx.update(u.clone(), &[]);
+
+        assert!(idx.lookup_by_location(&u, 2).is_none(), "entry must be gone");
     }
 }

@@ -743,16 +743,12 @@ impl Backend {
         // callables get their synthesized signature and macros get their
         // full multi-line body — the slang path otherwise reads a single
         // line from disk, which silently truncates multi-line declarations.
+        // O(1) via the reverse location index — no full-workspace scan.
         let workspace_match: Option<(Url, Symbol)> = {
             let ws = self.workspace.read().await;
-            let mut hit = None;
-            for entry in ws.index.entries() {
-                if entry.url == dest_uri && entry.symbol.name_range.start.line == line_no {
-                    hit = Some((entry.url.clone(), entry.symbol.clone()));
-                    break;
-                }
-            }
-            hit
+            ws.index
+                .lookup_by_location(&dest_uri, line_no)
+                .map(|e| (e.url.clone(), e.symbol.clone()))
         };
         if let Some((sym_url, sym)) = workspace_match {
             let docs = self.documents.read().await;
