@@ -31,6 +31,7 @@
 
 use mimir_core::{Position, Range};
 use ropey::Rope;
+use std::collections::HashSet;
 use tracing::trace;
 use tree_sitter::Node;
 
@@ -1038,6 +1039,37 @@ pub fn class_new_lhs_at(
 ///   both return. v1 is text-based; future work can add scope-aware
 ///   matching by routing through a semantic backend.
 ///
+/// Extract every distinct identifier-like token from a file's source text.
+///
+/// Used by `mimir-server` to build a per-file identifier presence index so
+/// the `textDocument/references` handler can skip scanning files that cannot
+/// possibly contain occurrences of a given name.
+///
+/// This intentionally scans the **source text** (not the AST) for simplicity
+/// and speed. It collects any contiguous run of `[A-Za-z0-9_]` that starts
+/// with `[A-Za-z_]` — this includes SV keywords. Keywords are harmless false
+/// positives: a file reported as "possibly contains `for`" will just be
+/// scanned and return zero occurrence matches, not misidentify anything.
+#[must_use]
+pub fn identifier_names(source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            // SAFETY: `start..i` is a valid ASCII subslice of a valid UTF-8 str.
+            names.insert(source[start..i].to_owned());
+        } else {
+            i += 1;
+        }
+    }
+    names
+}
+
 /// Returns an empty `Vec` for an empty `name` (defensive — saves the walk).
 #[must_use]
 pub fn occurrences_of(tree: &SyntaxTree, rope: &Rope, name: &str) -> Vec<Range> {

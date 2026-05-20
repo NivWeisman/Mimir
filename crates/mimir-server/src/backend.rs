@@ -357,7 +357,9 @@ impl Backend {
                 // Workspace lock acquired *after* the doc-store lock is
                 // dropped — no nested locks, no risk of an ordering
                 // deadlock with the hydration task.
+                let presence_names = mimir_syntax::symbols::identifier_names(tree_for_cache.source());
                 let mut ws = self.workspace.write().await;
+                ws.update_presence(uri.clone(), presence_names);
                 ws.index.update(uri.clone(), &index);
                 ws.trees.insert(uri.clone(), tree_for_cache);
             }
@@ -642,6 +644,8 @@ impl Backend {
         let mut ws = self.workspace.write().await;
         for (url, syms, tree) in entries {
             debug!(url = %url, count = syms.len(), "re-hydrated single file");
+            let names = mimir_syntax::symbols::identifier_names(tree.source());
+            ws.update_presence(url.clone(), names);
             ws.index.update(url.clone(), &syms);
             ws.trees.insert(url, tree);
         }
@@ -2170,9 +2174,13 @@ impl LanguageServer for Backend {
             .collect();
         let closed_trees: Vec<(Url, SyntaxTree)> = {
             let ws = self.workspace.read().await;
+            // Pre-filter by identifier presence: skip files that definitely
+            // do not contain `name` as any token. O(1) check per file URL.
+            let candidates = ws.files_containing(&name);
             ws.trees
                 .iter()
                 .filter(|(url, _)| !open_urls.contains(url))
+                .filter(|(url, _)| candidates.is_some_and(|s| s.contains(url)))
                 .map(|(url, tree)| (url.clone(), tree.clone()))
                 .collect()
         };
@@ -3009,6 +3017,8 @@ async fn hydrate_workspace_index(
     {
         let mut ws = workspace.write().await;
         for (url, syms, tree) in entries {
+            let names = mimir_syntax::symbols::identifier_names(tree.source());
+            ws.update_presence(url.clone(), names);
             ws.index.update(url.clone(), &syms);
             ws.trees.insert(url, tree);
         }

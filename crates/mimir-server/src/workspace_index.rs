@@ -29,7 +29,7 @@
 //! initialize-time contents. Restart the server to refresh. This matches
 //! the README's checklist state — `didChangeWatchedFiles` is its own item.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use mimir_syntax::{Symbol, SyntaxParser, SyntaxTree};
@@ -72,12 +72,63 @@ pub struct WorkspaceIndex {
 /// struct, callers acquire exactly one lock instead of two, eliminating the
 /// lock-ordering constraint that previously existed between the old
 /// `workspace_index` and `workspace_trees` fields on `Backend`.
+///
+/// Also holds the identifier presence index used to pre-filter the
+/// `references` scan: `files_per_name` maps any token that appears
+/// in a file to the set of URLs for that file, so `references` can skip
+/// files that provably don't mention the identifier at all.
 #[derive(Debug, Default)]
 pub struct WorkspaceState {
     /// Symbol index — maps declaration names to the files that declare them.
     pub index: WorkspaceIndex,
     /// Parse tree cache — maps URLs to their most recent successful tree.
     pub trees: HashMap<Url, SyntaxTree>,
+    /// Presence index: identifier token → set of URLs that contain it.
+    /// Built by byte-scanning the source text; much cheaper than full
+    /// tree-sitter traversal and sufficient for a pre-filter.
+    files_per_name: HashMap<String, HashSet<Url>>,
+    /// Reverse of `files_per_name`: URL → set of identifier tokens seen
+    /// in that file. Needed to evict entries when a file is re-indexed.
+    per_url_names: HashMap<Url, HashSet<String>>,
+}
+
+impl WorkspaceState {
+    /// Record the identifier tokens present in `url`'s source text.
+    ///
+    /// Called after every successful parse so the presence index stays in
+    /// sync with the tree cache. Re-indexing a URL first removes its prior
+    /// name set, then inserts the new one — no stale entries.
+    pub fn update_presence(&mut self, url: Url, names: HashSet<String>) {
+        // Evict prior entries for this URL.
+        if let Some(old_names) = self.per_url_names.remove(&url) {
+            for name in old_names {
+                if let Some(set) = self.files_per_name.get_mut(&name) {
+                    set.remove(&url);
+                    if set.is_empty() {
+                        self.files_per_name.remove(&name);
+                    }
+                }
+            }
+        }
+        // Insert new entries.
+        for name in &names {
+            self.files_per_name
+                .entry(name.clone())
+                .or_default()
+                .insert(url.clone());
+        }
+        self.per_url_names.insert(url, names);
+    }
+
+    /// Return the set of URLs that contain `name` as any identifier token,
+    /// or `None` if `name` has never been seen in any indexed file.
+    ///
+    /// `None` means "no data yet — don't filter"; `Some(empty set)` means
+    /// "definitely not in any file". Callers treat `None` as "scan all".
+    #[must_use]
+    pub fn files_containing(&self, name: &str) -> Option<&HashSet<Url>> {
+        self.files_per_name.get(name)
+    }
 }
 
 impl WorkspaceIndex {
@@ -427,6 +478,61 @@ mod tests {
             names.contains(&"uvm_object".to_string()),
             "expected uvm_object in {names:?}"
         );
+    }
+
+    // ── WorkspaceState presence index tests ──────────────────────────────
+
+    fn url_set(urls: &[&str]) -> HashSet<Url> {
+        urls.iter().map(|s| Url::parse(s).unwrap()).collect()
+    }
+
+    /// After `update_presence`, `files_containing` returns the URL.
+    #[test]
+    fn files_containing_returns_url_after_update() {
+        let mut ws = WorkspaceState::default();
+        let u = Url::parse("file:///a.sv").unwrap();
+        let names: HashSet<String> = ["foo", "bar"].iter().map(|s| s.to_string()).collect();
+        ws.update_presence(u.clone(), names);
+
+        let hits = ws.files_containing("foo").expect("foo should be present");
+        assert!(hits.contains(&u));
+    }
+
+    /// Re-indexing a URL removes old name entries and inserts new ones.
+    #[test]
+    fn update_presence_replaces_prior_names() {
+        let mut ws = WorkspaceState::default();
+        let u = Url::parse("file:///a.sv").unwrap();
+        ws.update_presence(u.clone(), ["alpha"].iter().map(|s| s.to_string()).collect());
+        ws.update_presence(u.clone(), ["beta"].iter().map(|s| s.to_string()).collect());
+
+        assert!(ws.files_containing("alpha").is_none(), "old name evicted");
+        assert!(
+            ws.files_containing("beta").unwrap().contains(&u),
+            "new name present"
+        );
+    }
+
+    /// `files_containing` returns `None` for a name not in any indexed file.
+    #[test]
+    fn files_containing_returns_none_for_unknown_name() {
+        let ws = WorkspaceState::default();
+        assert!(ws.files_containing("whatever").is_none());
+    }
+
+    /// Names shared across two URLs appear in both URL sets.
+    #[test]
+    fn files_containing_multiple_urls() {
+        let mut ws = WorkspaceState::default();
+        let a = Url::parse("file:///a.sv").unwrap();
+        let b = Url::parse("file:///b.sv").unwrap();
+        ws.update_presence(a.clone(), ["shared"].iter().map(|s| s.to_string()).collect());
+        ws.update_presence(b.clone(), ["shared"].iter().map(|s| s.to_string()).collect());
+
+        let hits = ws.files_containing("shared").unwrap();
+        assert!(hits.contains(&a));
+        assert!(hits.contains(&b));
+        let _ = url_set(&[]); // suppress unused-fn warning
     }
 
     // ── lookup_by_location tests ──────────────────────────────────────────
