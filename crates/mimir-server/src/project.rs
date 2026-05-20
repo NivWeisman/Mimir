@@ -570,12 +570,14 @@ impl ResolvedProject {
         if let Some(filelist) = cfg.slang.filelist.as_deref() {
             let expanded = expand_env_vars(&filelist.to_string_lossy(), &env);
             let absolute = absolutise(&root, Path::new(&expanded));
-            let mut visited = HashSet::new();
+            let mut in_progress = HashSet::new();
+            let mut done = HashSet::new();
             expand_filelist(
                 &absolute,
                 0,
                 &root,
-                &mut visited,
+                &mut in_progress,
+                &mut done,
                 &mut files,
                 &mut include_dirs,
                 &mut defines,
@@ -782,14 +784,22 @@ fn absolutise_filelist(filelist_base: &Path, toml_root: &Path, p: &Path) -> Path
 /// vectors so a top-level filelist with five `-f` includes builds a
 /// single flat output rather than a tree the caller has to walk.
 ///
-/// `visited` carries the canonical paths we've already opened in this
-/// expansion; a repeat visit fails with [`ProjectError::FilelistCycle`].
+/// Two-set DFS coloring distinguishes repeat references from true cycles:
+///
+/// * `in_progress` — canonical paths currently on the call stack (gray nodes).
+///   A hit here is a back-edge, i.e. a true cycle (`a.f → b.f → a.f`), and
+///   returns [`ProjectError::FilelistCycle`].
+/// * `done` — canonical paths fully processed in a prior branch (black nodes).
+///   A hit here is a diamond/shared reference (`a.f` and `b.f` both `-f c.f`),
+///   which is valid; we log a warning and skip the duplicate.
+///
 /// `depth` is checked against [`FILELIST_MAX_DEPTH`] before any work.
 fn expand_filelist(
     path: &Path,
     depth: usize,
     toml_root: &Path,
-    visited: &mut HashSet<PathBuf>,
+    in_progress: &mut HashSet<PathBuf>,
+    done: &mut HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
     include_dirs: &mut Vec<PathBuf>,
     defines: &mut Vec<MacroDefine>,
@@ -802,12 +812,22 @@ fn expand_filelist(
         });
     }
 
-    // Canonicalise for cycle detection; fall back to the raw path on
+    // Canonicalise for cycle/repeat detection; fall back to the raw path on
     // platforms / cases where canonicalize fails (e.g. symlink loops we
-    // didn't make ourselves), where the cycle check just devolves into
-    // "exact path repeat."
+    // didn't make ourselves).
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(canonical) {
+
+    // Already fully processed in a sibling branch — valid diamond reference.
+    if done.contains(&canonical) {
+        warn!(
+            path = %path.display(),
+            "filelist referenced more than once; skipping duplicate"
+        );
+        return Ok(());
+    }
+
+    // Currently on the call stack — this is a true cycle.
+    if !in_progress.insert(canonical.clone()) {
         return Err(ProjectError::FilelistCycle {
             path: path.to_path_buf(),
         });
@@ -843,22 +863,27 @@ fn expand_filelist(
                 break;
             };
             let nested = absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(next, env)));
-            expand_filelist(&nested, depth + 1, toml_root, visited, files, include_dirs, defines, env)?;
+            expand_filelist(&nested, depth + 1, toml_root, in_progress, done, files, include_dirs, defines, env)?;
             i += 2;
         } else if let Some(rest) = token.strip_prefix("-f") {
             // One-token form: `-fnested.f`.
             let nested = absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(rest, env)));
-            expand_filelist(&nested, depth + 1, toml_root, visited, files, include_dirs, defines, env)?;
+            expand_filelist(&nested, depth + 1, toml_root, in_progress, done, files, include_dirs, defines, env)?;
             i += 1;
         } else if let Some(rest) = token.strip_prefix("-F") {
             let nested = absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(rest, env)));
-            expand_filelist(&nested, depth + 1, toml_root, visited, files, include_dirs, defines, env)?;
+            expand_filelist(&nested, depth + 1, toml_root, in_progress, done, files, include_dirs, defines, env)?;
             i += 1;
         } else {
             files.push(absolutise_filelist(&base, toml_root, Path::new(&expand_env_vars(token, env))));
             i += 1;
         }
     }
+
+    // Transition from gray → black: no longer on the active call stack.
+    in_progress.remove(&canonical);
+    done.insert(canonical);
+
     Ok(())
 }
 
@@ -1088,8 +1113,9 @@ mod tests {
         let mut files = Vec::new();
         let mut incs = Vec::new();
         let mut defs = Vec::new();
-        let mut visited = HashSet::new();
-        expand_filelist(&f, 0, dir.path(), &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
+        let mut in_progress = HashSet::new();
+        let mut done = HashSet::new();
+        expand_filelist(&f, 0, dir.path(), &mut in_progress, &mut done, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
 
         assert_eq!(files.len(), 2);
         assert!(files[0].ends_with("a.sv"));
@@ -1116,8 +1142,9 @@ mod tests {
         let mut files = Vec::new();
         let mut incs = Vec::new();
         let mut defs = Vec::new();
-        let mut visited = HashSet::new();
-        expand_filelist(&outer, 0, dir.path(), &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
+        let mut in_progress = HashSet::new();
+        let mut done = HashSet::new();
+        expand_filelist(&outer, 0, dir.path(), &mut in_progress, &mut done, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
 
         // Order is: outer.sv, inner.sv (from nested), after.sv. The nested
         // include lands between the outer files that bracket the `-f`.
@@ -1150,17 +1177,18 @@ mod tests {
         let mut files = Vec::new();
         let mut incs = Vec::new();
         let mut defs = Vec::new();
-        let mut visited = HashSet::new();
-        expand_filelist(&f, 0, dir.path(), &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
+        let mut in_progress = HashSet::new();
+        let mut done = HashSet::new();
+        expand_filelist(&f, 0, dir.path(), &mut in_progress, &mut done, &mut files, &mut incs, &mut defs, &HashMap::new()).unwrap();
 
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("rtl/dut.sv"), "expected TOML-root fallback path, got {:?}", files[0]);
     }
 
-    /// A filelist that `-f`-includes itself fails with `FilelistCycle`,
-    /// not stack overflow.
+    /// A filelist that `-f`-includes itself (direct self-loop) fails with
+    /// `FilelistCycle`, not stack overflow.
     #[test]
-    fn expand_filelist_cycle_detected() {
+    fn expand_filelist_direct_cycle_is_error() {
         let dir = tempdir().unwrap();
         let f = dir.path().join("loop.f");
         fs::write(&f, "loop.sv\n-f loop.f\n").unwrap();
@@ -1168,10 +1196,93 @@ mod tests {
         let mut files = Vec::new();
         let mut incs = Vec::new();
         let mut defs = Vec::new();
-        let mut visited = HashSet::new();
-        let err = expand_filelist(&f, 0, dir.path(), &mut visited, &mut files, &mut incs, &mut defs, &HashMap::new())
+        let mut in_progress = HashSet::new();
+        let mut done = HashSet::new();
+        let err = expand_filelist(&f, 0, dir.path(), &mut in_progress, &mut done, &mut files, &mut incs, &mut defs, &HashMap::new())
             .expect_err("self-include should fail");
         assert!(matches!(err, ProjectError::FilelistCycle { .. }));
+    }
+
+    /// An indirect cycle (`a.f → b.f → a.f`) also fails with `FilelistCycle`.
+    #[test]
+    fn expand_filelist_indirect_cycle_is_error() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.f");
+        let b = dir.path().join("b.f");
+        fs::write(&a, "a.sv\n-f b.f\n").unwrap();
+        fs::write(&b, "b.sv\n-f a.f\n").unwrap();
+
+        let mut files = Vec::new();
+        let mut incs = Vec::new();
+        let mut defs = Vec::new();
+        let mut in_progress = HashSet::new();
+        let mut done = HashSet::new();
+        let err = expand_filelist(&a, 0, dir.path(), &mut in_progress, &mut done, &mut files, &mut incs, &mut defs, &HashMap::new())
+            .expect_err("indirect cycle should fail");
+        assert!(matches!(err, ProjectError::FilelistCycle { .. }));
+    }
+
+    /// Two sibling filelists that both `-f` the same shared filelist is a
+    /// valid diamond reference — the second occurrence warns and skips rather
+    /// than erroring.  Files from the shared filelist appear exactly once.
+    #[test]
+    fn expand_filelist_diamond_repeat_warns_and_skips() {
+        let dir = tempdir().unwrap();
+        // shared.f contributes one file and one incdir.
+        let shared = dir.path().join("shared.f");
+        fs::write(&shared, "shared.sv\n+incdir+shared_inc\n").unwrap();
+
+        // left.f and right.f both include shared.f.
+        let left = dir.path().join("left.f");
+        let right = dir.path().join("right.f");
+        fs::write(&left, "left.sv\n-f shared.f\n").unwrap();
+        fs::write(&right, "right.sv\n-f shared.f\n").unwrap();
+
+        // root.f includes both siblings.
+        let root = dir.path().join("root.f");
+        fs::write(&root, "-f left.f\n-f right.f\n").unwrap();
+
+        let mut files = Vec::new();
+        let mut incs = Vec::new();
+        let mut defs = Vec::new();
+        let mut in_progress = HashSet::new();
+        let mut done = HashSet::new();
+        // Must succeed — not an error.
+        expand_filelist(&root, 0, dir.path(), &mut in_progress, &mut done, &mut files, &mut incs, &mut defs, &HashMap::new())
+            .expect("diamond reference should succeed");
+
+        // left.sv, shared.sv (first visit), right.sv — shared.f skipped on second visit.
+        assert_eq!(files.len(), 3, "got {:?}", files);
+        assert!(files.iter().any(|p| p.ends_with("left.sv")));
+        assert!(files.iter().any(|p| p.ends_with("shared.sv")));
+        assert!(files.iter().any(|p| p.ends_with("right.sv")));
+        // shared_inc appears exactly once.
+        assert_eq!(incs.len(), 1);
+        assert!(incs[0].ends_with("shared_inc"));
+    }
+
+    /// The same filelist referenced twice at the top level (not via nesting)
+    /// also warns-and-skips on the second reference.
+    #[test]
+    fn expand_filelist_top_level_repeat_warns_and_skips() {
+        let dir = tempdir().unwrap();
+        let shared = dir.path().join("shared.f");
+        fs::write(&shared, "shared.sv\n").unwrap();
+
+        let root = dir.path().join("root.f");
+        fs::write(&root, "-f shared.f\n-f shared.f\n").unwrap();
+
+        let mut files = Vec::new();
+        let mut incs = Vec::new();
+        let mut defs = Vec::new();
+        let mut in_progress = HashSet::new();
+        let mut done = HashSet::new();
+        expand_filelist(&root, 0, dir.path(), &mut in_progress, &mut done, &mut files, &mut incs, &mut defs, &HashMap::new())
+            .expect("repeat top-level reference should succeed");
+
+        // shared.sv must appear exactly once.
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("shared.sv"));
     }
 
     /// Discovery finds `.mimir.toml` in an ancestor directory.
