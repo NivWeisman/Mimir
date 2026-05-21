@@ -60,6 +60,7 @@ use crate::slang_service::{
     ImplementationRoute, route_implementation,
     detect_member_access, detect_macro_trigger, path_to_url, m_range_to_lsp,
 };
+use crate::syntax_service::{SyntaxCandidates, SyntaxService};
 use crate::workspace_index::{self, WorkspaceIndex, WorkspaceState};
 
 /// Per-document state held inside the store.
@@ -78,22 +79,22 @@ pub(crate) struct DocumentState {
     /// (e.g. we treat `verilog` and `systemverilog` slightly differently
     /// — though for now both go through the same parser).
     #[allow(dead_code)]
-    language_id: String,
+    pub(crate) language_id: String,
     /// Symbol index from the most recent successful parse. Empty when
     /// the document hasn't been parsed yet or the last parse failed.
     /// Powers same-file `goto_definition` and `documentSymbol`.
-    index: Vec<Symbol>,
+    pub(crate) index: Vec<Symbol>,
     /// Parse tree from the most recent successful parse. `None` between
     /// `did_open` and the first parse completing. On a parse error we
     /// deliberately leave the previous tree in place — serving slightly
     /// stale results mid-keystroke is strictly better than serving none.
     /// `SyntaxTree` clones cheaply (`tree_sitter::Tree` is `Arc` inside).
-    tree: Option<SyntaxTree>,
+    pub(crate) tree: Option<SyntaxTree>,
     /// Document version the `index` and `tree` were built from. Used to
     /// detect a stale write — `reparse_and_publish` may finish after a
     /// fresh `did_change` has bumped the version, in which case we must
     /// not overwrite the live cache with the stale parse's results.
-    index_version: i32,
+    pub(crate) index_version: i32,
 }
 
 /// The tower-lsp [`LanguageServer`] implementation.
@@ -119,6 +120,13 @@ pub(crate) struct Backend {
     /// resolved project config, closed-file disk cache, and every param-
     /// assembly helper.
     slang: Arc<SlangService>,
+
+    /// Document store + parser + workspace-index Arcs, packaged as a service
+    /// so feature handlers can call `cached_tree` / `cached_tree_and_index`
+    /// through a named interface rather than reaching into the raw fields.
+    /// The Arcs are shared with the identically-named fields below — mutations
+    /// through `self.documents` etc. are immediately visible here.
+    syntax: SyntaxService,
 
     /// One in-flight (sleeping or running) elaborate task per URI that
     /// triggered it. On a new edit for the same URI we `.abort()` the
@@ -151,19 +159,28 @@ impl Backend {
     /// configuration bug, not a runtime condition, and it would happen on
     /// the very first message we received anyway.
     pub fn new(client: Client, slang: Option<Arc<mimir_slang::Client>>) -> Self {
-        let parser = SyntaxParser::new().expect("tree-sitter SV grammar failed to load");
         let documents: Arc<RwLock<HashMap<Url, DocumentState>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let parser: Arc<Mutex<SyntaxParser>> = Arc::new(Mutex::new(
+            SyntaxParser::new().expect("tree-sitter SV grammar failed to load"),
+        ));
+        let workspace: Arc<RwLock<WorkspaceState>> =
+            Arc::new(RwLock::new(WorkspaceState::default()));
         Self {
+            syntax: SyntaxService::new(
+                documents.clone(),
+                parser.clone(),
+                workspace.clone(),
+            ),
             slang: Arc::new(SlangService::new(documents.clone(), slang)),
             client,
             documents,
-            parser: Arc::new(Mutex::new(parser)),
+            parser,
             pending_elaborations: Arc::new(RwLock::new(HashMap::new())),
             slang_published: Arc::new(RwLock::new(HashSet::new())),
             last_elaborate_input_hash: Arc::new(RwLock::new(None)),
             startup_index_logged: Arc::new(AtomicBool::new(false)),
-            workspace: Arc::new(RwLock::new(WorkspaceState::default())),
+            workspace,
         }
     }
 
@@ -302,68 +319,21 @@ impl Backend {
 
     /// Snapshot the cached parse tree for `uri`.
     ///
-    /// Returns `None` when the document isn't open. When the document
-    /// *is* open but the cache hasn't been populated yet (rare — only
-    /// between `did_open` and the first `reparse_and_publish` finishing,
-    /// or after every parse so far has errored) we fall back to a
-    /// synchronous full parse so the caller always gets a tree if the
-    /// document exists.
+    /// Thin wrapper that delegates to [`SyntaxService::cached_tree`]. See
+    /// that method for full semantics (cache-miss fallback, error handling,
+    /// etc.). Kept here so call sites in `Backend`'s `LanguageServer` impl
+    /// don't need to change spelling after the service extraction.
     async fn cached_tree(&self, uri: &Url) -> Option<SyntaxTree> {
-        let (cached, fallback_text) = {
-            let docs = self.documents.read().await;
-            let state = docs.get(uri)?;
-            match &state.tree {
-                Some(t) => (Some(t.clone()), None),
-                None => (None, Some(state.document.text())),
-            }
-        };
-        if let Some(t) = cached {
-            return Some(t);
-        }
-        let text = fallback_text?;
-        let mut parser = self.parser.lock().await;
-        match parser.parse(&text, None) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                error!(error = %e, "fallback parse failed");
-                None
-            }
-        }
+        self.syntax.cached_tree(uri).await
     }
 
     /// Snapshot the cached tree *and* symbol index for `uri` together.
     ///
-    /// Acquires the doc-store read lock once for both. Falls back to a
-    /// synchronous parse if the tree cache is empty; the returned
-    /// `index` may be empty in that case (it's only populated by
-    /// `reparse_and_publish`).
+    /// Thin wrapper that delegates to [`SyntaxService::cached_tree_and_index`].
+    /// See that method for full semantics. Kept here so call sites in
+    /// `Backend`'s `LanguageServer` impl don't need to change spelling.
     async fn cached_tree_and_index(&self, uri: &Url) -> Option<(SyntaxTree, Vec<Symbol>)> {
-        let (cached, fallback_text, index) = {
-            let docs = self.documents.read().await;
-            let state = docs.get(uri)?;
-            let cached = state.tree.clone();
-            let fallback_text = if cached.is_none() {
-                Some(state.document.text())
-            } else {
-                None
-            };
-            (cached, fallback_text, state.index.clone())
-        };
-        let tree = match cached {
-            Some(t) => t,
-            None => {
-                let text = fallback_text?;
-                let mut parser = self.parser.lock().await;
-                match parser.parse(&text, None) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(error = %e, "fallback parse failed");
-                        return None;
-                    }
-                }
-            }
-        };
-        Some((tree, index))
+        self.syntax.cached_tree_and_index(uri).await
     }
 
     /// Schedule a debounced slang elaborate. Called from `did_open` and
@@ -3643,15 +3613,6 @@ fn keyword_completion_item(kw: &'static str) -> CompletionItem {
             ..Default::default()
         },
     }
-}
-
-/// Same-file vs cross-file syntax-side completion candidates.
-///
-/// Returned by [`Backend::gather_syntax_candidates`]. Streams are kept
-/// separate so callers can prioritise same-file hits in their dedup pass.
-struct SyntaxCandidates {
-    same_file: Vec<Symbol>,
-    cross_file: Vec<(Url, Symbol)>,
 }
 
 /// Convert a list of slang `SignatureItem`s into LSP's `SignatureHelp`.

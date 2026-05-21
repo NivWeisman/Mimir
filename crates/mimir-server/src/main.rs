@@ -24,6 +24,7 @@ mod format;
 mod includes;
 mod project;
 mod slang_service;
+mod syntax_service;
 mod workspace_index;
 
 /// Environment variable: filesystem path to the slang sidecar binary. When
