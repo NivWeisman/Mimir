@@ -1,30 +1,39 @@
-//! The `tower_lsp::LanguageServer` impl.
+//! The `tower_lsp::LanguageServer` impl — thin coordinator between LSP wire
+//! protocol and three focused service structs.
 //!
-//! This file is the seam between the LSP protocol and our internal
-//! crates. Responsibilities:
+//! ## Responsibilities
 //!
-//! * Maintain a map `Url -> TextDocument` (the document store).
-//! * On `did_open` / `did_change` / `did_close`, mutate the store.
-//! * After every store mutation, parse the affected document and publish
-//!   diagnostics back to the client.
+//! * Maintain `Url → DocumentState` (the document store) and apply
+//!   `did_open` / `did_change` / `did_close` mutations.
+//! * After every mutation, parse the document and publish tree-sitter
+//!   diagnostics via [`Backend::reparse_and_publish`].
+//! * Coordinate LSP feature handlers (hover, definition, completion, …) by
+//!   delegating to the appropriate service and merging results.
+//!
+//! ## Service architecture
+//!
+//! Heavy logic is split into three peer modules so handlers stay thin:
+//!
+//! | Service | Module | Owns |
+//! |---------|--------|------|
+//! | [`SlangService`] | `slang_service` | Sidecar IPC, project config, closed-file cache, param assembly |
+//! | [`SyntaxService`] | `syntax_service` | Document store + parser + workspace index access |
+//! | [`ElaborateService`] | `elaborate_service` | Debounce, input-hash dedup, diagnostic publish lifecycle |
+//!
+//! All three hold `Arc` clones of the same underlying data — no extra
+//! synchronisation cost beyond the locks already in place.
 //!
 //! ## Concurrency model
 //!
-//! `tower-lsp` calls every handler concurrently from the tokio runtime.
-//! That means `did_change` for document A and `did_change` for document B
-//! can run at the same time on different worker threads.
+//! `tower-lsp` dispatches every handler concurrently from the tokio runtime.
+//! The document store is a `tokio::sync::RwLock<HashMap<Url, DocumentState>>`;
+//! the lock is held only long enough to insert/look up — parsing happens
+//! outside the lock on a cloned string so concurrent edits don't block each
+//! other.
 //!
-//! We use a single `tokio::sync::RwLock<HashMap<Url, DocumentState>>`. The
-//! lock is held only long enough to insert/lookup; the parse happens on a
-//! `clone()` of the source string outside the lock so we don't block other
-//! documents while a slow parse is in flight.
-//!
-//! ## Why not `spawn_blocking`?
-//!
-//! tree-sitter is fast enough for typical files that we don't need to push
-//! parsing to a blocking thread pool (~milliseconds for a 5000-line UVM
-//! file). If we ever process huge generated headers we'll revisit; for now
-//! the simpler `await`-on-the-reactor model wins on readability.
+//! tree-sitter is fast enough (~ms for a 5000-line UVM file) that we don't
+//! push parsing onto a `spawn_blocking` thread. If huge generated headers ever
+//! become a bottleneck we can revisit.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -327,7 +336,7 @@ impl Backend {
     /// spawned task, mirroring the initialize-time hydration path so
     /// the watcher event returns promptly. A failed re-discover
     /// (deleted / malformed config) logs at warn and leaves the
-    /// previous `self.project` in place.
+    /// previous project config in place.
     async fn rehydrate_project_from(&self, mimir_toml_path: &Path) {
         let Some(start) = mimir_toml_path.parent() else {
             warn!(path = %mimir_toml_path.display(), "rehydrate: .mimir.toml has no parent dir");
@@ -1539,8 +1548,8 @@ impl LanguageServer for Backend {
     /// that drives inlay hints.
     ///
     /// Slang-first when configured: routes through
-    /// [`try_slang_hover`] (which calls `slang.definition` and reads the
-    /// declaration line at the resolved location). On transport error or
+    /// Slang-first when configured: calls `slang.definition` and reads the
+    /// declaration line at the resolved location. On transport error or
     /// an empty slang result, falls through to the tree-sitter path —
     /// hover is a UX feature, not a correctness one, so we prefer "show
     /// the textually-first match" to "show nothing" when slang declines
@@ -2334,20 +2343,6 @@ fn workspace_root_path(params: &InitializeParams) -> Option<PathBuf> {
     None
 }
 
-/// Build the elaborate request from the resolved project config and the
-/// currently-open documents.
-///
-/// Returns the `ElaborateParams` to send and a parallel `Vec<Url>` of
-/// every file we asked slang to look at. The latter is used by
-/// [`publish_slang_result`] to publish empty diagnostics for files slang
-/// reported clean — that's how we honour the "slang says clean → drop
-/// tree-sitter syntax errors" conflict policy across files.
-///
-/// Open documents' in-memory text overrides any on-disk version, so the
-/// user's unsaved changes participate in elaboration. Open documents not
-/// listed in the project filelist are also included — the user might be
-/// editing a file the `.f` doesn't list yet, and we still want
-/// diagnostics for it.
 /// Eager-hydrate the workspace index from a project filelist.
 ///
 /// Spawned from `initialize` once `.mimir.toml` has resolved. Reads each
