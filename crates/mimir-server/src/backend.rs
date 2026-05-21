@@ -930,6 +930,15 @@ impl LanguageServer for Backend {
                 // doesn't retain parse trees). Slang RPC for references is a
                 // future slice.
                 references_provider: Some(OneOf::Left(true)),
+                // Rename: reuses the same reference engine as
+                // `textDocument/references` (scope-aware + workspace-wide),
+                // replacing every occurrence with the caller-supplied name.
+                // `prepare_rename` validates the cursor is on an identifier
+                // before the editor shows the input box.
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 // Syntax-only for stages 1–4; slang takes over for stages 5–6.
                 // Trigger characters: `.` (member access), `` ` `` (macros),
                 // `$` (system task/function names), `:` (the first half of
@@ -1507,6 +1516,152 @@ impl LanguageServer for Backend {
         );
         debug!(count = locations.len(), name = %name, "references returned");
         Ok(Some(locations))
+    }
+
+    /// Validate that the cursor is on a renameable identifier and return its
+    /// current span. The editor uses the span to pre-fill the rename input.
+    ///
+    /// Returns `None` (no rename box) when the cursor is on whitespace,
+    /// a keyword, punctuation, or outside the document — anything that
+    /// isn't a `simple_identifier` or `system_tf_identifier` token.
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document.uri),
+    )]
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> LspResult<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+        let pos = params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        let Some(tree) = self.cached_tree(&uri).await else {
+            debug!("prepare_rename: no tree available");
+            return Ok(None);
+        };
+        let rope = Rope::from_str(tree.source());
+        let Some((_name, range)) =
+            mimir_syntax::symbols::identifier_and_range_at(&tree, &rope, target)
+        else {
+            debug!("prepare_rename: cursor not on identifier");
+            return Ok(None);
+        };
+        debug!(range = ?range, "prepare_rename: identifier found");
+        Ok(Some(PrepareRenameResponse::Range(m_range_to_lsp(range))))
+    }
+
+    /// Rename the identifier under the cursor to `params.new_name` across
+    /// every file in the workspace. Uses the same reference engine as
+    /// `textDocument/references` (scope-aware within a file,
+    /// workspace-wide across open buffers and filelist-hydrated files).
+    ///
+    /// Returns a [`WorkspaceEdit`] grouping one [`TextEdit`] per occurrence
+    /// per file. The editor applies the edits atomically. Returns `None`
+    /// when the cursor is not on an identifier or when no occurrences are
+    /// found (e.g. the symbol was never used).
+    ///
+    /// v1 limitations (matching `references`): tree-sitter only — no
+    /// slang-backed scope/type-aware resolution, so `pkg_a::foo` and
+    /// `pkg_b::foo` are conflated by name; no hierarchical-name support.
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position.text_document.uri, new_name = %params.new_name),
+    )]
+    async fn rename(&self, params: RenameParams) -> LspResult<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let target = MPosition::new(pos.line, pos.character);
+        let new_name = params.new_name;
+
+        let Some(cursor_tree) = self.cached_tree(&uri).await else {
+            debug!("rename: no tree available");
+            return Ok(None);
+        };
+        let cursor_rope = Rope::from_str(cursor_tree.source());
+
+        let Some(name) =
+            mimir_syntax::symbols::identifier_at(&cursor_tree, &cursor_rope, target)
+        else {
+            debug!("rename: cursor not on identifier");
+            return Ok(None);
+        };
+        let name = name.to_owned();
+
+        // Snapshot open-buffer trees (excluding cursor file) under one lock,
+        // then drop the lock before acquiring the workspace lock.
+        let other_open: Vec<(Url, SyntaxTree)> = {
+            let docs = self.documents.read().await;
+            docs.iter()
+                .filter(|(other_uri, _)| **other_uri != uri)
+                .filter_map(|(other_uri, state)| {
+                    state.tree.as_ref().map(|t| (other_uri.clone(), t.clone()))
+                })
+                .collect()
+        };
+
+        // Collect closed-file trees from the workspace tree cache, pre-filtered
+        // by identifier presence (same pattern as `references`).
+        let open_urls: HashSet<&Url> = other_open
+            .iter()
+            .map(|(u, _)| u)
+            .chain(std::iter::once(&uri))
+            .collect();
+        let closed_trees: Vec<(Url, SyntaxTree)> = {
+            let ws = self.workspace.read().await;
+            let candidates = ws.files_containing(&name);
+            ws.trees
+                .iter()
+                .filter(|(url, _)| !open_urls.contains(url))
+                .filter(|(url, _)| candidates.is_some_and(|s| s.contains(url)))
+                .map(|(url, tree)| (url.clone(), tree.clone()))
+                .collect()
+        };
+
+        let all_other_trees: Vec<(Url, SyntaxTree)> =
+            other_open.into_iter().chain(closed_trees).collect();
+
+        let ws = self.workspace.read().await;
+        let locations = collect_references(
+            &name,
+            &uri,
+            &cursor_tree,
+            &cursor_rope,
+            target,
+            &all_other_trees,
+            &ws.index,
+            true, // always include the declaration site in a rename
+        );
+        drop(ws);
+
+        if locations.is_empty() {
+            debug!(name = %name, "rename: no occurrences found");
+            return Ok(None);
+        }
+
+        // Group one TextEdit per location, keyed by URL.
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for loc in &locations {
+            changes.entry(loc.uri.clone()).or_default().push(TextEdit {
+                range: loc.range,
+                new_text: new_name.clone(),
+            });
+        }
+
+        debug!(
+            files = changes.len(),
+            occurrences = locations.len(),
+            name = %name,
+            new_name = %new_name,
+            "rename: workspace edit prepared",
+        );
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
     }
 
     /// Hover: declaration line for the symbol under the cursor, with a
@@ -5002,5 +5157,92 @@ mod tests {
         let wi = WorkspaceIndex::default();
         let out = run_references("foo", &here, &text, &[], &wi, true);
         assert_eq!(out.len(), REFERENCES_LIMIT);
+    }
+
+    // ----------------------------------------------------------------------
+    // rename — locations_to_workspace_edit
+    // ----------------------------------------------------------------------
+
+    /// Helper: build a `WorkspaceEdit` from a vec of `Location`s the same
+    /// way the `rename` handler does.
+    fn locations_to_workspace_edit(locs: Vec<Location>, new_name: &str) -> WorkspaceEdit {
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for loc in locs {
+            changes.entry(loc.uri).or_default().push(TextEdit {
+                range: loc.range,
+                new_text: new_name.to_owned(),
+            });
+        }
+        WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }
+    }
+
+    /// Rename in the same file: every occurrence is replaced, producing
+    /// one entry in `changes`.
+    #[test]
+    fn rename_single_file_produces_one_entry_per_occurrence() {
+        let here = url("file:///a.sv");
+        let text = "module m;\n  int foo;\n  initial foo = 1;\nendmodule\n";
+        let wi = WorkspaceIndex::default();
+        let locs = run_references("foo", &here, text, &[], &wi, true);
+        // decl + one use = 2 occurrences
+        assert_eq!(locs.len(), 2);
+
+        let edit = locations_to_workspace_edit(locs, "bar");
+        let file_edits = edit.changes.unwrap();
+        assert_eq!(file_edits.len(), 1, "single file → one URL key");
+        let edits = &file_edits[&here];
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|e| e.new_text == "bar"));
+    }
+
+    /// Cross-file rename: two URLs should appear in `changes`.
+    #[test]
+    fn rename_cross_file_produces_entry_per_file() {
+        let here = url("file:///a.sv");
+        let other = url("file:///b.sv");
+        let cursor_text = "module a;\n  my_class c;\nendmodule\n";
+        let other_text = "class my_class;\nendclass\n";
+        let wi = workspace_index_from(&[(&other, other_text)]);
+        let locs =
+            run_references("my_class", &here, cursor_text, &[(other.clone(), other_text)], &wi, true);
+
+        let edit = locations_to_workspace_edit(locs, "renamed_class");
+        let file_edits = edit.changes.unwrap();
+        assert_eq!(file_edits.len(), 2, "two URLs should appear");
+        assert!(file_edits.contains_key(&here));
+        assert!(file_edits.contains_key(&other));
+        let all_new: Vec<&str> = file_edits
+            .values()
+            .flatten()
+            .map(|e| e.new_text.as_str())
+            .collect();
+        assert!(all_new.iter().all(|&s| s == "renamed_class"));
+    }
+
+    /// `rename` must advertise prepare support in `initialize`.
+    #[tokio::test]
+    async fn initialize_advertises_rename_with_prepare() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        #[allow(deprecated)]
+        let init = InitializeParams {
+            root_uri: None,
+            workspace_folders: None,
+            ..Default::default()
+        };
+        let result = service
+            .inner()
+            .initialize(init)
+            .await
+            .expect("initialize ok");
+        match result.capabilities.rename_provider {
+            Some(OneOf::Right(opts)) => {
+                assert_eq!(opts.prepare_provider, Some(true));
+            }
+            other => panic!("expected RenameOptions with prepare_provider, got {other:?}"),
+        }
     }
 }

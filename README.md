@@ -449,7 +449,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (429 today)
+cargo test   --workspace                    # run all unit tests (437 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
 make integration                            # python LSP tests against the riscv-dv example
@@ -574,7 +574,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Refactoring
 
-- ⬜ `textDocument/rename`
+- ✅ `textDocument/rename` + `textDocument/prepareRename` — workspace-wide rename using the same reference engine as `textDocument/references` (scope-aware within a file, workspace-wide across open buffers and filelist-hydrated files). `prepareRename` validates the cursor is on an identifier and returns its span so the editor can pre-fill the input box. One `TextEdit` per occurrence per file, returned as a `WorkspaceEdit`. v1 limitations: tree-sitter only — no slang-backed scope/type-aware resolution (`pkg_a::foo` and `pkg_b::foo` are conflated by name); no hierarchical-name support; capped at 1 000 occurrences matching the `references` limit.
 - ⬜ `textDocument/codeAction` (quick-fixes)
 - ✅ `textDocument/formatting` — whole-file via `verible-verilog-format` (see [docs/formatter.md](docs/formatter.md))
 - ✅ `textDocument/rangeFormatting` — selection snapped to whole lines, same backend

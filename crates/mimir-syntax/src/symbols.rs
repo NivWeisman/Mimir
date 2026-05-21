@@ -558,6 +558,29 @@ pub fn identifier_at<'a>(tree: &'a SyntaxTree, rope: &Rope, pos: Position) -> Op
     }
 }
 
+/// Return the identifier text and its [`Range`] under `pos`, if any.
+///
+/// Like [`identifier_at`] but also returns the exact source range of the
+/// identifier token. Used by `prepare_rename` to give the editor the
+/// current name's span so it can pre-fill the rename input.
+#[must_use]
+pub fn identifier_and_range_at<'a>(
+    tree: &'a SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+) -> Option<(&'a str, Range)> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte)?;
+    if matches!(leaf.kind(), "simple_identifier" | "system_tf_identifier") {
+        let text = tree.source().get(leaf.byte_range())?;
+        let range = node_range(leaf, rope);
+        Some((text, range))
+    } else {
+        None
+    }
+}
+
 /// Return the raw text of the leaf token under `pos` — a superset of
 /// [`identifier_at`] that also surfaces keyword tokens (`always_ff`,
 /// `module`, …) and other single-word leaves.
@@ -1377,6 +1400,14 @@ mod tests {
         identifier_at(&tree, &Rope::from_str(src), Position::new(line, col)).map(str::to_owned)
     }
 
+    /// Helper: parse `src` and return the `(SyntaxTree, Rope)` pair.
+    fn parse_tree_and_rope(src: &str) -> (crate::SyntaxTree, Rope) {
+        init_for_tests();
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        (tree, Rope::from_str(src))
+    }
+
     /// Find the first symbol with the given name. Many tests have only
     /// one symbol of interest; this keeps the assertions readable.
     fn pick<'a>(syms: &'a [Symbol], name: &str) -> &'a Symbol {
@@ -1655,6 +1686,30 @@ endclass
             .map(|s| s.name.as_str())
             .collect();
         assert_eq!(classes, vec!["outer", "inner"]);
+    }
+
+    // --- identifier_and_range_at ---------------------------------------
+
+    #[test]
+    fn identifier_and_range_returns_name_and_span() {
+        let src = "module foo;\nendmodule\n";
+        let (tree, rope) = parse_tree_and_rope(src);
+        let result = identifier_and_range_at(&tree, &rope, Position::new(0, 7));
+        let (name, range) = result.expect("should find identifier");
+        assert_eq!(name, "foo");
+        // "foo" spans columns 7..10 on line 0.
+        assert_eq!(range.start.line, 0);
+        assert_eq!(range.start.character, 7);
+        assert_eq!(range.end.line, 0);
+        assert_eq!(range.end.character, 10);
+    }
+
+    #[test]
+    fn identifier_and_range_on_keyword_returns_none() {
+        let src = "module foo;\nendmodule\n";
+        let (tree, rope) = parse_tree_and_rope(src);
+        // Column 0 is "module" — a keyword, not a simple_identifier.
+        assert!(identifier_and_range_at(&tree, &rope, Position::new(0, 0)).is_none());
     }
 
     // --- identifier_at -------------------------------------------------
@@ -2078,7 +2133,7 @@ class apb_monitor;
   endfunction
 endclass
 ";
-        let (tree, rope) = parse(src);
+        let (tree, rope) = parse_tree_and_rope(src);
         // Position inside `ap` on the `ap.write(...)` line (line 3, col 4).
         let ty = find_variable_type_at(&tree, &rope, Position::new(3, 4), "ap");
         assert_eq!(ty.as_deref(), Some("uvm_analysis_port"));
@@ -2094,7 +2149,7 @@ module m;
   end
 endmodule
 ";
-        let (tree, rope) = parse(src);
+        let (tree, rope) = parse_tree_and_rope(src);
         // Position on the `x = 1` line.
         let ty = find_variable_type_at(&tree, &rope, Position::new(3, 4), "x");
         assert_eq!(ty.as_deref(), Some("int"));
@@ -2109,7 +2164,7 @@ class c;
   endfunction
 endclass
 ";
-        let (tree, rope) = parse(src);
+        let (tree, rope) = parse_tree_and_rope(src);
         // Position on `phase.run()`.
         let ty = find_variable_type_at(&tree, &rope, Position::new(2, 4), "phase");
         assert_eq!(ty.as_deref(), Some("uvm_phase"));
@@ -2124,7 +2179,7 @@ class c;
   endfunction
 endclass
 ";
-        let (tree, rope) = parse(src);
+        let (tree, rope) = parse_tree_and_rope(src);
         let ty = find_variable_type_at(&tree, &rope, Position::new(2, 4), "nope");
         assert_eq!(ty, None);
     }
@@ -2175,7 +2230,7 @@ class c;
   endfunction
 endclass
 ";
-        let (tree, rope) = parse(src);
+        let (tree, rope) = parse_tree_and_rope(src);
         // Position inside `new(` on line 3.
         let ctx = class_new_lhs_at(&tree, &rope, Position::new(3, 10));
         assert_eq!(ctx, Some(ClassNewLhs::LhsName("ap".into())));
@@ -2190,7 +2245,7 @@ class c;
   endfunction
 endclass
 ";
-        let (tree, rope) = parse(src);
+        let (tree, rope) = parse_tree_and_rope(src);
         // Position inside the `new("p")` initializer on line 2.
         let ctx = class_new_lhs_at(&tree, &rope, Position::new(2, 20));
         match ctx {
