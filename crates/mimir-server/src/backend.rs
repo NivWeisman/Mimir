@@ -27,24 +27,13 @@
 //! the simpler `await`-on-the-reactor model wins on readability.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use mimir_core::{Position as MPosition, Range as MRange, TextDocument};
 use mimir_slang::{
-    Client as SlangClient, ClientError as SlangClientError, ConnectionError as SlangConnectionError,
-    CompleteParams as SlangCompleteParams,
-    CompletionRequestKind as SlangCompletionRequestKind,
-    DefinitionLocation as SlangDefinitionLocation, DefinitionParams as SlangDefinitionParams,
-    Diagnostic as SlangDiagnostic, ElaborateParams, ElaborateResult,
-    ImplementationLocation as SlangImplementationLocation,
-    ImplementationParams as SlangImplementationParams, Severity as SlangSeverity,
-    SignatureHelpParams as SlangSignatureHelpParams, SlangCompletionItem, SourceFile,
-    TypeDefinitionLocation as SlangTypeDefinitionLocation,
-    TypeDefinitionParams as SlangTypeDefinitionParams,
+    Diagnostic as SlangDiagnostic, ElaborateResult, Severity as SlangSeverity,
 };
 use mimir_syntax::{
     calls::{active_arg_index, call_site_at, call_sites_in, CallKind},
@@ -65,6 +54,12 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::completion_score;
 use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
 use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
+use crate::slang_service::{
+    SlangService, SlangDefinitionOutcome, DefinitionRoute, route_definition,
+    TypeDefinitionRoute, route_type_definition,
+    ImplementationRoute, route_implementation,
+    detect_member_access, detect_macro_trigger, path_to_url, m_range_to_lsp,
+};
 use crate::workspace_index::{self, WorkspaceIndex, WorkspaceState};
 
 /// Per-document state held inside the store.
@@ -76,8 +71,9 @@ use crate::workspace_index::{self, WorkspaceIndex, WorkspaceState};
 /// still a future slice — for now every parse is full, but at least we
 /// only do it once per edit.
 #[derive(Debug)]
-struct DocumentState {
-    document: TextDocument,
+pub(crate) struct DocumentState {
+    /// The live text buffer for this document.
+    pub(crate) document: TextDocument,
     /// Language ID the editor reported in `did_open`. Useful for routing
     /// (e.g. we treat `verilog` and `systemverilog` slightly differently
     /// — though for now both go through the same parser).
@@ -100,41 +96,6 @@ struct DocumentState {
     index_version: i32,
 }
 
-/// Cached on-disk source texts for closed project files.
-///
-/// `build_definition_params` and `build_elaborate_params` send every project
-/// file's text to the slang sidecar on each hover/definition/completion call.
-/// For files that are not open in the editor the only way to get their text
-/// is a `std::fs::read_to_string` call — expensive when repeated N times per
-/// request. This cache stores those texts so the disk read happens at most
-/// once per file per session.
-///
-/// ## Correctness invariant
-///
-/// The cache **only covers files that are not currently open**. Open files
-/// are always sourced from the live rope (`open_text` in
-/// `build_definition_params`), which takes precedence over the disk cache
-/// inside `assemble_elaborate_params`. Unsaved edits are therefore always
-/// reflected correctly.
-///
-/// ## Invalidation events
-///
-/// | Event | Action |
-/// |---|---|
-/// | `did_open` | Drop entire cache — file moves closed→open; a future `did_close` must re-read disk |
-/// | `did_close` | Drop entire cache — file moves open→closed; disk may have changed via another editor |
-/// | `did_change` | **No invalidation** — changed file is in `open_text`, not the cache |
-/// | `did_change_watched_files` CHANGED/CREATED | Evict the specific `PathBuf` entry |
-/// | Project reload | Drop entire cache — filelist may have changed |
-#[derive(Debug, Clone, Default)]
-struct ClosedFileDiskCache {
-    /// `path → source_text` for every closed project file successfully read
-    /// from disk. Files that returned `None` from `read_to_string` are absent;
-    /// the caller treats absence the same as an empty string (matching
-    /// `assemble_elaborate_params`'s `unwrap_or_default` semantics).
-    texts: HashMap<PathBuf, String>,
-}
-
 /// The tower-lsp [`LanguageServer`] implementation.
 ///
 /// Pub only inside the crate; `main.rs` constructs it via `Backend::new`.
@@ -154,26 +115,14 @@ pub(crate) struct Backend {
     /// human types into one file at a time).
     parser: Arc<Mutex<SyntaxParser>>,
 
-    /// Optional slang sidecar client. `None` when neither `MIMIR_SLANG_PATH`
-    /// process env nor `[env] MIMIR_SLANG_PATH` in `.mimir.toml` is set, or
-    /// the configured path failed to spawn.  While `None`, the diagnostic
-    /// pipeline is tree-sitter-only.  Wrapped in `RwLock` so `initialize`
-    /// can set it from the project config after startup.
-    slang: Arc<RwLock<Option<Arc<SlangClient>>>>,
-
-    /// Resolved project config (`.mimir.toml` + expanded filelist),
-    /// discovered on `initialize` from the workspace root. `None` when no
-    /// `.mimir.toml` was found — slang stays inactive in that case
-    /// because it has no compilation unit to elaborate.
-    project: Arc<RwLock<Option<ResolvedProject>>>,
+    /// Single point of contact for all slang-sidecar IPC: client connection,
+    /// resolved project config, closed-file disk cache, and every param-
+    /// assembly helper.
+    slang: Arc<SlangService>,
 
     /// One in-flight (sleeping or running) elaborate task per URI that
     /// triggered it. On a new edit for the same URI we `.abort()` the
     /// existing handle and schedule a fresh one — that's the debounce.
-    /// Aborting during the sleep cancels cleanly; aborting during the
-    /// `elaborate` call drops the request response on the floor (the
-    /// connection's per-request `id` correlation handles the next caller
-    /// correctly).
     pending_elaborations: Arc<RwLock<HashMap<Url, JoinHandle<()>>>>,
 
     /// URLs we published non-empty slang diagnostics to in the previous
@@ -184,34 +133,14 @@ pub(crate) struct Backend {
     slang_published: Arc<RwLock<HashSet<Url>>>,
 
     /// Hash of the inputs of the most recent **successful** slang elaborate.
-    /// Used by [`Backend::schedule_elaborate`] to skip a re-elaborate when
-    /// the project's file texts, include dirs, defines, and `top` haven't
-    /// changed since the last successful call — that's the common case
-    /// after `did_open` of an already-warm file. `None` until the first
-    /// elaborate succeeds. Only updated on success so a failed elaborate
-    /// doesn't lock out future retries.
     last_elaborate_input_hash: Arc<RwLock<Option<u64>>>,
 
     /// Latched `true` after the first successful elaborate has emitted its
-    /// per-file `info!("indexed by startup slang elaborate")` lines. This
-    /// is the user-visible signal that the warm slang elaborate completed;
-    /// subsequent elaborates stay at `debug!` so the log doesn't grow with
-    /// every edit.
+    /// per-file `info!("indexed by startup slang elaborate")` lines.
     startup_index_logged: Arc<AtomicBool>,
 
     /// Combined workspace symbol index and parse trees under a single lock.
-    ///
-    /// The two halves are always updated atomically so reads of `index` and
-    /// `trees` are guaranteed to be in sync. See [`WorkspaceState`] and
-    /// [`workspace_index`] for the full data-structure contract.
     workspace: Arc<RwLock<WorkspaceState>>,
-
-    /// Cached on-disk source texts for closed project files. Eliminates
-    /// repeated `std::fs::read_to_string` calls in `build_definition_params`
-    /// and `build_elaborate_params` on every hover/definition/completion
-    /// request. `None` means "not yet populated or deliberately invalidated".
-    /// See [`ClosedFileDiskCache`] for the full invalidation contract.
-    closed_file_cache: Arc<RwLock<Option<ClosedFileDiskCache>>>,
 }
 
 impl Backend {
@@ -221,20 +150,20 @@ impl Backend {
     /// Panics if the parser fails to load the SV grammar — that's a build
     /// configuration bug, not a runtime condition, and it would happen on
     /// the very first message we received anyway.
-    pub fn new(client: Client, slang: Option<Arc<SlangClient>>) -> Self {
+    pub fn new(client: Client, slang: Option<Arc<mimir_slang::Client>>) -> Self {
         let parser = SyntaxParser::new().expect("tree-sitter SV grammar failed to load");
+        let documents: Arc<RwLock<HashMap<Url, DocumentState>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         Self {
+            slang: Arc::new(SlangService::new(documents.clone(), slang)),
             client,
-            documents: Arc::new(RwLock::new(HashMap::new())),
+            documents,
             parser: Arc::new(Mutex::new(parser)),
-            slang: Arc::new(RwLock::new(slang)),
-            project: Arc::new(RwLock::new(None)),
             pending_elaborations: Arc::new(RwLock::new(HashMap::new())),
             slang_published: Arc::new(RwLock::new(HashSet::new())),
             last_elaborate_input_hash: Arc::new(RwLock::new(None)),
             startup_index_logged: Arc::new(AtomicBool::new(false)),
             workspace: Arc::new(RwLock::new(WorkspaceState::default())),
-            closed_file_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -244,12 +173,7 @@ impl Backend {
     /// `.mimir.toml` has been discovered — that keeps every feature on when
     /// the server is used without a project config file.
     async fn current_features(&self) -> FeatureToggles {
-        self.project
-            .read()
-            .await
-            .as_ref()
-            .map(|p| p.features.clone())
-            .unwrap_or_default()
+        self.slang.current_features().await
     }
 
     /// Return the current [`FormatterConfig`] from the resolved project config.
@@ -257,12 +181,7 @@ impl Backend {
     /// Falls back to [`FormatterConfig::default`] (binary = `"verible-verilog-format"`,
     /// all options unset) when no `.mimir.toml` is present.
     async fn current_formatter_config(&self) -> FormatterConfig {
-        self.project
-            .read()
-            .await
-            .as_ref()
-            .map(|p| p.formatter.clone())
-            .unwrap_or_default()
+        self.slang.current_formatter_config().await
     }
 
     /// Parse the document at `uri` and publish diagnostics to the client.
@@ -459,22 +378,11 @@ impl Backend {
     /// project lacks a `.mimir.toml` — both are normal "tree-sitter only"
     /// states the user opts into by not configuring the sidecar.
     async fn schedule_elaborate(&self, trigger_uri: Url) {
-        let Some(slang) = self.slang.read().await.clone() else {
-            return;
-        };
-        // Snapshot the project config under the read lock so the spawned
-        // task isn't holding a lock across `await`s.
-        let project = match self.project.read().await.clone() {
-            Some(p) => p,
+        let debounce = match self.slang.current_debounce().await {
+            Some(d) => d,
             None => return,
         };
-        let debounce = Duration::from_millis(project.debounce_ms);
 
-        // Cancel any pending elaborate for this trigger URI. Aborting
-        // during the debounce sleep is clean. Aborting while a request is
-        // in-flight (after the bytes were sent but before the response is
-        // read) leaves a stale response in the sidecar's stdout buffer;
-        // Connection::request drains such responses transparently.
         {
             let mut pending = self.pending_elaborations.write().await;
             if let Some(prior) = pending.remove(&trigger_uri) {
@@ -483,33 +391,23 @@ impl Backend {
             }
         }
 
-        // Clone the Arcs / Client that the task needs. tokio Client is
-        // already a cheap clone (internally Arc'd); the rest are explicit
-        // Arcs so cloning is just a refcount bump.
-        let documents = self.documents.clone();
+        let slang_svc = self.slang.clone();
         let pending = self.pending_elaborations.clone();
         let slang_published = self.slang_published.clone();
         let last_hash = self.last_elaborate_input_hash.clone();
         let startup_logged = self.startup_index_logged.clone();
         let lsp_client = self.client.clone();
         let trigger_for_task = trigger_uri.clone();
-        let closed_file_cache = self.closed_file_cache.clone();
 
         let handle = tokio::spawn(async move {
             tokio::time::sleep(debounce).await;
 
-            // Build the elaborate request from project config + the
-            // currently-open documents (their in-memory text overrides
-            // anything on disk so unsaved changes participate).
-            let (params, files_in_request) =
-                build_elaborate_params(&project, &documents, &closed_file_cache).await;
+            let Some((params, files_in_request)) = slang_svc.build_elaborate_params().await else {
+                pending.write().await.remove(&trigger_for_task);
+                return;
+            };
 
-            // Hash the inputs that determine slang's answer. If we've
-            // already sent slang exactly this set of files+config and got
-            // a successful response, the prior diagnostics still apply —
-            // skip the round-trip (which is the ~500KB packet) and let
-            // the editor keep what it has.
-            let input_hash = hash_elaborate_inputs(&params);
+            let input_hash = SlangService::hash_inputs(&params);
             if *last_hash.read().await == Some(input_hash) {
                 debug!(
                     hash = input_hash,
@@ -526,17 +424,12 @@ impl Backend {
                 hash = input_hash,
                 "sending elaborate request",
             );
-            match slang.elaborate(&params).await {
+            match slang_svc.elaborate(&params).await {
                 Ok(result) => {
                     publish_slang_result(&lsp_client, &files_in_request, result, &slang_published)
                         .await;
                     *last_hash.write().await = Some(input_hash);
 
-                    // First successful elaborate of the session: emit one
-                    // `info!` per file that slang now has compiled.
-                    // `compare_exchange` so a concurrent elaborate doesn't
-                    // double-log. AcqRel is the cheapest ordering that
-                    // gives both the winner and the loser a coherent view.
                     if startup_logged
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
@@ -547,16 +440,10 @@ impl Backend {
                     }
                 }
                 Err(e) => {
-                    // We deliberately don't drop the slang client here
-                    // even on terminal errors — that's a follow-up. For
-                    // now, log and let the next edit retry; if the
-                    // sidecar is genuinely gone, every retry will fail
-                    // the same way and the user will see it in stderr.
                     error!(error = %e, "slang elaborate failed");
                 }
             }
 
-            // Self-clean from the pending map so we don't leak handles.
             pending.write().await.remove(&trigger_for_task);
         });
 
@@ -590,10 +477,7 @@ impl Backend {
                 );
                 let paths = resolved.files.clone();
                 let include_dirs = resolved.include_dirs.clone();
-                *self.project.write().await = Some(resolved);
-                // The filelist may have changed — drop the entire disk cache
-                // so the next request re-reads all closed project files.
-                *self.closed_file_cache.write().await = None;
+                self.slang.set_project(Some(resolved)).await;
                 let parser = self.parser.clone();
                 let workspace = self.workspace.clone();
                 tokio::spawn(async move {
@@ -626,13 +510,10 @@ impl Backend {
     /// initial hydration uses the same skipping policy via
     /// `hydrate_from_paths`.
     async fn rehydrate_single_file(&self, path: &Path) {
-        let include_dirs = self
-            .project
-            .read()
-            .await
-            .as_ref()
-            .map(|p| p.include_dirs.clone())
-            .unwrap_or_default();
+        let include_dirs: Vec<PathBuf> = match self.slang.build_elaborate_params().await {
+            Some((params, _)) => params.include_dirs.into_iter().map(PathBuf::from).collect(),
+            None => Vec::new(),
+        };
         let entries = {
             let mut p = self.parser.lock().await;
             workspace_index::hydrate_from_paths(
@@ -734,224 +615,6 @@ impl Backend {
         hover_for_symbol(&sym, &sym_url, &docs)
     }
 
-    /// Slang-first hover: ask slang where the symbol under the cursor is
-    /// declared, then read the declaration line at that location. Used
-    /// when `MIMIR_SLANG_PATH` is configured.
-    ///
-    /// Returns `None` when slang isn't configured, when slang has no
-    /// answer, or on transport error — the caller falls through to the
-    /// tree-sitter path in all three cases. Hover is a UX feature, not a
-    /// correctness one: an empty slang result should still let the user
-    /// see *something* via the syntax index rather than nothing at all.
-    async fn try_slang_hover(&self, uri: &Url, rope: &Rope, target: MPosition) -> Option<Hover> {
-        let slang = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
-
-        let (params, _) = build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, target).await?;
-
-        let result = match slang.definition(&params).await {
-            Ok(r) => r,
-            Err(e) => {
-                if is_slang_transient(&e) {
-                    debug!(error = %e, "slang hover: connection busy with elaborate; falling back to syntax");
-                } else {
-                    error!(error = %e, "slang hover transport error; falling back to syntax");
-                }
-                return None;
-            }
-        };
-
-        let loc = result.locations.into_iter().next()?;
-        let dest_uri = match path_to_url(&loc.path) {
-            Some(u) => u,
-            None => {
-                debug!(path = %loc.path, "slang hover: location path not a file URL");
-                return None;
-            }
-        };
-        let line_no = loc.range.start.line;
-
-        // Look the resolved location up in the workspace index. When a
-        // matching `Symbol` exists, route through `hover_for_symbol` so
-        // callables get their synthesized signature and macros get their
-        // full multi-line body — the slang path otherwise reads a single
-        // line from disk, which silently truncates multi-line declarations.
-        // O(1) via the reverse location index — no full-workspace scan.
-        let workspace_match: Option<(Url, Symbol)> = {
-            let ws = self.workspace.read().await;
-            ws.index
-                .lookup_by_location(&dest_uri, line_no)
-                .map(|e| (e.url.clone(), e.symbol.clone()))
-        };
-        if let Some((sym_url, sym)) = workspace_match {
-            let docs = self.documents.read().await;
-            if let Some(h) = hover_for_symbol(&sym, &sym_url, &docs) {
-                return Some(h);
-            }
-        }
-
-        // No workspace symbol at the resolved location — fall back to a
-        // multi-line text read so a multi-line declaration still shows
-        // every parameter. `read_declaration_block` reads lines from
-        // `line_no` until the first source line that looks like the end
-        // of the declaration (`;`, `endfunction`, blank line, …).
-        let dest_path = &loc.path;
-        let block: Option<String> = {
-            let docs = self.documents.read().await;
-            docs.get(&dest_uri).and_then(|state| {
-                let r = Rope::from_str(&state.document.text());
-                read_declaration_block(&r, line_no)
-            })
-        }
-        .or_else(|| {
-            if &dest_uri == uri {
-                read_declaration_block(rope, line_no)
-            } else {
-                std::fs::read_to_string(dest_path)
-                    .ok()
-                    .and_then(|t| read_declaration_block(&Rope::from_str(&t), line_no))
-            }
-        });
-
-        let block = block?;
-        Some(hover_markdown(&block))
-    }
-
-    /// Try to resolve a definition via the slang sidecar.
-    ///
-    /// Returns:
-    /// * `None` — slang is not configured, or no project is loaded, or
-    ///   the cursor URI doesn't have a filesystem path. The caller
-    ///   should fall through to the syntax path.
-    /// * `Some(Resolved(locs))` — slang ran and returned a definitive
-    ///   answer (possibly empty). The caller honours an empty result
-    ///   as authoritative; no further fallback.
-    /// * `Some(TransportError)` — IO/protocol error talking to the
-    ///   sidecar. Logged at error here; caller should fall back.
-    async fn try_slang_definition(
-        &self,
-        uri: &Url,
-        target: MPosition,
-    ) -> Option<SlangDefinitionOutcome> {
-        let slang = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
-
-        // Build the request envelope. `build_definition_params` returns
-        // `None` if the URI has no filesystem path (e.g. an `untitled:`
-        // buffer); slang can't address those.
-        let (params, _files_in_request) =
-            build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, target).await?;
-
-        match slang.definition(&params).await {
-            Ok(result) => {
-                let locations: Vec<Location> = result
-                    .locations
-                    .into_iter()
-                    .filter_map(slang_location_to_lsp)
-                    .collect();
-                Some(SlangDefinitionOutcome::Resolved(locations))
-            }
-            Err(e) => {
-                if is_slang_transient(&e) {
-                    debug!(error = %e, "slang definition: connection busy with elaborate; falling back to syntax");
-                } else {
-                    error!(error = %e, "slang definition transport error; falling back to syntax");
-                }
-                Some(SlangDefinitionOutcome::TransportError)
-            }
-        }
-    }
-
-    /// Try to resolve the type of the symbol under the cursor via slang.
-    ///
-    /// No syntax fallback — type resolution requires semantic information that
-    /// tree-sitter doesn't have. Returns `None` when slang is not configured or
-    /// the URI is not a filesystem path; `Some(Resolved(_))` on success;
-    /// `Some(TransportError)` on I/O failure.
-    async fn try_slang_type_definition(
-        &self,
-        uri: &Url,
-        target: MPosition,
-    ) -> Option<SlangTypeDefinitionOutcome> {
-        let slang = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
-
-        let (def_params, _) =
-            build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, target).await?;
-        let params = SlangTypeDefinitionParams {
-            files: def_params.files,
-            include_dirs: def_params.include_dirs,
-            defines: def_params.defines,
-            top: def_params.top,
-            target_path: def_params.target_path,
-            target_position: def_params.target_position,
-        };
-
-        match slang.type_definition(&params).await {
-            Ok(result) => {
-                let locations: Vec<Location> = result
-                    .locations
-                    .into_iter()
-                    .filter_map(slang_type_definition_location_to_lsp)
-                    .collect();
-                Some(SlangTypeDefinitionOutcome::Resolved(locations))
-            }
-            Err(e) => {
-                if is_slang_transient(&e) {
-                    debug!(error = %e, "slang type_definition: connection busy with elaborate; falling back");
-                } else {
-                    error!(error = %e, "slang type_definition transport error");
-                }
-                Some(SlangTypeDefinitionOutcome::TransportError)
-            }
-        }
-    }
-
-    /// Try to resolve implementations of the symbol under the cursor via slang.
-    ///
-    /// No syntax fallback — implementation queries need full class-hierarchy
-    /// information that tree-sitter doesn't provide. Returns `None` when slang
-    /// is not configured or the URI is not a filesystem path;
-    /// `Some(Resolved(_))` on success; `Some(TransportError)` on I/O failure.
-    async fn try_slang_implementation(
-        &self,
-        uri: &Url,
-        target: MPosition,
-    ) -> Option<SlangImplementationOutcome> {
-        let slang = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
-
-        let (def_params, _) =
-            build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, target).await?;
-        let params = SlangImplementationParams {
-            files: def_params.files,
-            include_dirs: def_params.include_dirs,
-            defines: def_params.defines,
-            top: def_params.top,
-            target_path: def_params.target_path,
-            target_position: def_params.target_position,
-        };
-
-        match slang.implementation(&params).await {
-            Ok(result) => {
-                let locations: Vec<Location> = result
-                    .locations
-                    .into_iter()
-                    .filter_map(slang_implementation_location_to_lsp)
-                    .collect();
-                Some(SlangImplementationOutcome::Resolved(locations))
-            }
-            Err(e) => {
-                if is_slang_transient(&e) {
-                    debug!(error = %e, "slang implementation: connection busy with elaborate; falling back");
-                } else {
-                    error!(error = %e, "slang implementation transport error");
-                }
-                Some(SlangImplementationOutcome::TransportError)
-            }
-        }
-    }
-
     /// Stage 1 + Stage 2 syntax-based resolver, factored out so the
     /// `goto_definition` handler can either reach for slang first
     /// (when configured) or call this directly (when slang is absent
@@ -995,238 +658,6 @@ impl Backend {
             .collect();
         debug!(name, count = locations.len(), "syntax definition resolved");
         Some(GotoDefinitionResponse::Array(locations))
-    }
-
-    /// Common scaffolding for the three slang-backed completion routes.
-    ///
-    /// Owns: lock-acquire on slang+project, [`build_definition_params`],
-    /// constructing [`SlangCompleteParams`], dispatching `slang.complete`,
-    /// and converting transport errors to `None` so callers fall back to
-    /// the syntax path. Returns the raw `Vec<SlangCompletionItem>` on
-    /// success (possibly empty) so each caller can apply its own
-    /// per-route filtering and empty-result fallback policy.
-    async fn slang_complete_request(
-        &self,
-        uri: &Url,
-        pos: MPosition,
-        kind: SlangCompletionRequestKind,
-        prefix: Option<String>,
-    ) -> Option<Vec<SlangCompletionItem>> {
-        self.slang_complete_request_with_patch(uri, pos, kind, prefix, None)
-            .await
-    }
-
-    /// Variant of [`slang_complete_request`] that lets the caller patch the
-    /// target file's text and adjust the cursor before the request leaves
-    /// the server. Used by member-access completion to insert a placeholder
-    /// identifier after the trigger `.` so slang's parser produces a valid
-    /// `MemberAccessExpression` (instead of bailing on the dangling dot).
-    async fn slang_complete_request_with_patch(
-        &self,
-        uri: &Url,
-        pos: MPosition,
-        kind: SlangCompletionRequestKind,
-        prefix: Option<String>,
-        patch: Option<TargetTextPatch>,
-    ) -> Option<Vec<SlangCompletionItem>> {
-        let slang = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
-        let (mut def_params, _) =
-            build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, pos).await?;
-        if let Some(patch) = patch {
-            apply_target_text_patch(&mut def_params, &patch);
-        }
-        let params = into_complete_params(def_params, kind, prefix);
-        match slang.complete(&params).await {
-            Ok(result) => Some(result.items),
-            Err(e) => {
-                if is_slang_transient(&e) {
-                    debug!(error = %e, "slang complete: connection busy with elaborate; falling back to syntax");
-                } else {
-                    warn!(error = %e, "slang complete error; falling back to syntax");
-                }
-                None
-            }
-        }
-    }
-
-    /// Try slang-backed member-access or package-scope completion.
-    ///
-    /// Returns `Some` when:
-    /// * slang is configured + project loaded,
-    /// * the line has a `.` or `::` trigger before the cursor,
-    /// * the sidecar successfully resolves the LHS type or package.
-    ///
-    /// Returns `None` otherwise — the caller falls back to `syntax_completion`.
-    async fn try_slang_member_completion(
-        &self,
-        uri: &Url,
-        pos: MPosition,
-    ) -> Option<CompletionResponse> {
-        let text = {
-            let docs = self.documents.read().await;
-            docs.get(uri)?.document.text()
-        };
-        let rope = Rope::from_str(&text);
-        let (is_pkg_scope, member_prefix) = detect_member_access(&rope, pos)?;
-        let kind = if is_pkg_scope {
-            SlangCompletionRequestKind::PackageScope
-        } else {
-            SlangCompletionRequestKind::MemberAccess
-        };
-        let wire_prefix = (!member_prefix.is_empty()).then(|| member_prefix.clone());
-
-        // For member-access (`.` trigger) with no member typed yet, the
-        // buffer reads `a.|` — slang's parser sees an incomplete expression
-        // and produces no `NamedValueExpression` for `a`, so the sidecar's
-        // type lookup at the LHS returns null and we get zero items. Insert
-        // a placeholder identifier at the cursor so the line parses as
-        // `a.<sentinel>`: the AST then has a real `NamedValueExpression(a)`
-        // the sidecar can resolve, and the unknown sentinel member name is
-        // harmless (it just doesn't match any real member, so it never
-        // surfaces in the result list).
-        //
-        // Skipped for package-scope (`pkg::|`) because the sidecar's
-        // package-scope handler walks the text backward from the cursor to
-        // pull the LHS name and looks it up by name — it doesn't need a
-        // parsed RHS.
-        let patch = (!is_pkg_scope && member_prefix.is_empty())
-            .then(|| build_member_completion_sentinel(&rope, pos))
-            .flatten();
-        let send_pos = patch.as_ref().map_or(pos, |p| p.adjusted_position);
-
-        let items = self
-            .slang_complete_request_with_patch(uri, send_pos, kind, wire_prefix, patch)
-            .await?;
-        if items.is_empty() {
-            // Route 2 (`completion` LSP method) returns an empty array when
-            // a `.` / `::` trigger is present and slang yields nothing —
-            // no syntax fallback for member-access (would surface unrelated
-            // workspace symbols, the "workspace dump" anti-pattern). Make
-            // the log say what actually happens so the user can diagnose
-            // (usually: type or package not in elaboration unit; check the
-            // `.mimir.toml` filelist and `+incdir+`).
-            debug!(
-                is_pkg_scope,
-                prefix = %member_prefix,
-                "slang member completion: 0 items; popup will be empty (no syntax fallback for member-access)",
-            );
-            return None;
-        }
-        let prefix_lower = member_prefix.to_ascii_lowercase();
-        let filtered: Vec<SlangCompletionItem> = items
-            .into_iter()
-            .filter(|it| {
-                prefix_lower.is_empty() || it.label.to_ascii_lowercase().starts_with(&prefix_lower)
-            })
-            .collect();
-        debug!(count = filtered.len(), "slang member completion");
-        Some(slang_items_to_response(filtered))
-    }
-
-    /// Try slang-backed scope-aware identifier completion.
-    ///
-    /// Called when there is no `.` / `::` / `` ` `` trigger before the cursor
-    /// — i.e. the user is typing a plain identifier. The sidecar walks the
-    /// enclosing scope chain and returns all visible symbols, inner scopes
-    /// shadowing outer ones.
-    ///
-    /// Returns `Some` when slang resolves at least one candidate. Returns
-    /// `None` on transport error, empty result, or no slang configured —
-    /// the caller falls through to `syntax_completion`.
-    async fn try_slang_identifier_completion(
-        &self,
-        uri: &Url,
-        pos: MPosition,
-    ) -> Option<CompletionResponse> {
-        let text = {
-            let docs = self.documents.read().await;
-            docs.get(uri)?.document.text()
-        };
-        let rope = Rope::from_str(&text);
-        let prefix = mimir_syntax::symbols::prefix_at(&rope, pos).unwrap_or_default();
-        let wire_prefix = (!prefix.is_empty()).then(|| prefix.to_owned());
-
-        let items = self
-            .slang_complete_request(
-                uri,
-                pos,
-                SlangCompletionRequestKind::Identifier,
-                wire_prefix,
-            )
-            .await?;
-        if items.is_empty() {
-            debug!("slang identifier completion: no items; falling back to syntax");
-            return None;
-        }
-        debug!(count = items.len(), "slang identifier completion");
-        Some(slang_items_to_response(items))
-    }
-
-    /// Try slang-backed macro-name completion.
-    ///
-    /// Called when the cursor is right after a `` ` `` trigger character.
-    /// The sidecar returns all `` `define `` names visible in the compilation
-    /// unit; the prefix (if any) is applied server-side.
-    ///
-    /// Returns `None` on transport error or no slang configured — the caller
-    /// falls through to `syntax_macro_completion`. An empty successful result
-    /// returns `Some(empty)` so the route does *not* fall back to syntax
-    /// (the slang macro list is authoritative when slang is reachable).
-    async fn try_slang_macro_completion(
-        &self,
-        uri: &Url,
-        pos: MPosition,
-        macro_prefix: &str,
-    ) -> Option<CompletionResponse> {
-        let wire_prefix = (!macro_prefix.is_empty()).then(|| macro_prefix.to_owned());
-        let items = self
-            .slang_complete_request(uri, pos, SlangCompletionRequestKind::Macro, wire_prefix)
-            .await?;
-        debug!(count = items.len(), "slang macro completion");
-        Some(slang_items_to_response(items))
-    }
-
-    /// Try slang-backed signature help.
-    ///
-    /// Returns `Some` when slang is configured and the sidecar returns at
-    /// least one signature. Returns `None` on transport error, empty result,
-    /// or no slang configured — the caller falls through to tree-sitter.
-    async fn try_slang_signature_help(
-        &self,
-        uri: &Url,
-        pos: MPosition,
-    ) -> Option<Vec<mimir_slang::SignatureItem>> {
-        let client = self.slang.read().await.clone()?;
-        let project = self.project.read().await.clone()?;
-
-        let (def_params, _) = build_definition_params(&project, &self.documents, &self.closed_file_cache, uri, pos).await?;
-        let params = SlangSignatureHelpParams {
-            files: def_params.files,
-            include_dirs: def_params.include_dirs,
-            defines: def_params.defines,
-            top: def_params.top,
-            target_path: def_params.target_path,
-            target_position: def_params.target_position,
-        };
-
-        match client.signature_help(&params).await {
-            Ok(result) if !result.signatures.is_empty() => {
-                debug!(
-                    count = result.signatures.len(),
-                    "slang signature help returned"
-                );
-                Some(result.signatures)
-            }
-            Ok(_) => {
-                debug!("slang signature help: empty — falling back to tree-sitter");
-                None
-            }
-            Err(e) => {
-                debug!(error = %e, "slang signature help transport error — falling back");
-                None
-            }
-        }
     }
 
     /// Gather syntax-side candidates for `uri`, split into same-file and
@@ -1454,22 +885,6 @@ impl Backend {
 /// `old_end_byte` refer to offsets in the old text, as tree-sitter requires.
 /// Returns `None` when the LSP range is out of bounds (we fall back to a
 /// full re-parse in that case).
-/// Returns `true` for slang client errors that indicate the sidecar was
-/// temporarily unavailable rather than broken: the connection was occupied by
-/// a concurrent elaborate ([`SlangClientError::Busy`]) or the sidecar took
-/// longer than the interactive deadline ([`SlangConnectionError::Timeout`]).
-///
-/// These are expected under active editing and should be logged at `debug!`
-/// level, not `error!` — the caller falls through to the tree-sitter path.
-#[inline]
-fn is_slang_transient(e: &SlangClientError) -> bool {
-    matches!(e, SlangClientError::Busy)
-        || matches!(
-            e,
-            SlangClientError::Connection(SlangConnectionError::Timeout { .. })
-        )
-}
-
 fn make_input_edit(rope: &Rope, range: MRange, new_text: &str) -> Option<InputEdit> {
     let start_byte = range.start.to_byte_offset(rope).ok()?;
     let old_end_byte = range.end.to_byte_offset(rope).ok()?;
@@ -1533,7 +948,7 @@ impl LanguageServer for Backend {
                     // If slang wasn't configured via process env at startup,
                     // check whether the project's [env] table provides
                     // MIMIR_SLANG_PATH and try to spawn from there.
-                    if self.slang.read().await.is_none() {
+                    if !self.slang.is_configured().await {
                         if let Some(raw) = resolved.env.get(crate::SLANG_PATH_ENV) {
                             // Resolve relative paths against the .mimir.toml
                             // directory so `MIMIR_SLANG_PATH =
@@ -1558,7 +973,7 @@ impl LanguageServer for Backend {
                                         path = %abs_path.display(),
                                         "slang sidecar spawned from .mimir.toml [env]",
                                     );
-                                    *self.slang.write().await = Some(Arc::new(client));
+                                    self.slang.set_client(Some(Arc::new(client))).await;
                                 }
                                 Err(e) => {
                                     warn!(
@@ -1588,7 +1003,7 @@ impl LanguageServer for Backend {
                     tokio::spawn(async move {
                         hydrate_workspace_index(paths, include_dirs, parser, workspace).await;
                     });
-                    *self.project.write().await = Some(resolved);
+                    self.slang.set_project(Some(resolved)).await;
 
                     // Kick off a workspace-wide slang elaborate so semantic
                     // cross-file features (definition, completion,
@@ -1807,7 +1222,7 @@ impl LanguageServer for Backend {
 
         // A file moving closed→open means future did_close must re-read it
         // from disk. Drop the entire cache so that path is not served stale.
-        *self.closed_file_cache.write().await = None;
+        self.slang.clear_closed_file_cache().await;
 
         {
             let mut docs = self.documents.write().await;
@@ -1905,7 +1320,7 @@ impl LanguageServer for Backend {
         // A file moving open→closed becomes disk-authoritative again. The
         // user may have changed it via another editor since we last read it,
         // so drop the entire cache rather than risk serving stale text.
-        *self.closed_file_cache.write().await = None;
+        self.slang.clear_closed_file_cache().await;
         // LSP spec: clear diagnostics for closed docs by publishing empty.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
@@ -1978,17 +1393,7 @@ impl LanguageServer for Backend {
                         }
                         // A closed project file changed on disk — evict its
                         // cached text so the next request re-reads from disk.
-                        {
-                            let mut guard = self.closed_file_cache.write().await;
-                            if let Some(cache) = guard.as_mut() {
-                                if cache.texts.remove(&path).is_some() {
-                                    debug!(
-                                        path = %path.display(),
-                                        "closed_file_cache: evicted stale entry"
-                                    );
-                                }
-                            }
-                        }
+                        self.slang.evict_closed_file(&path).await;
                         self.rehydrate_single_file(&path).await;
                     }
                 }
@@ -2014,7 +1419,7 @@ impl LanguageServer for Backend {
         // empty (the user opted into the semantic resolver; an
         // authoritative "no" is more accurate than syntactic guesses).
         // Transport errors fall through to the syntax path.
-        let outcome = Box::pin(self.try_slang_definition(&uri, target)).await;
+        let outcome = Box::pin(self.slang.definition(&uri, target)).await;
         match route_definition(outcome) {
             DefinitionRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang definition resolved");
@@ -2048,7 +1453,7 @@ impl LanguageServer for Backend {
         // v2 deferral: prototype-vs-body distinction for `extern function` /
         // `pure virtual` requires either a dedicated slang RPC or
         // `is_prototype` tracking in the symbol index.
-        let outcome = Box::pin(self.try_slang_definition(&uri, target)).await;
+        let outcome = Box::pin(self.slang.definition(&uri, target)).await;
         match route_definition(outcome) {
             DefinitionRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang declaration resolved");
@@ -2075,7 +1480,7 @@ impl LanguageServer for Backend {
 
         // Slang-only: no tree-sitter fallback for type resolution.
         // None (slang not configured / transport error) → returns None to editor.
-        let outcome = Box::pin(self.try_slang_type_definition(&uri, target)).await;
+        let outcome = Box::pin(self.slang.type_definition(&uri, target)).await;
         match route_type_definition(outcome) {
             TypeDefinitionRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang type_definition resolved");
@@ -2100,7 +1505,7 @@ impl LanguageServer for Backend {
 
         // Slang-only: implementation queries need full semantic analysis.
         // None (slang not configured / transport error) → returns None to editor.
-        let outcome = Box::pin(self.try_slang_implementation(&uri, target)).await;
+        let outcome = Box::pin(self.slang.implementation(&uri, target)).await;
         match route_implementation(outcome) {
             ImplementationRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang implementation resolved");
@@ -2301,12 +1706,47 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Slang-first lookup, then tree-sitter fallback.
-        // Box::pin moves each sub-future's state machine to the heap, preventing
-        // the large SlangDefinitionParams (all file texts) from being stored
-        // inline in this handler's stack-allocated state machine.
-        if let Some(hover) = Box::pin(self.try_slang_hover(&uri, &rope, target)).await {
-            return Ok(Some(hover));
+        // Slang-first lookup: ask slang where the symbol is declared, then
+        // enrich via workspace index (multi-line hover) or declaration block.
+        if let Some(SlangDefinitionOutcome::Resolved(locs)) = Box::pin(self.slang.definition(&uri, target)).await {
+            if let Some(loc) = locs.into_iter().next() {
+                let dest_uri = loc.uri;
+                let line_no = loc.range.start.line;
+
+                let workspace_match: Option<(Url, Symbol)> = {
+                    let ws = self.workspace.read().await;
+                    ws.index
+                        .lookup_by_location(&dest_uri, line_no)
+                        .map(|e| (e.url.clone(), e.symbol.clone()))
+                };
+                if let Some((sym_url, sym)) = workspace_match {
+                    let docs = self.documents.read().await;
+                    if let Some(h) = hover_for_symbol(&sym, &sym_url, &docs) {
+                        return Ok(Some(h));
+                    }
+                }
+
+                let block: Option<String> = {
+                    let docs = self.documents.read().await;
+                    docs.get(&dest_uri).and_then(|state| {
+                        let r = Rope::from_str(&state.document.text());
+                        read_declaration_block(&r, line_no)
+                    })
+                }
+                .or_else(|| {
+                    if dest_uri == uri {
+                        read_declaration_block(&rope, line_no)
+                    } else {
+                        dest_uri.to_file_path().ok()
+                            .and_then(|p| std::fs::read_to_string(&p).ok())
+                            .and_then(|t| read_declaration_block(&Rope::from_str(&t), line_no))
+                    }
+                });
+
+                if let Some(block) = block {
+                    return Ok(Some(hover_markdown(&block)));
+                }
+            }
         }
 
         if let Some(hover) =
@@ -2509,7 +1949,7 @@ impl LanguageServer for Backend {
         let target = MPosition::new(pos.line, pos.character);
 
         // --- slang path ---
-        if let Some(sigs) = Box::pin(self.try_slang_signature_help(&uri, target)).await {
+        if let Some(sigs) = Box::pin(self.slang.signature_help(&uri, target)).await {
             let result = slang_signatures_to_lsp(sigs, 0);
             return Ok(Some(result));
         }
@@ -2730,7 +2170,7 @@ impl LanguageServer for Backend {
         if let Some(rope) = &rope {
             if let Some(macro_prefix) = detect_macro_trigger(rope, target) {
                 if let Some(resp) =
-                    Box::pin(self.try_slang_macro_completion(&uri, target, &macro_prefix)).await
+                    Box::pin(self.slang.macro_completion(&uri, target, &macro_prefix)).await
                 {
                     return Ok(Some(resp));
                 }
@@ -2749,7 +2189,7 @@ impl LanguageServer for Backend {
             .map(|r| detect_member_access(r, target).is_some())
             .unwrap_or(false);
 
-        if let Some(resp) = Box::pin(self.try_slang_member_completion(&uri, target)).await {
+        if let Some(resp) = Box::pin(self.slang.member_completion(&uri, target)).await {
             return Ok(Some(resp));
         }
         if has_member_trigger {
@@ -2758,7 +2198,7 @@ impl LanguageServer for Backend {
 
         // Route 3: plain identifier — scope-aware completion.
         // Slang first (scope-correct); falls back to syntax+workspace+keywords.
-        if let Some(resp) = Box::pin(self.try_slang_identifier_completion(&uri, target)).await {
+        if let Some(resp) = Box::pin(self.slang.identifier_completion(&uri, target)).await {
             return Ok(Some(resp));
         }
         Ok(Box::pin(self.syntax_completion(&uri, target)).await)
@@ -3086,250 +2526,6 @@ async fn hydrate_workspace_index(
         requested = count_requested,
         "workspace index hydrated",
     );
-}
-
-/// Hash the inputs of an [`ElaborateParams`] for cache-keying purposes.
-///
-/// Includes everything slang's compilation depends on: each source file's
-/// `path` + `text` + `is_compilation_unit`, plus `include_dirs`,
-/// `defines`, and `top`. Uses `DefaultHasher` — deterministic within one
-/// process (sufficient for an in-memory equality check) and O(total bytes).
-///
-/// Two requests with identical inputs hash to the same value; any change
-/// to a file's text, the filelist, include search paths, or defines
-/// produces a different hash and forces a fresh slang elaborate.
-fn hash_elaborate_inputs(params: &ElaborateParams) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for f in &params.files {
-        f.path.hash(&mut h);
-        f.text.hash(&mut h);
-        f.is_compilation_unit.hash(&mut h);
-    }
-    for d in &params.include_dirs {
-        d.hash(&mut h);
-    }
-    for d in &params.defines {
-        d.name.hash(&mut h);
-        d.value.hash(&mut h);
-    }
-    params.top.hash(&mut h);
-    h.finish()
-}
-
-async fn build_elaborate_params(
-    project: &ResolvedProject,
-    documents: &Arc<RwLock<HashMap<Url, DocumentState>>>,
-    closed_file_cache: &Arc<RwLock<Option<ClosedFileDiskCache>>>,
-) -> (ElaborateParams, Vec<Url>) {
-    // Snapshot open document text under the read lock; release before
-    // any disk I/O. `text()` clones the rope into a String — cheap
-    // enough for typical files, and lets the lock release immediately.
-    let open_text: HashMap<PathBuf, (Url, String)> = {
-        let docs = documents.read().await;
-        docs.iter()
-            .filter_map(|(uri, state)| {
-                uri.to_file_path()
-                    .ok()
-                    .map(|p| (p, (uri.clone(), state.document.text())))
-            })
-            .collect()
-    };
-
-    assemble_with_cache(project, &open_text, closed_file_cache).await
-}
-
-/// Assemble [`ElaborateParams`] using the [`ClosedFileDiskCache`].
-///
-/// Uses a three-phase approach so no lock is held across disk I/O:
-///
-/// 1. **Read phase** — snapshot cached texts under `read().await`.
-/// 2. **Work phase** — call [`assemble_elaborate_params`] with a closure
-///    that reads from the snapshot first, falls back to
-///    `std::fs::read_to_string` for misses, and collects newly-read texts.
-///    No lock held during disk reads.
-/// 3. **Write phase** — merge newly-read texts back into the cache under
-///    `write().await`.
-///
-/// Open-file texts (`open_text`) always shadow the cache: they come from the
-/// live rope and are passed directly to [`assemble_elaborate_params`], which
-/// checks `open_text` before calling the disk reader. Unsaved edits are
-/// therefore always reflected correctly regardless of cache state.
-async fn assemble_with_cache(
-    project: &ResolvedProject,
-    open_text: &HashMap<PathBuf, (Url, String)>,
-    closed_file_cache: &Arc<RwLock<Option<ClosedFileDiskCache>>>,
-) -> (ElaborateParams, Vec<Url>) {
-    // Phase 1: snapshot existing cached texts (cheap read lock).
-    let cached_texts: HashMap<PathBuf, String> = closed_file_cache
-        .read()
-        .await
-        .as_ref()
-        .map(|c| c.texts.clone())
-        .unwrap_or_default();
-
-    // Phase 2: assemble params — no lock held; disk reads happen here.
-    let mut new_entries: HashMap<PathBuf, String> = HashMap::new();
-    let result = assemble_elaborate_params(project, open_text, |path| {
-        if let Some(text) = cached_texts.get(path) {
-            return Some(text.clone());
-        }
-        let text = std::fs::read_to_string(path).ok()?;
-        new_entries.insert(path.to_path_buf(), text.clone());
-        Some(text)
-    });
-
-    // Phase 3: merge newly-read texts into the cache (write lock, no I/O).
-    // Always ensure the cache is Some after the first call so subsequent
-    // calls skip the write lock entirely on a fully-warm cache.
-    {
-        let mut guard = closed_file_cache.write().await;
-        let cache = guard.get_or_insert_with(ClosedFileDiskCache::default);
-        cache.texts.extend(new_entries);
-        debug!(
-            count = cache.texts.len(),
-            "closed_file_cache: warm after merge"
-        );
-    }
-
-    result
-}
-
-/// Pure version of [`build_elaborate_params`]: given the project, a
-/// snapshot of open documents, and an injectable disk reader, produce
-/// the request envelope. Split out so unit tests can drive it without an
-/// `Arc<RwLock<HashMap<...>>>` or a real filesystem.
-///
-/// `read_disk` is called for project files that aren't currently open.
-/// Returning `None` means "this file isn't on disk either" — slang sees
-/// an empty buffer for it. That's the same fallback we'd get from
-/// `read_to_string(...).unwrap_or_default()`, just an explicit seam.
-fn assemble_elaborate_params(
-    project: &ResolvedProject,
-    open_text: &HashMap<PathBuf, (Url, String)>,
-    mut read_disk: impl FnMut(&std::path::Path) -> Option<String>,
-) -> (ElaborateParams, Vec<Url>) {
-    let mut files: Vec<SourceFile> = Vec::new();
-    let mut files_in_request: Vec<Url> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-
-    // Project filelist first — declaration order matters for slang
-    // (later files can refer to earlier ones in the same compilation
-    // unit; reordering would change diagnostics).
-    for project_file in &project.files {
-        if !seen.insert(project_file.clone()) {
-            continue;
-        }
-        let (url, text) = match open_text.get(project_file) {
-            Some((url, text)) => (url.clone(), text.clone()),
-            None => {
-                let text = read_disk(project_file).unwrap_or_default();
-                let url = Url::from_file_path(project_file)
-                    .unwrap_or_else(|()| placeholder_url(project_file));
-                (url, text)
-            }
-        };
-        files.push(SourceFile {
-            path: project_file.display().to_string(),
-            text,
-            is_compilation_unit: true,
-        });
-        files_in_request.push(url);
-    }
-
-    // Open documents not yet covered by the project filelist. We send
-    // them so unsaved edits to includee files still affect elaboration,
-    // but mark them `is_compilation_unit = false` — the sidecar will
-    // seed its `SourceManager` with the buffer and let `` `include ``
-    // resolution find it, instead of wrapping it in a standalone
-    // `SyntaxTree` (which would be wrong: an includee out of its
-    // `package` context produces spurious errors, and the buffer
-    // collides with the one the preprocessor pulled in via include).
-    //
-    // Headers that aren't open in the editor are intentionally NOT
-    // pulled in here — slang's preprocessor reads them straight from
-    // disk via `+incdir+`. Inlining the full include closure (e.g. all
-    // of UVM) would balloon every request to multi-MB and pay no
-    // dividend the preprocessor can't already deliver.
-    for (path, (url, text)) in open_text {
-        if seen.insert(path.clone()) {
-            files.push(SourceFile {
-                path: path.display().to_string(),
-                text: text.clone(),
-                is_compilation_unit: false,
-            });
-            files_in_request.push(url.clone());
-        }
-    }
-
-    let include_dirs = project
-        .include_dirs
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-
-    let params = ElaborateParams {
-        files,
-        include_dirs,
-        defines: project.defines.clone(),
-        top: project.top.clone(),
-    };
-    (params, files_in_request)
-}
-
-/// Build a `definition` request envelope for the slang sidecar.
-///
-/// Reuses [`assemble_elaborate_params`] for the file/include/define
-/// assembly so the request matches the most recent `elaborate` shape
-/// — the sidecar can answer from its compilation cache when the
-/// inputs are bit-equal. Only the cursor's `target_path` /
-/// `target_position` are added on top.
-///
-/// Returns `None` when the cursor URI has no filesystem path (e.g.
-/// `untitled:` buffers); slang addresses files by path so there's
-/// nothing meaningful to send.
-async fn build_definition_params(
-    project: &ResolvedProject,
-    documents: &Arc<RwLock<HashMap<Url, DocumentState>>>,
-    closed_file_cache: &Arc<RwLock<Option<ClosedFileDiskCache>>>,
-    target_uri: &Url,
-    target_position: MPosition,
-) -> Option<(SlangDefinitionParams, Vec<Url>)> {
-    let target_path = target_uri.to_file_path().ok()?;
-
-    let open_text: HashMap<PathBuf, (Url, String)> = {
-        let docs = documents.read().await;
-        docs.iter()
-            .filter_map(|(uri, state)| {
-                uri.to_file_path()
-                    .ok()
-                    .map(|p| (p, (uri.clone(), state.document.text())))
-            })
-            .collect()
-    };
-    let (elab, files_in_request) =
-        assemble_with_cache(project, &open_text, closed_file_cache).await;
-    let params = SlangDefinitionParams {
-        files: elab.files,
-        include_dirs: elab.include_dirs,
-        defines: elab.defines,
-        top: elab.top,
-        target_path: target_path.display().to_string(),
-        target_position: MPosition::new(target_position.line, target_position.character),
-    };
-    Some((params, files_in_request))
-}
-
-/// Convert a slang `DefinitionLocation` into LSP's `Location`.
-///
-/// Returns `None` when the path can't be turned back into a URL — same
-/// fallback path as `slang_to_lsp_diagnostic` uses for diagnostics,
-/// keeping behaviour consistent across slang result types.
-fn slang_location_to_lsp(loc: SlangDefinitionLocation) -> Option<Location> {
-    let url = path_to_url(&loc.path)?;
-    Some(Location {
-        uri: url,
-        range: m_range_to_lsp(loc.range),
-    })
 }
 
 /// Outcome of the AST-driven method-call resolver. `Resolved(sym, via)`
@@ -3753,139 +2949,6 @@ fn slang_locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResp
     }
 }
 
-/// Outcome of a slang definition request, used by `goto_definition` to
-/// decide whether to short-circuit (Resolved, including empty) or fall
-/// through to the syntax path (TransportError).
-#[derive(Debug)]
-enum SlangDefinitionOutcome {
-    /// Slang answered. The vector may be empty — that's "no decl found"
-    /// and the server returns `None` to the editor without falling
-    /// back to syntax.
-    Resolved(Vec<Location>),
-    /// IO / protocol error talking to the sidecar. The caller falls
-    /// back to syntax.
-    TransportError,
-}
-
-/// Routing decision for `goto_definition`: which backend's answer the
-/// handler should ultimately return. Pure (no I/O) so the slang-vs-syntax
-/// policy is unit-testable without spawning a sidecar.
-#[derive(Debug, PartialEq, Eq)]
-enum DefinitionRoute {
-    /// Use slang's locations (may be empty — trust-slang short-circuits
-    /// the empty case to `None` in the response, never the syntax index).
-    UseSlangResult(Vec<Location>),
-    /// Slang isn't configured, no project loaded, or the sidecar request
-    /// hit a transport error. The handler should consult the syntax
-    /// index instead.
-    UseSyntaxFallback,
-}
-
-/// Pure routing policy. `None` means the slang path didn't run (not
-/// configured, no project, untitled buffer); `Some(TransportError)`
-/// means it ran and failed; `Some(Resolved(_))` means it ran and
-/// answered.
-///
-/// Policy: slang is primary; an *empty* slang answer falls back to the
-/// tree-sitter workspace index. Unlike `goto_type_definition` /
-/// `goto_implementation`, definition has a meaningful syntax fallback
-/// (every declared symbol is in the workspace index), so an empty slang
-/// reply on a position slang can't resolve (e.g. a type argument inside
-/// `IDENT#(T)`) still has somewhere useful to land.
-fn route_definition(outcome: Option<SlangDefinitionOutcome>) -> DefinitionRoute {
-    match outcome {
-        Some(SlangDefinitionOutcome::Resolved(locs)) if !locs.is_empty() => {
-            DefinitionRoute::UseSlangResult(locs)
-        }
-        // Slang resolved-but-empty, transport error, or not run at all —
-        // give the syntax index a chance.
-        _ => DefinitionRoute::UseSyntaxFallback,
-    }
-}
-
-/// Convert a slang `TypeDefinitionLocation` into LSP's `Location`.
-fn slang_type_definition_location_to_lsp(loc: SlangTypeDefinitionLocation) -> Option<Location> {
-    let url = path_to_url(&loc.path)?;
-    Some(Location {
-        uri: url,
-        range: m_range_to_lsp(loc.range),
-    })
-}
-
-/// Outcome of a slang `typeDefinition` request.
-#[derive(Debug)]
-enum SlangTypeDefinitionOutcome {
-    /// Slang answered (may be empty — no fallback in either case).
-    Resolved(Vec<Location>),
-    /// I/O / protocol error. The handler returns `None` to the editor.
-    TransportError,
-}
-
-/// Routing decision for `goto_type_definition`. Pure so the policy is
-/// unit-testable without a sidecar.
-#[derive(Debug, PartialEq, Eq)]
-enum TypeDefinitionRoute {
-    /// Use slang's locations (trust-slang-on-empty: empty → `None`).
-    UseSlangResult(Vec<Location>),
-    /// Slang not configured, untitled buffer, or transport error.
-    UseEmpty,
-}
-
-fn route_type_definition(outcome: Option<SlangTypeDefinitionOutcome>) -> TypeDefinitionRoute {
-    match outcome {
-        Some(SlangTypeDefinitionOutcome::Resolved(locs)) => {
-            TypeDefinitionRoute::UseSlangResult(locs)
-        }
-        Some(SlangTypeDefinitionOutcome::TransportError) | None => TypeDefinitionRoute::UseEmpty,
-    }
-}
-
-/// Convert a slang `ImplementationLocation` into LSP's `Location`.
-fn slang_implementation_location_to_lsp(loc: SlangImplementationLocation) -> Option<Location> {
-    let url = path_to_url(&loc.path)?;
-    Some(Location {
-        uri: url,
-        range: m_range_to_lsp(loc.range),
-    })
-}
-
-/// Outcome of a slang `implementation` request.
-#[derive(Debug)]
-enum SlangImplementationOutcome {
-    /// Slang answered (may be empty — no fallback in either case).
-    Resolved(Vec<Location>),
-    /// I/O / protocol error. The handler returns `None` to the editor.
-    TransportError,
-}
-
-/// Routing decision for `goto_implementation`. Pure so the policy is
-/// unit-testable without a sidecar.
-#[derive(Debug, PartialEq, Eq)]
-enum ImplementationRoute {
-    /// Use slang's locations (trust-slang-on-empty: empty → `None`).
-    UseSlangResult(Vec<Location>),
-    /// Slang not configured, untitled buffer, or transport error.
-    UseEmpty,
-}
-
-fn route_implementation(outcome: Option<SlangImplementationOutcome>) -> ImplementationRoute {
-    match outcome {
-        Some(SlangImplementationOutcome::Resolved(locs)) => {
-            ImplementationRoute::UseSlangResult(locs)
-        }
-        Some(SlangImplementationOutcome::TransportError) | None => ImplementationRoute::UseEmpty,
-    }
-}
-
-/// Last-ditch fallback when `Url::from_file_path` rejects a path (e.g.
-/// non-absolute path on a system where it requires absolute). We surface
-/// it as a `file:` URL with the raw path, accepting that the editor may
-/// or may not match it back to an open document. Better than panicking;
-/// happens only on pathological filesystems.
-fn placeholder_url(p: &std::path::Path) -> Url {
-    Url::parse(&format!("file://{}", p.display()))
-        .unwrap_or_else(|_| Url::parse("file:///").expect("file:/// is always valid"))
-}
 
 /// Apply a slang elaborate result to the editor's diagnostic state.
 ///
@@ -4193,20 +3256,6 @@ fn collect_references(
     out
 }
 
-/// Convert our internal `Range` into the `lsp_types` shape.
-fn m_range_to_lsp(r: MRange) -> Range {
-    Range {
-        start: Position {
-            line: r.start.line,
-            character: r.start.character,
-        },
-        end: Position {
-            line: r.end.line,
-            character: r.end.character,
-        },
-    }
-}
-
 /// Convert a `mimir_syntax::FoldRange` into the `lsp_types` shape.
 ///
 /// Whole-line folds — `start_character` / `end_character` are `None` so the
@@ -4431,94 +3480,6 @@ fn symbol_kind_to_completion_kind(kind: MSymbolKind) -> CompletionItemKind {
     }
 }
 
-/// Scan the rope line up to `pos` for a member-access or package-scope trigger.
-///
-/// Returns `Some((is_package_scope, prefix_after_trigger))` when a `.` or
-/// `::` trigger is found immediately before any partial identifier at the
-/// cursor. `is_package_scope` is `true` for `::`, `false` for `.`.
-/// The returned prefix is the partial identifier typed after the trigger
-/// (may be empty when the cursor is immediately after the trigger character).
-/// Returns `None` when no trigger is found.
-fn detect_member_access(rope: &Rope, pos: MPosition) -> Option<(bool, String)> {
-    if (pos.line as usize) >= rope.len_lines() {
-        return None;
-    }
-    let line = rope.line(pos.line as usize);
-
-    // Build the line text up to the cursor (respecting UTF-16 character count).
-    let mut buf = String::new();
-    let mut utf16: u32 = 0;
-    for ch in line.chars() {
-        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
-            break;
-        }
-        buf.push(ch);
-        utf16 += ch.len_utf16() as u32;
-    }
-
-    let chars: Vec<char> = buf.chars().collect();
-    let mut i = chars.len();
-
-    // Skip trailing identifier chars (the partial member name being typed).
-    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
-        i -= 1;
-    }
-    let prefix: String = chars[i..].iter().collect();
-
-    // Check for `.` trigger.
-    if i > 0 && chars[i - 1] == '.' {
-        return Some((false, prefix));
-    }
-    // Check for `::` trigger.
-    if i >= 2 && chars[i - 2] == ':' && chars[i - 1] == ':' {
-        return Some((true, prefix));
-    }
-
-    None
-}
-
-/// Detect a `` ` `` macro trigger before the cursor.
-///
-/// Returns `Some(prefix)` when the identifier (or empty string) immediately
-/// before the cursor is preceded by a backtick. For example:
-///   `` `MY_ `` at column 5 → `Some("MY_")`
-///   `` `     `` at column 1 → `Some("")`
-///
-/// Returns `None` for any other context (including `.` or `::`).
-fn detect_macro_trigger(rope: &Rope, pos: MPosition) -> Option<String> {
-    if (pos.line as usize) >= rope.len_lines() {
-        return None;
-    }
-    let line = rope.line(pos.line as usize);
-
-    // Build the line text up to the cursor (UTF-16 aware).
-    let mut buf = String::new();
-    let mut utf16: u32 = 0;
-    for ch in line.chars() {
-        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
-            break;
-        }
-        buf.push(ch);
-        utf16 += ch.len_utf16() as u32;
-    }
-
-    let chars: Vec<char> = buf.chars().collect();
-    let mut i = chars.len();
-
-    // Skip trailing identifier chars (the partial macro name being typed).
-    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_') {
-        i -= 1;
-    }
-    let prefix: String = chars[i..].iter().collect();
-
-    // The character immediately before the identifier must be a backtick.
-    if i > 0 && chars[i - 1] == '`' {
-        return Some(prefix);
-    }
-
-    None
-}
-
 /// Payload stored in `CompletionItem.data` so a later
 /// `completionItem/resolve` request can re-locate the symbol cheaply
 /// (no re-parse, no workspace re-scan) and read its declaration line
@@ -4693,78 +3654,6 @@ struct SyntaxCandidates {
     cross_file: Vec<(Url, Symbol)>,
 }
 
-/// Patch applied to a slang request so the sidecar sees a parseable
-/// version of the buffer. The completion-sentinel inserts a dummy
-/// identifier at the cursor; the LSP buffer is unchanged.
-#[derive(Debug, Clone)]
-struct TargetTextPatch {
-    /// Byte offset (UTF-8) at which `insert` is spliced into the file
-    /// identified by `SlangDefinitionParams::target_path`.
-    insert_byte_offset: usize,
-    /// Text inserted at `insert_byte_offset`.
-    insert: &'static str,
-    /// Cursor position to send to slang AFTER the splice — i.e. the
-    /// post-insert location of the original cursor (shifted right by
-    /// `insert.encode_utf16().count()`). LSP positions are UTF-16 units.
-    adjusted_position: MPosition,
-}
-
-/// Reserved identifier inserted by [`build_member_completion_sentinel`].
-/// Chosen to be unlikely to collide with any real symbol in user code:
-/// double underscores plus a `mimir_` prefix.
-const COMPLETION_SENTINEL: &str = "__mimir_complete__";
-
-/// Build a [`TargetTextPatch`] that inserts [`COMPLETION_SENTINEL`] at the
-/// cursor so a `.`-triggered completion produces a parseable
-/// `MemberAccessExpression`. Returns `None` only when the cursor position
-/// can't be turned into a byte offset (out-of-bounds line/character —
-/// shouldn't happen for a position the editor sent us, but we degrade
-/// gracefully rather than panic).
-fn build_member_completion_sentinel(rope: &Rope, pos: MPosition) -> Option<TargetTextPatch> {
-    let byte = pos.to_byte_offset(rope).ok()?;
-    let utf16_shift = COMPLETION_SENTINEL.encode_utf16().count() as u32;
-    Some(TargetTextPatch {
-        insert_byte_offset: byte,
-        insert: COMPLETION_SENTINEL,
-        adjusted_position: MPosition::new(pos.line, pos.character + utf16_shift),
-    })
-}
-
-/// Splice `patch.insert` into the request's target file at the recorded
-/// byte offset. The target file is identified by `def.target_path`.
-fn apply_target_text_patch(def: &mut SlangDefinitionParams, patch: &TargetTextPatch) {
-    let target = def.target_path.clone();
-    for sf in def.files.iter_mut() {
-        if sf.path == target && patch.insert_byte_offset <= sf.text.len() {
-            sf.text.insert_str(patch.insert_byte_offset, patch.insert);
-            break;
-        }
-    }
-}
-
-/// Build a [`SlangCompleteParams`] by lifting the six wire fields out of a
-/// resolved [`SlangDefinitionParams`] and stamping in the request `kind` /
-/// `prefix`. Centralises the field-shuffle that the three slang completion
-/// routes used to repeat verbatim.
-fn into_complete_params(
-    def: SlangDefinitionParams,
-    kind: SlangCompletionRequestKind,
-    prefix: Option<String>,
-) -> SlangCompleteParams {
-    SlangCompleteParams {
-        files: def.files,
-        include_dirs: def.include_dirs,
-        defines: def.defines,
-        top: def.top,
-        target_path: def.target_path,
-        target_position: def.target_position,
-        kind,
-        prefix,
-    }
-}
-
-/// Convert a vector of sidecar [`SlangCompletionItem`]s into an LSP
-/// [`CompletionResponse::Array`]. Single-source mapping for the three
 /// Convert a list of slang `SignatureItem`s into LSP's `SignatureHelp`.
 ///
 /// `active_sig` is the index of the currently active overload (0 for the
@@ -4803,46 +3692,6 @@ fn slang_signatures_to_lsp(
         signatures: lsp_sigs,
         active_signature: Some(active_sig),
         active_parameter: None,
-    }
-}
-
-/// slang routes; keeps the field-by-field translation in one place.
-///
-/// Dedupes by `label` (first-wins) so a symbol visible through multiple
-/// paths — e.g. lexical scope and a `import pkg::*` — only surfaces once.
-fn slang_items_to_response(items: Vec<SlangCompletionItem>) -> CompletionResponse {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mapped: Vec<CompletionItem> = items
-        .into_iter()
-        .filter(|it| seen.insert(it.label.clone()))
-        .map(|it| CompletionItem {
-            label: it.label,
-            kind: Some(slang_completion_kind_to_lsp(it.kind)),
-            detail: it.detail,
-            ..Default::default()
-        })
-        .collect();
-    debug!(
-        count = mapped.len(),
-        labels = ?mapped.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
-        "slang completion response",
-    );
-    CompletionResponse::Array(mapped)
-}
-
-/// Map a sidecar numeric `kind` code to an LSP [`CompletionItemKind`].
-///
-/// The sidecar uses a small numeric vocabulary that mirrors LSP's enum but
-/// doesn't depend on the Rust `lsp_types` crate. This is the only place we
-/// decode those numbers back into the typed enum.
-fn slang_completion_kind_to_lsp(kind: u8) -> CompletionItemKind {
-    match kind {
-        2 => CompletionItemKind::METHOD,
-        5 => CompletionItemKind::FIELD,
-        6 => CompletionItemKind::VARIABLE,
-        20 => CompletionItemKind::ENUM_MEMBER,
-        21 => CompletionItemKind::CONSTANT,
-        _ => CompletionItemKind::VARIABLE,
     }
 }
 
@@ -4912,24 +3761,6 @@ fn nest_symbol_subtree(symbols: &[Symbol]) -> (DocumentSymbol, usize) {
 /// would misclassify legitimate children as siblings).
 fn range_contains(outer: MRange, inner: MRange) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
-}
-
-/// Convert a path string from the slang sidecar back to a `file:` URL.
-/// Slang echoes back exactly the path we sent (which is `PathBuf::display`
-/// on a path we built from `Url::to_file_path` in the first place), so on
-/// every platform we exercise the round-trip is loss-free.
-fn path_to_url(path: &str) -> Option<Url> {
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        Url::from_file_path(&p).ok()
-    } else {
-        // Best-effort: try to canonicalise relative paths against the
-        // current process directory. Realistically we always send
-        // absolute paths so this branch is a safety net.
-        std::fs::canonicalize(&p)
-            .ok()
-            .and_then(|abs| Url::from_file_path(abs).ok())
-    }
 }
 
 /// Map a tree-sitter (`mimir-syntax`) diagnostic onto the wire format
@@ -5231,191 +4062,6 @@ mod tests {
         }
     }
 
-    /// `assemble_elaborate_params` puts the project's filelist first
-    /// (preserving order), prefers in-memory text over disk, and falls
-    /// back to disk for files the user hasn't opened.
-    #[test]
-    fn assemble_uses_open_text_then_disk() {
-        let f1 = PathBuf::from("/proj/a.sv");
-        let f2 = PathBuf::from("/proj/b.sv");
-        let project = project_with_files(vec![f1.clone(), f2.clone()]);
-
-        let url1 = Url::from_file_path(&f1).unwrap();
-        let mut open_text = HashMap::new();
-        open_text.insert(f1.clone(), (url1.clone(), "module a; endmodule".into()));
-
-        let (params, files_in_request) = assemble_elaborate_params(&project, &open_text, |p| {
-            if p == f2 {
-                Some("module b; endmodule".into())
-            } else {
-                None
-            }
-        });
-
-        assert_eq!(params.files.len(), 2);
-        assert_eq!(params.files[0].path, "/proj/a.sv");
-        assert_eq!(params.files[0].text, "module a; endmodule");
-        assert!(params.files[0].is_compilation_unit);
-        assert_eq!(params.files[1].path, "/proj/b.sv");
-        assert_eq!(params.files[1].text, "module b; endmodule");
-        assert!(params.files[1].is_compilation_unit);
-        assert_eq!(params.include_dirs, vec!["/proj/inc"]);
-        assert_eq!(params.top.as_deref(), Some("tb_top"));
-        assert_eq!(files_in_request.len(), 2);
-        assert_eq!(files_in_request[0], url1);
-    }
-
-    /// Open documents not in the project filelist get appended after the
-    /// project files — we still want diagnostics for them even before the
-    /// user adds them to `.f`.
-    #[test]
-    fn assemble_appends_open_docs_not_in_filelist() {
-        let f1 = PathBuf::from("/proj/a.sv");
-        let project = project_with_files(vec![f1.clone()]);
-
-        let scratch = PathBuf::from("/tmp/scratch.sv");
-        let scratch_url = Url::from_file_path(&scratch).unwrap();
-        let mut open_text = HashMap::new();
-        open_text.insert(
-            scratch.clone(),
-            (scratch_url.clone(), "module s; endmodule".into()),
-        );
-
-        let (params, files_in_request) =
-            assemble_elaborate_params(&project, &open_text, |_| Some(String::new()));
-
-        assert_eq!(params.files.len(), 2);
-        assert_eq!(params.files[0].path, "/proj/a.sv");
-        assert!(params.files[0].is_compilation_unit);
-        // Open-but-not-in-filelist files are seeded into the source
-        // manager but not parsed as their own compilation unit — so
-        // unsaved buffers participate via include resolution without
-        // colliding with the preprocessor's own load of the file.
-        assert_eq!(params.files[1].path, "/tmp/scratch.sv");
-        assert!(!params.files[1].is_compilation_unit);
-        assert_eq!(files_in_request.len(), 2);
-        assert!(files_in_request.contains(&scratch_url));
-    }
-
-    /// Duplicate paths in the project filelist are deduplicated — slang
-    /// would either reject the duplicate or silently coalesce; we don't
-    /// want to find out which the hard way.
-    #[test]
-    fn assemble_deduplicates_repeated_files() {
-        let f = PathBuf::from("/proj/a.sv");
-        let project = project_with_files(vec![f.clone(), f.clone()]);
-
-        let (params, files_in_request) =
-            assemble_elaborate_params(&project, &HashMap::new(), |_| Some(String::new()));
-
-        assert_eq!(params.files.len(), 1);
-        assert_eq!(files_in_request.len(), 1);
-    }
-
-    /// `assemble_elaborate_params` does NOT inline transitively
-    /// `` `include`` d files into the slang request. Headers reach the
-    /// sidecar via slang's own preprocessor (`+incdir+` lookup); inlining
-    /// the full closure (e.g. all of UVM) would balloon every request to
-    /// multi-megabytes for no behavioural gain. The "open header" case is
-    /// already covered by `assemble_appends_open_docs_not_in_filelist`.
-    #[test]
-    fn assemble_does_not_expand_includes_into_request() {
-        let umbrella = PathBuf::from("/proj/uvm.sv");
-        let mut project = project_with_files(vec![umbrella.clone()]);
-        project.include_dirs = vec![PathBuf::from("/uvm/src")];
-
-        let pkg = PathBuf::from("/uvm/src/uvm_pkg.sv");
-        let texts: HashMap<PathBuf, String> = HashMap::from([
-            (umbrella.clone(), "`include \"uvm_pkg.sv\"\n".into()),
-            (pkg.clone(), "package uvm_pkg; endpackage\n".into()),
-        ]);
-
-        let (params, _) =
-            assemble_elaborate_params(&project, &HashMap::new(), |p| texts.get(p).cloned());
-
-        let paths: Vec<&str> = params.files.iter().map(|sf| sf.path.as_str()).collect();
-        assert_eq!(paths, vec!["/proj/uvm.sv"]);
-    }
-
-    // ── closed_file_cache tests ───────────────────────────────────────────
-
-    /// The cache is `None` before the first call and `Some` after — even
-    /// when all files are unreadable (missing from disk). The contract is
-    /// that `Some` means "we attempted a population", not "we found data".
-    #[tokio::test]
-    async fn closed_file_cache_populated_on_first_call_skipped_on_second() {
-        let f = PathBuf::from("/proj/a.sv");
-        let project = project_with_files(vec![f.clone()]);
-        let open_text: HashMap<PathBuf, (Url, String)> = HashMap::new();
-        let cache: Arc<RwLock<Option<ClosedFileDiskCache>>> = Arc::new(RwLock::new(None));
-
-        assert!(cache.read().await.is_none(), "cache starts empty");
-        let _ = assemble_with_cache(&project, &open_text, &cache).await;
-
-        // After the first call the cache must be populated (Some).
-        assert!(
-            cache.read().await.is_some(),
-            "cache should be Some after first call"
-        );
-
-        let text_before = cache.read().await.as_ref().unwrap().texts.get(&f).cloned();
-        let _ = assemble_with_cache(&project, &open_text, &cache).await;
-        let text_after = cache.read().await.as_ref().unwrap().texts.get(&f).cloned();
-        assert_eq!(
-            text_before, text_after,
-            "cache entry must be identical on second call (no re-read)"
-        );
-    }
-
-    /// Setting the cache to `None` causes the next call to re-populate it.
-    #[tokio::test]
-    async fn closed_file_cache_invalidation_resets_state() {
-        let f = PathBuf::from("/proj/a.sv");
-        let project = project_with_files(vec![f]);
-        let open_text: HashMap<PathBuf, (Url, String)> = HashMap::new();
-        let cache: Arc<RwLock<Option<ClosedFileDiskCache>>> = Arc::new(RwLock::new(None));
-
-        let _ = assemble_with_cache(&project, &open_text, &cache).await;
-        assert!(cache.read().await.is_some());
-
-        // Simulate an invalidation event (e.g. did_open).
-        *cache.write().await = None;
-        assert!(cache.read().await.is_none(), "cache must be None after invalidation");
-
-        let _ = assemble_with_cache(&project, &open_text, &cache).await;
-        assert!(
-            cache.read().await.is_some(),
-            "cache must be re-populated after next call"
-        );
-    }
-
-    /// Targeted eviction preserves unrelated entries — only the evicted
-    /// path is gone; other cached paths survive.
-    #[tokio::test]
-    async fn closed_file_cache_targeted_eviction_preserves_other_entries() {
-        let fa = PathBuf::from("/proj/a.sv");
-        let fb = PathBuf::from("/proj/b.sv");
-
-        let mut initial = ClosedFileDiskCache::default();
-        initial.texts.insert(fa.clone(), "module a; endmodule".into());
-        initial.texts.insert(fb.clone(), "module b; endmodule".into());
-        let cache: Arc<RwLock<Option<ClosedFileDiskCache>>> =
-            Arc::new(RwLock::new(Some(initial)));
-
-        // Targeted eviction of /proj/a.sv (simulating a CHANGED event).
-        {
-            let mut guard = cache.write().await;
-            if let Some(c) = guard.as_mut() {
-                c.texts.remove(&fa);
-            }
-        }
-
-        let guard = cache.read().await;
-        let c = guard.as_ref().unwrap();
-        assert!(!c.texts.contains_key(&fa), "evicted entry must be absent");
-        assert!(c.texts.contains_key(&fb), "non-evicted entry must still be present");
-    }
-
     /// Plan: every requested file gets a publish, including files with
     /// no diagnostics (empty publish overwrites tree-sitter).
     #[test]
@@ -5632,17 +4278,6 @@ mod tests {
         }
     }
 
-    /// `Range` round-trips through `m_range_to_lsp` losslessly.
-    #[test]
-    fn m_range_to_lsp_preserves_endpoints() {
-        let r = MRange::new(MPosition::new(3, 7), MPosition::new(4, 12));
-        let lsp = m_range_to_lsp(r);
-        assert_eq!(lsp.start.line, 3);
-        assert_eq!(lsp.start.character, 7);
-        assert_eq!(lsp.end.line, 4);
-        assert_eq!(lsp.end.character, 12);
-    }
-
     /// `nest_symbols` over an empty index returns no roots.
     #[test]
     fn nest_symbols_empty() {
@@ -5808,226 +4443,6 @@ mod tests {
     #[test]
     fn slang_outcome_resolved_empty_returns_none() {
         assert!(slang_locations_to_response(Vec::new()).is_none());
-    }
-
-    /// `slang_location_to_lsp` preserves the path and range, mapping
-    /// through `path_to_url` + `m_range_to_lsp` the same way diagnostics
-    /// already do.
-    #[test]
-    fn slang_location_to_lsp_round_trip() {
-        let loc = SlangDefinitionLocation {
-            path: "/proj/b.sv".into(),
-            range: MRange::new(MPosition::new(2, 6), MPosition::new(2, 12)),
-        };
-        let lsp = slang_location_to_lsp(loc).expect("path_to_url should accept absolute path");
-        assert_eq!(lsp.uri.scheme(), "file");
-        assert!(lsp.uri.path().ends_with("/proj/b.sv"));
-        assert_eq!(lsp.range.start.line, 2);
-        assert_eq!(lsp.range.start.character, 6);
-        assert_eq!(lsp.range.end.character, 12);
-    }
-
-    /// `route_definition` picks slang when slang resolved (any vec).
-    #[test]
-    fn route_definition_uses_slang_when_resolved_non_empty() {
-        let url = Url::parse("file:///proj/a.sv").unwrap();
-        let locs = vec![Location {
-            uri: url,
-            range: Range {
-                start: Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: Position {
-                    line: 0,
-                    character: 1,
-                },
-            },
-        }];
-        let route = route_definition(Some(SlangDefinitionOutcome::Resolved(locs.clone())));
-        assert_eq!(route, DefinitionRoute::UseSlangResult(locs));
-    }
-
-    /// `route_definition` falls back to syntax when slang resolved with
-    /// an empty location set. Slang misses some positions (notably type
-    /// names inside parameterized scopes — see the apb_monitor →
-    /// apb_rw cross-file test); when it can't resolve, the workspace
-    /// index gets a chance instead of silently returning no result.
-    #[test]
-    fn route_definition_falls_back_when_slang_resolved_empty() {
-        let route = route_definition(Some(SlangDefinitionOutcome::Resolved(Vec::new())));
-        assert_eq!(route, DefinitionRoute::UseSyntaxFallback);
-    }
-
-    /// Transport errors fall back to the syntax index — the user still
-    /// gets *some* answer when the sidecar is misbehaving.
-    #[test]
-    fn route_definition_falls_back_on_transport_error() {
-        let route = route_definition(Some(SlangDefinitionOutcome::TransportError));
-        assert_eq!(route, DefinitionRoute::UseSyntaxFallback);
-    }
-
-    /// `None` (slang not configured, no project loaded, untitled buffer)
-    /// also falls back. The syntax index is the floor.
-    #[test]
-    fn route_definition_falls_back_when_slang_not_run() {
-        let route = route_definition(None);
-        assert_eq!(route, DefinitionRoute::UseSyntaxFallback);
-    }
-
-    /// A path `path_to_url` rejects yields `None` rather than panicking
-    /// or fabricating a URL.
-    #[test]
-    fn slang_location_to_lsp_returns_none_on_unparseable_path() {
-        // `path_to_url` parses bare strings; an empty path is not a
-        // valid file URL and should round-trip through the helper as
-        // `None` (or at most a sanitised `file:///` placeholder). We
-        // accept either as long as it's not a panic — the contract is
-        // "don't crash on bad data."
-        let loc = SlangDefinitionLocation {
-            path: String::new(),
-            range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 0)),
-        };
-        // Just exercise the path; correctness of the path-parser is
-        // covered by `path_to_url`'s own tests.
-        let _ = slang_location_to_lsp(loc);
-    }
-
-    // ------------------------------------------------------------------
-    // route_type_definition
-    // ------------------------------------------------------------------
-
-    fn sample_location() -> Location {
-        Location {
-            uri: Url::parse("file:///proj/a.sv").unwrap(),
-            range: Range {
-                start: Position {
-                    line: 1,
-                    character: 0,
-                },
-                end: Position {
-                    line: 1,
-                    character: 8,
-                },
-            },
-        }
-    }
-
-    /// Slang resolved with locations → `UseSlangResult`.
-    #[test]
-    fn route_type_definition_uses_slang_when_resolved_non_empty() {
-        let locs = vec![sample_location()];
-        let route = route_type_definition(Some(SlangTypeDefinitionOutcome::Resolved(locs.clone())));
-        assert_eq!(route, TypeDefinitionRoute::UseSlangResult(locs));
-    }
-
-    /// Empty resolved → still `UseSlangResult` (trust-slang-on-empty — no syntax fallback).
-    #[test]
-    fn route_type_definition_uses_slang_when_resolved_empty() {
-        let route = route_type_definition(Some(SlangTypeDefinitionOutcome::Resolved(Vec::new())));
-        assert_eq!(route, TypeDefinitionRoute::UseSlangResult(Vec::new()));
-    }
-
-    /// Transport error → `UseEmpty` (no syntax fallback for type queries).
-    #[test]
-    fn route_type_definition_returns_empty_on_transport_error() {
-        let route = route_type_definition(Some(SlangTypeDefinitionOutcome::TransportError));
-        assert_eq!(route, TypeDefinitionRoute::UseEmpty);
-    }
-
-    /// `None` (slang not configured) → `UseEmpty`.
-    #[test]
-    fn route_type_definition_returns_empty_when_slang_not_run() {
-        let route = route_type_definition(None);
-        assert_eq!(route, TypeDefinitionRoute::UseEmpty);
-    }
-
-    // ------------------------------------------------------------------
-    // route_implementation
-    // ------------------------------------------------------------------
-
-    /// Slang resolved with locations → `UseSlangResult`.
-    #[test]
-    fn route_implementation_uses_slang_when_resolved_non_empty() {
-        let locs = vec![sample_location()];
-        let route = route_implementation(Some(SlangImplementationOutcome::Resolved(locs.clone())));
-        assert_eq!(route, ImplementationRoute::UseSlangResult(locs));
-    }
-
-    /// Empty resolved → still `UseSlangResult` (trust-slang-on-empty).
-    #[test]
-    fn route_implementation_uses_slang_when_resolved_empty() {
-        let route = route_implementation(Some(SlangImplementationOutcome::Resolved(Vec::new())));
-        assert_eq!(route, ImplementationRoute::UseSlangResult(Vec::new()));
-    }
-
-    /// Transport error → `UseEmpty`.
-    #[test]
-    fn route_implementation_returns_empty_on_transport_error() {
-        let route = route_implementation(Some(SlangImplementationOutcome::TransportError));
-        assert_eq!(route, ImplementationRoute::UseEmpty);
-    }
-
-    /// `None` (slang not configured) → `UseEmpty`.
-    #[test]
-    fn route_implementation_returns_empty_when_slang_not_run() {
-        let route = route_implementation(None);
-        assert_eq!(route, ImplementationRoute::UseEmpty);
-    }
-
-    /// `build_member_completion_sentinel` inserts the sentinel at the
-    /// cursor's byte offset and shifts the LSP position right by the
-    /// sentinel's UTF-16 length. Without this, slang would see an
-    /// incomplete `a.` expression and fail to resolve the LHS type.
-    #[test]
-    fn member_completion_sentinel_inserts_at_cursor() {
-        // Single-line buffer "  a." with the cursor right after the dot
-        // (UTF-16 column 4).
-        let rope = Rope::from_str("  a.");
-        let pos = MPosition::new(0, 4);
-        let patch = build_member_completion_sentinel(&rope, pos).expect("cursor in bounds");
-        assert_eq!(patch.insert, COMPLETION_SENTINEL);
-        assert_eq!(patch.insert_byte_offset, 4);
-        assert_eq!(patch.adjusted_position.line, 0);
-        assert_eq!(
-            patch.adjusted_position.character,
-            4 + COMPLETION_SENTINEL.encode_utf16().count() as u32,
-        );
-    }
-
-    /// `apply_target_text_patch` only patches the file matching the
-    /// request's `target_path` — sibling files in `files` keep their
-    /// original text.
-    #[test]
-    fn apply_target_text_patch_only_touches_target() {
-        let mut def = SlangDefinitionParams {
-            files: vec![
-                SourceFile {
-                    path: "/proj/a.sv".into(),
-                    text: "module a; endmodule".into(),
-                    is_compilation_unit: true,
-                },
-                SourceFile {
-                    path: "/proj/b.sv".into(),
-                    text: "module b; endmodule".into(),
-                    is_compilation_unit: true,
-                },
-            ],
-            include_dirs: vec![],
-            defines: vec![],
-            top: None,
-            target_path: "/proj/b.sv".into(),
-            target_position: MPosition::new(0, 9),
-        };
-        let patch = TargetTextPatch {
-            insert_byte_offset: 9,
-            insert: COMPLETION_SENTINEL,
-            adjusted_position: MPosition::new(0, 9),
-        };
-        apply_target_text_patch(&mut def, &patch);
-        assert_eq!(def.files[0].text, "module a; endmodule");
-        assert!(def.files[1].text.contains(COMPLETION_SENTINEL));
-        assert!(def.files[1].text.starts_with("module b;"));
     }
 
     /// `CompletionOptions` can be constructed with the trigger characters
@@ -6203,159 +4618,6 @@ mod tests {
     fn read_line_trimmed_oob_returns_none() {
         let rope = ropey::Rope::from_str("only one line\n");
         assert_eq!(read_line_trimmed(&rope, 99), None);
-    }
-
-    // ------------------------------------------------------------------
-    // detect_member_access
-    // ------------------------------------------------------------------
-
-    fn rope_from(s: &str) -> ropey::Rope {
-        ropey::Rope::from_str(s)
-    }
-
-    /// Cursor immediately after `.` → Some((false, "")).
-    #[test]
-    fn detect_member_access_dot_empty_prefix() {
-        let rope = rope_from("my_obj.");
-        let pos = MPosition::new(0, 7); // right after '.'
-        let result = detect_member_access(&rope, pos);
-        assert_eq!(result, Some((false, String::new())));
-    }
-
-    /// Cursor mid-identifier after `.` → returns dot trigger + prefix.
-    #[test]
-    fn detect_member_access_dot_with_prefix() {
-        let rope = rope_from("my_obj.run_p");
-        let pos = MPosition::new(0, 12); // end of "run_p"
-        let result = detect_member_access(&rope, pos);
-        assert_eq!(result, Some((false, "run_p".to_string())));
-    }
-
-    /// Cursor immediately after `::` → Some((true, "")).
-    #[test]
-    fn detect_member_access_scope_empty_prefix() {
-        let rope = rope_from("my_pkg::");
-        let pos = MPosition::new(0, 8); // right after '::'
-        let result = detect_member_access(&rope, pos);
-        assert_eq!(result, Some((true, String::new())));
-    }
-
-    /// Cursor mid-identifier after `::` → returns scope trigger + prefix.
-    #[test]
-    fn detect_member_access_scope_with_prefix() {
-        let rope = rope_from("uvm_pkg::uvm_seq");
-        let pos = MPosition::new(0, 16); // end of "uvm_seq"
-        let result = detect_member_access(&rope, pos);
-        assert_eq!(result, Some((true, "uvm_seq".to_string())));
-    }
-
-    /// Plain identifier with no trigger → `None`.
-    #[test]
-    fn detect_member_access_no_trigger() {
-        let rope = rope_from("my_var");
-        let pos = MPosition::new(0, 6);
-        assert!(detect_member_access(&rope, pos).is_none());
-    }
-
-    /// Cursor past the end of an out-of-bounds line → `None`.
-    #[test]
-    fn detect_member_access_out_of_bounds_line() {
-        let rope = rope_from("x.y");
-        let pos = MPosition::new(99, 0); // line 99 doesn't exist
-        assert!(detect_member_access(&rope, pos).is_none());
-    }
-
-    /// Only `:` (single colon, not `::`) is not a trigger.
-    #[test]
-    fn detect_member_access_single_colon_not_a_trigger() {
-        let rope = rope_from("foo:bar");
-        let pos = MPosition::new(0, 7);
-        assert!(detect_member_access(&rope, pos).is_none());
-    }
-
-    // ------------------------------------------------------------------
-    // detect_macro_trigger
-    // ------------------------------------------------------------------
-
-    /// Cursor immediately after `` ` `` → `Some("")`.
-    #[test]
-    fn detect_macro_trigger_empty_prefix() {
-        let rope = rope_from("`");
-        let pos = MPosition::new(0, 1); // right after backtick
-        assert_eq!(detect_macro_trigger(&rope, pos), Some(String::new()));
-    }
-
-    /// Cursor after `` `MY_ `` → `Some("MY_")`.
-    #[test]
-    fn detect_macro_trigger_with_prefix() {
-        let rope = rope_from("`MY_MACRO");
-        let pos = MPosition::new(0, 4); // after "MY_"
-        assert_eq!(detect_macro_trigger(&rope, pos), Some("MY_".to_string()));
-    }
-
-    /// Full macro name typed → prefix is the full name.
-    #[test]
-    fn detect_macro_trigger_full_name() {
-        let rope = rope_from("`UVM_INFO");
-        let pos = MPosition::new(0, 9); // end of "UVM_INFO"
-        assert_eq!(
-            detect_macro_trigger(&rope, pos),
-            Some("UVM_INFO".to_string())
-        );
-    }
-
-    /// No backtick — plain identifier → `None`.
-    #[test]
-    fn detect_macro_trigger_no_backtick() {
-        let rope = rope_from("my_signal");
-        let pos = MPosition::new(0, 9);
-        assert!(detect_macro_trigger(&rope, pos).is_none());
-    }
-
-    /// `.` trigger is not a macro trigger.
-    #[test]
-    fn detect_macro_trigger_dot_not_macro() {
-        let rope = rope_from("obj.field");
-        let pos = MPosition::new(0, 9);
-        assert!(detect_macro_trigger(&rope, pos).is_none());
-    }
-
-    /// Out-of-bounds line → `None`.
-    #[test]
-    fn detect_macro_trigger_oob_line() {
-        let rope = rope_from("`M");
-        let pos = MPosition::new(99, 0);
-        assert!(detect_macro_trigger(&rope, pos).is_none());
-    }
-
-    // ------------------------------------------------------------------
-    // slang_completion_kind_to_lsp
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn slang_completion_kind_to_lsp_known_codes() {
-        assert_eq!(slang_completion_kind_to_lsp(2), CompletionItemKind::METHOD);
-        assert_eq!(slang_completion_kind_to_lsp(5), CompletionItemKind::FIELD);
-        assert_eq!(
-            slang_completion_kind_to_lsp(6),
-            CompletionItemKind::VARIABLE
-        );
-        assert_eq!(
-            slang_completion_kind_to_lsp(20),
-            CompletionItemKind::ENUM_MEMBER
-        );
-        assert_eq!(
-            slang_completion_kind_to_lsp(21),
-            CompletionItemKind::CONSTANT
-        );
-    }
-
-    #[test]
-    fn slang_completion_kind_to_lsp_unknown_falls_back_to_variable() {
-        assert_eq!(
-            slang_completion_kind_to_lsp(99),
-            CompletionItemKind::VARIABLE
-        );
     }
 
     // ------------------------------------------------------------------
