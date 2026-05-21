@@ -72,6 +72,39 @@ Per-crate test entry points:
 - **Heavy comments are a product requirement.** `missing_docs = "warn"` is on
   in every crate. Don't strip module-level `//!` blocks.
 
+## Single responsibility
+
+Every struct, module, and file owns exactly one concern. When a unit starts
+doing two things, split it — don't add a second responsibility to an existing
+one.
+
+**Concrete rules:**
+
+- **One job per struct.** A struct that holds both "how to talk to the sidecar"
+  and "how to debounce elaboration" must be split. State fields are the tell:
+  if you can't describe the struct's fields with a single noun phrase, it has
+  too many jobs.
+- **One job per module.** A module that tokenizes filelists *and* parses TOML
+  schema *and* resolves project paths is three modules. Each module's `//!`
+  doc must fit in one sentence — if you need "and", split.
+- **Handlers are coordinators, not implementors.** LSP handler methods in
+  `backend.rs` call services; they don't contain business logic. If a handler
+  grows beyond ~10 lines of non-delegation code, the logic belongs in a
+  service module.
+- **Services own their state.** A service struct's fields are private to that
+  service. Callers pass inputs and receive outputs; they don't reach into the
+  service's internals or duplicate its state.
+- **Existing splits to preserve:**
+
+  | Unit | Single responsibility |
+  |------|-----------------------|
+  | `SlangService` | Sidecar IPC + param assembly |
+  | `SyntaxService` | Document store + parser + workspace index |
+  | `ElaborateService` | Debounce + dedup + diagnostic publish |
+  | `filelist` | `.f` tokenization + path resolution + `${VAR}` expansion |
+  | `project` | `.mimir.toml` schema + `ResolvedProject` discovery/load |
+  | `backend` | LSP wire glue — thin coordinator only |
+
 ## When making changes
 
 - New public function → add a `#[cfg(test)] mod tests` test in the same file.
