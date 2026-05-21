@@ -12,12 +12,13 @@
 //!
 //! ## Service architecture
 //!
-//! Heavy logic is split into three peer modules so handlers stay thin:
+//! Heavy logic is split into focused modules so handlers stay thin:
 //!
 //! | Service | Module | Owns |
 //! |---------|--------|------|
+//! | [`TreeSitterProvider`] | `parse_provider` | `SyntaxParser` mutex, single-file parse, bulk hydration |
 //! | [`SlangService`] | `slang_service` | Sidecar IPC, project config, closed-file cache, param assembly |
-//! | [`SyntaxService`] | `syntax_service` | Document store + parser + workspace index access |
+//! | [`SyntaxService`] | `syntax_service` | Document store + workspace index access |
 //! | [`ElaborateService`] | `elaborate_service` | Debounce, input-hash dedup, diagnostic publish lifecycle |
 //!
 //! All three hold `Arc` clones of the same underlying data — no extra
@@ -46,10 +47,10 @@ use mimir_syntax::{
     inlay::hints_for,
     signature::signature_for,
     Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity, Symbol, SymbolKind as MSymbolKind,
-    SyntaxParser, SyntaxTree,
+    SyntaxTree,
 };
 use ropey::Rope;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tree_sitter::InputEdit;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
@@ -59,6 +60,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::completion_score;
 use crate::elaborate_service::{ElaborateService, slang_to_lsp_diagnostic};
 use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
+use crate::parse_provider::TreeSitterProvider;
 use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
 use crate::slang_service::{
     SlangService, SlangDefinitionOutcome, DefinitionRoute, route_definition,
@@ -116,11 +118,10 @@ pub(crate) struct Backend {
     /// writes (edits) once a session is established.
     documents: Arc<RwLock<HashMap<Url, DocumentState>>>,
 
-    /// One parser, guarded by a Mutex. tree-sitter parsers aren't `Sync`,
-    /// and constructing a fresh parser per request would re-pay the
-    /// language-load cost. The mutex is uncontended in the common case (a
-    /// human types into one file at a time).
-    parser: Arc<Mutex<SyntaxParser>>,
+    /// Tree-sitter parse provider. Owns the `SyntaxParser` mutex and all
+    /// parse operations — single-file incremental parse and bulk path
+    /// hydration for the workspace index.
+    ts: Arc<TreeSitterProvider>,
 
     /// Single point of contact for all slang-sidecar IPC: client connection,
     /// resolved project config, closed-file disk cache, and every param-
@@ -153,23 +154,21 @@ impl Backend {
     pub fn new(client: Client, slang: Option<Arc<mimir_slang::Client>>) -> Self {
         let documents: Arc<RwLock<HashMap<Url, DocumentState>>> =
             Arc::new(RwLock::new(HashMap::new()));
-        let parser: Arc<Mutex<SyntaxParser>> = Arc::new(Mutex::new(
-            SyntaxParser::new().expect("tree-sitter SV grammar failed to load"),
-        ));
+        let ts = Arc::new(TreeSitterProvider::new());
         let workspace: Arc<RwLock<WorkspaceState>> =
             Arc::new(RwLock::new(WorkspaceState::default()));
         let slang = Arc::new(SlangService::new(documents.clone(), slang));
         Self {
             syntax: SyntaxService::new(
                 documents.clone(),
-                parser.clone(),
+                ts.clone(),
                 workspace.clone(),
             ),
             elaborate: ElaborateService::new(slang.clone(), client.clone()),
             slang,
             client,
             documents,
-            parser,
+            ts,
             workspace,
         }
     }
@@ -221,39 +220,16 @@ impl Backend {
             }
         };
 
-        // Run the parse outside the doc-store lock.
-        let parse_result = {
-            let mut parser = self.parser.lock().await;
-            // Apply edits to a clone of the prior tree so tree-sitter can
-            // reuse subtrees that did not change. Full sync or first open
-            // leaves `edits` empty and we fall through to a full parse.
-            let prev: Option<SyntaxTree> = if !edits.is_empty() {
-                prior_tree.map(|mut t| {
-                    for edit in &edits {
-                        t.tree.edit(edit);
-                    }
-                    t
-                })
-            } else {
-                None
-            };
-            parser.parse(&text, prev.as_ref().map(|t| &t.tree))
-        };
-
+        // Run the parse outside the doc-store lock. The provider applies
+        // edits to the prior tree (incremental reuse) and returns diagnostics
+        // + symbols in one shot. On parse error it returns None and has
+        // already logged at error! — we deliberately leave state.tree and
+        // state.index untouched so mid-keystroke failures don't erase the
+        // last-known-good results.
+        let parse_result = self.ts.parse(&text, &edits, prior_tree).await;
         let (diags, new_state) = match parse_result {
-            Ok(tree) => {
-                let rope = Rope::from_str(&text);
-                let diags = mimir_syntax::diagnostics::collect(&tree, &rope);
-                let index = mimir_syntax::symbols::index(&tree, &rope);
-                (diags, Some((index, tree)))
-            }
-            Err(e) => {
-                // Deliberately leave `state.tree` and `state.index`
-                // untouched here — a failed parse mid-keystroke should
-                // not erase last-known-good results.
-                error!(error = %e, "parser returned error; publishing empty diagnostics");
-                (Vec::new(), None)
-            }
+            Some(r) => (r.diagnostics, Some((r.symbols, r.tree))),
+            None => (Vec::new(), None),
         };
 
         // Write the fresh index + tree back into the doc store, but only if
@@ -352,10 +328,10 @@ impl Backend {
                 let paths = resolved.files.clone();
                 let include_dirs = resolved.include_dirs.clone();
                 self.slang.set_project(Some(resolved)).await;
-                let parser = self.parser.clone();
+                let ts = self.ts.clone();
                 let workspace = self.workspace.clone();
                 tokio::spawn(async move {
-                    hydrate_workspace_index(paths, include_dirs, parser, workspace).await;
+                    hydrate_workspace_index(paths, include_dirs, ts, workspace).await;
                 });
             }
             Ok(None) => {
@@ -388,15 +364,7 @@ impl Backend {
             Some((params, _)) => params.include_dirs.into_iter().map(PathBuf::from).collect(),
             None => Vec::new(),
         };
-        let entries = {
-            let mut p = self.parser.lock().await;
-            workspace_index::hydrate_from_paths(
-                &[path.to_path_buf()],
-                &include_dirs,
-                &mut p,
-                |path| std::fs::read_to_string(path).ok(),
-            )
-        };
+        let entries = self.ts.hydrate_paths(&[path.to_path_buf()], &include_dirs).await;
         let mut ws = self.workspace.write().await;
         for (url, syms, tree) in entries {
             debug!(url = %url, count = syms.len(), "re-hydrated single file");
@@ -869,13 +837,13 @@ impl LanguageServer for Backend {
                     // degrades to same-file resolution, which is fine.
                     let paths = resolved.files.clone();
                     let include_dirs = resolved.include_dirs.clone();
-                    let parser = self.parser.clone();
+                    let ts = self.ts.clone();
                     let workspace = self.workspace.clone();
                     // Snapshot the first project file before the move so we
                     // can build a stable startup-elaborate trigger URI.
                     let first_project_file = paths.first().cloned();
                     tokio::spawn(async move {
-                        hydrate_workspace_index(paths, include_dirs, parser, workspace).await;
+                        hydrate_workspace_index(paths, include_dirs, ts, workspace).await;
                     });
                     self.slang.set_project(Some(resolved)).await;
 
@@ -2345,30 +2313,20 @@ fn workspace_root_path(params: &InitializeParams) -> Option<PathBuf> {
 
 /// Eager-hydrate the workspace index from a project filelist.
 ///
-/// Spawned from `initialize` once `.mimir.toml` has resolved. Reads each
-/// file from disk, parses it with the shared `SyntaxParser`, and folds
-/// the resulting symbols into the workspace index under one write-lock
+/// Spawned from `initialize` once `.mimir.toml` has resolved. Delegates
+/// the parse work to [`TreeSitterProvider::hydrate_paths`] and folds the
+/// resulting symbols into the workspace index under one write-lock
 /// transaction at the end. Marks the index hydrated regardless of how
 /// many files actually parsed — a partial result still beats a cold
 /// index, and `is_hydrated` is just a "did we attempt this once" flag.
-///
-/// The function is `async` so it can `await` the parser Mutex; the
-/// per-file parses themselves are CPU-bound but ms-scale per file, so we
-/// don't bother with `spawn_blocking`. If a project ships hundreds of
-/// large generated headers we may revisit.
 async fn hydrate_workspace_index(
     paths: Vec<PathBuf>,
     include_dirs: Vec<PathBuf>,
-    parser: Arc<Mutex<SyntaxParser>>,
+    ts: Arc<TreeSitterProvider>,
     workspace: Arc<RwLock<WorkspaceState>>,
 ) {
     let count_requested = paths.len();
-    let entries = {
-        let mut p = parser.lock().await;
-        workspace_index::hydrate_from_paths(&paths, &include_dirs, &mut p, |path| {
-            std::fs::read_to_string(path).ok()
-        })
-    };
+    let entries = ts.hydrate_paths(&paths, &include_dirs).await;
 
     let parsed = entries.len();
     {
@@ -4839,7 +4797,7 @@ mod tests {
     /// build a fresh parser per test rather than sharing one — these
     /// tests aren't perf-sensitive and the parser cost is small.
     fn parse_tree(text: &str) -> SyntaxTree {
-        let mut parser = SyntaxParser::new().expect("grammar load");
+        let mut parser = mimir_syntax::SyntaxParser::new().expect("grammar load");
         parser.parse(text, None).expect("parse")
     }
 

@@ -98,8 +98,9 @@ one.
 
   | Unit | Single responsibility |
   |------|-----------------------|
+  | `TreeSitterProvider` | `SyntaxParser` ownership + all parse operations |
   | `SlangService` | Sidecar IPC + param assembly |
-  | `SyntaxService` | Document store + parser + workspace index |
+  | `SyntaxService` | Document store + workspace index access |
   | `ElaborateService` | Debounce + dedup + diagnostic publish |
   | `filelist` | `.f` tokenization + path resolution + `${VAR}` expansion |
   | `project` | `.mimir.toml` schema + `ResolvedProject` discovery/load |

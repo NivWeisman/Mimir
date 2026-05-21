@@ -1,32 +1,29 @@
-//! Syntax service layer: document store access and AST cache.
+//! Syntax service layer: document store and workspace index access.
 //!
-//! This module encapsulates the three shared Arcs that power every
-//! tree-sitter request — the document store, the parser, and the workspace
-//! index — behind a clean service interface.
+//! [`SyntaxService`] owns the document store and workspace Arcs and exposes
+//! two cached-snapshot methods used by every LSP feature handler that needs
+//! a parse tree: [`SyntaxService::cached_tree`] and
+//! [`SyntaxService::cached_tree_and_index`].
 //!
-//! [`SyntaxService`] exposes two cached-snapshot methods used by every LSP
-//! feature handler that needs a parse tree: [`SyntaxService::cached_tree`]
-//! and [`SyntaxService::cached_tree_and_index`]. Both apply a synchronous
-//! fallback parse when the cache is cold so callers always get a result as
-//! long as the document is open.
+//! Parse operations are delegated to [`crate::parse_provider::TreeSitterProvider`]
+//! so this module's single responsibility is document/workspace state access,
+//! not parsing.
 //!
 //! # Relationship to `Backend`
 //!
-//! `Backend` creates the three Arcs (`documents`, `parser`, `workspace`)
-//! and passes clones to `SyntaxService::new`. Both sides hold Arcs to the
-//! **same** underlying data, so mutations made through `Backend`'s fields
-//! are immediately visible to `SyntaxService` and vice versa — no
-//! synchronization issues beyond the locks already protecting each Arc.
+//! `Backend` creates the shared Arcs and passes clones here. Both sides
+//! operate on the **same** underlying data — mutations through `Backend`'s
+//! fields are immediately visible to `SyntaxService` and vice versa.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mimir_syntax::{Symbol, SyntaxParser, SyntaxTree};
-use tokio::sync::{Mutex, RwLock};
+use mimir_syntax::{Symbol, SyntaxTree};
+use tokio::sync::RwLock;
 use tower_lsp::lsp_types::Url;
-use tracing::error;
 
 use crate::backend::DocumentState;
+use crate::parse_provider::TreeSitterProvider;
 use crate::workspace_index::WorkspaceState;
 
 /// Same-file vs cross-file syntax-side completion candidates.
@@ -41,17 +38,17 @@ pub(crate) struct SyntaxCandidates {
     pub(crate) cross_file: Vec<(Url, Symbol)>,
 }
 
-/// Thin service wrapper around the document store, parser, and workspace.
+/// Thin service wrapper around the document store and workspace index.
 ///
 /// Holds the same `Arc`s as [`crate::backend::Backend`] so no data is copied —
-/// all operations see the same live state.
+/// all operations see the same live state. Parse operations are delegated to
+/// [`TreeSitterProvider`] rather than held here.
 pub(crate) struct SyntaxService {
     /// Per-document text + parse state. Written by `did_open` / `did_change` /
     /// `did_close`; read here on every LSP feature request.
     documents: Arc<RwLock<HashMap<Url, DocumentState>>>,
-    /// The shared tree-sitter parser — one instance, `Mutex`-protected because
-    /// `tree_sitter::Parser` is not `Sync`.
-    parser: Arc<Mutex<SyntaxParser>>,
+    /// Tree-sitter parse provider. Used for cache-miss fallback parses.
+    ts: Arc<TreeSitterProvider>,
     /// Workspace-wide symbol index and per-file tree cache. Read here for
     /// cross-file resolution; written by `reparse_and_publish` and the
     /// workspace hydration task.
@@ -60,18 +57,18 @@ pub(crate) struct SyntaxService {
 }
 
 impl SyntaxService {
-    /// Construct the service from the three shared Arcs created by `Backend`.
+    /// Construct the service from the shared Arcs created by `Backend`.
     ///
     /// The Arcs are cloned (reference-counted pointer copies, not deep copies)
     /// so both `Backend` and `SyntaxService` operate on the same data.
     pub(crate) fn new(
         documents: Arc<RwLock<HashMap<Url, DocumentState>>>,
-        parser: Arc<Mutex<SyntaxParser>>,
+        ts: Arc<TreeSitterProvider>,
         workspace: Arc<RwLock<WorkspaceState>>,
     ) -> Self {
         Self {
             documents,
-            parser,
+            ts,
             workspace,
         }
     }
@@ -97,14 +94,7 @@ impl SyntaxService {
             return Some(t);
         }
         let text = fallback_text?;
-        let mut parser = self.parser.lock().await;
-        match parser.parse(&text, None) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                error!(error = %e, "fallback parse failed");
-                None
-            }
-        }
+        self.ts.parse(&text, &[], None).await.map(|r| r.tree)
     }
 
     /// Snapshot the cached tree *and* symbol index for `uri` together.
@@ -132,14 +122,7 @@ impl SyntaxService {
             Some(t) => t,
             None => {
                 let text = fallback_text?;
-                let mut parser = self.parser.lock().await;
-                match parser.parse(&text, None) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(error = %e, "fallback parse failed");
-                        return None;
-                    }
-                }
+                self.ts.parse(&text, &[], None).await?.tree
             }
         };
         Some((tree, index))

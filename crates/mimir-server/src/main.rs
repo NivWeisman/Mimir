@@ -24,6 +24,7 @@ mod elaborate_service;
 mod filelist;
 mod format;
 mod includes;
+mod parse_provider;
 mod project;
 mod slang_service;
 mod syntax_service;
