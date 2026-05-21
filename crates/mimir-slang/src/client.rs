@@ -16,9 +16,15 @@
 //! request `id`), but the current implementation is **single-flight**: the
 //! [`Connection`] holds `&mut self` across each `request → wait for
 //! response` cycle, so callers serialise on the wrapping `Mutex` inside
-//! [`Client`]. This is fine for today's "elaborate on idle" pattern. If we
-//! later need pipelining, the wire format already supports it — only the
-//! client-side dispatcher needs replacing.
+//! [`Client`]. If we later need pipelining, the wire format already supports
+//! it — only the client-side dispatcher needs replacing.
+//!
+//! To avoid blocking interactive editor requests behind a slow background
+//! elaborate, **interactive methods** (`definition`, `complete`, etc.) use
+//! `Mutex::try_lock` and return [`ClientError::Busy`] immediately when the
+//! connection is occupied. The server falls through to its tree-sitter
+//! fallback in that case. [`Client::elaborate`] uses the full `lock().await`
+//! because it runs on a background task where waiting is acceptable.
 //!
 //! ## Failure model
 //!
@@ -33,6 +39,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -41,6 +48,12 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, instrument, warn, trace};
+
+/// Maximum wall-clock time an interactive sidecar request (definition,
+/// complete, hover, etc.) may run before the caller falls through to the
+/// tree-sitter fallback. Elaborate runs without a deadline because it is
+/// a background task — latency there is invisible to the user.
+const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::protocol::{
     methods, CompleteParams, CompleteResult, DefinitionParams, DefinitionResult, ElaborateParams,
@@ -92,6 +105,17 @@ pub enum ConnectionError {
         got: u64,
     },
 
+    /// The sidecar did not respond within the deadline for an interactive
+    /// request. The connection guard has been dropped (lock released) so a
+    /// stale response may be left in the sidecar's stdout buffer; the next
+    /// caller that acquires the lock will drain it via the id-ordering logic
+    /// in [`Connection::request`].
+    #[error("sidecar request timed out after {secs}s")]
+    Timeout {
+        /// Wall-clock seconds we waited before giving up.
+        secs: u64,
+    },
+
     /// Response had neither `result` nor `error`. Wire-protocol violation.
     #[error("response had neither `result` nor `error` (id={id})")]
     EmptyResponse {
@@ -131,6 +155,13 @@ pub enum ClientError {
     /// A request through the underlying [`Connection`] failed.
     #[error(transparent)]
     Connection(#[from] ConnectionError),
+
+    /// The sidecar connection is occupied by another in-flight request
+    /// (typically a background elaborate). The caller should skip the slang
+    /// path and fall through to its tree-sitter fallback immediately rather
+    /// than queuing behind a potentially slow elaborate round-trip.
+    #[error("sidecar connection is busy with another in-flight request")]
+    Busy,
 }
 
 // --------------------------------------------------------------------------
@@ -307,6 +338,28 @@ where
 }
 
 // --------------------------------------------------------------------------
+// interactive_request — timeout wrapper for editor-facing sidecar calls
+// --------------------------------------------------------------------------
+
+/// Wrap a sidecar future in [`INTERACTIVE_TIMEOUT`].
+///
+/// On expiry the future is dropped (the `MutexGuard<Connection>` inside it is
+/// released) and [`ConnectionError::Timeout`] is returned. The sidecar will
+/// still produce a response for the now-abandoned request; the next caller
+/// that acquires the lock will drain it via the stale-id logic in
+/// [`Connection::request`].
+async fn interactive_request<F, T>(fut: F) -> Result<T, ConnectionError>
+where
+    F: std::future::Future<Output = Result<T, ConnectionError>>,
+{
+    tokio::time::timeout(INTERACTIVE_TIMEOUT, fut)
+        .await
+        .map_err(|_| ConnectionError::Timeout {
+            secs: INTERACTIVE_TIMEOUT.as_secs(),
+        })?
+}
+
+// --------------------------------------------------------------------------
 // Client — owns the sidecar process
 // --------------------------------------------------------------------------
 
@@ -389,17 +442,18 @@ impl Client {
 
     /// Run a `definition` request against the sidecar.
     ///
-    /// Same locking discipline as `elaborate`: holds the `Connection`
-    /// mutex for the request/response cycle, so a `definition` arriving
-    /// during a pending `elaborate` will queue. Acceptable for v1 — the
-    /// editor's F12 is interactive but rare; pipelining is a separate
-    /// slice if measurements show contention.
+    /// Uses `try_lock` so the call returns [`ClientError::Busy`] immediately
+    /// when the connection is occupied by a background elaborate. If the lock
+    /// is available but the sidecar doesn't respond within
+    /// [`INTERACTIVE_TIMEOUT`], returns [`ConnectionError::Timeout`] and
+    /// releases the lock so the stale response can be drained by the next
+    /// caller. In both cases the server falls through to the tree-sitter path.
     pub async fn definition(
         &self,
         params: &DefinitionParams,
     ) -> Result<DefinitionResult, ClientError> {
-        let mut conn = self.connection.lock().await;
-        Ok(conn.definition(params).await?)
+        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
+        Ok(interactive_request(conn.definition(params)).await?)
     }
 
     /// Run a `typeDefinition` request against the sidecar.
@@ -408,12 +462,14 @@ impl Client {
     /// cursor (e.g. `my_class` for a variable of type `my_class`). Empty
     /// locations means no type declaration was found (built-in scalar,
     /// void return, etc.) — trust-slang-on-empty applies.
+    ///
+    /// Uses `try_lock` + [`INTERACTIVE_TIMEOUT`]; see [`Client::definition`].
     pub async fn type_definition(
         &self,
         params: &TypeDefinitionParams,
     ) -> Result<TypeDefinitionResult, ClientError> {
-        let mut conn = self.connection.lock().await;
-        Ok(conn.type_definition(params).await?)
+        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
+        Ok(interactive_request(conn.type_definition(params)).await?)
     }
 
     /// Run an `implementation` request against the sidecar.
@@ -422,12 +478,14 @@ impl Client {
     /// direct subclasses of a class. Empty locations means no implementations
     /// were found (non-virtual method, leaf class, cursor not on a relevant
     /// symbol).
+    ///
+    /// Uses `try_lock` + [`INTERACTIVE_TIMEOUT`]; see [`Client::definition`].
     pub async fn implementation(
         &self,
         params: &ImplementationParams,
     ) -> Result<ImplementationResult, ClientError> {
-        let mut conn = self.connection.lock().await;
-        Ok(conn.implementation(params).await?)
+        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
+        Ok(interactive_request(conn.implementation(params)).await?)
     }
 
     /// Run a `complete` request against the sidecar.
@@ -437,12 +495,14 @@ impl Client {
     /// vector means the sidecar could not resolve the LHS type or the type
     /// has no members matching the prefix — the caller should fall through
     /// to syntax-only candidates.
+    ///
+    /// Uses `try_lock` + [`INTERACTIVE_TIMEOUT`]; see [`Client::definition`].
     pub async fn complete(
         &self,
         params: &CompleteParams,
     ) -> Result<CompleteResult, ClientError> {
-        let mut conn = self.connection.lock().await;
-        Ok(conn.complete(params).await?)
+        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
+        Ok(interactive_request(conn.complete(params)).await?)
     }
 
     /// Run a `signatureHelp` request against the sidecar.
@@ -452,12 +512,14 @@ impl Client {
     /// vector means the cursor is not inside a call's argument list or the
     /// callable could not be resolved — the server falls back to the
     /// tree-sitter index in that case.
+    ///
+    /// Uses `try_lock` + [`INTERACTIVE_TIMEOUT`]; see [`Client::definition`].
     pub async fn signature_help(
         &self,
         params: &SignatureHelpParams,
     ) -> Result<SignatureHelpResult, ClientError> {
-        let mut conn = self.connection.lock().await;
-        Ok(conn.signature_help(params).await?)
+        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
+        Ok(interactive_request(conn.signature_help(params)).await?)
     }
 
     /// Send the `shutdown` request, then wait for the child to exit.

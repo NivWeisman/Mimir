@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use mimir_core::{Position as MPosition, Range as MRange, TextDocument};
 use mimir_slang::{
-    Client as SlangClient, CompleteParams as SlangCompleteParams,
+    Client as SlangClient, ClientError as SlangClientError, ConnectionError as SlangConnectionError,
+    CompleteParams as SlangCompleteParams,
     CompletionRequestKind as SlangCompletionRequestKind,
     DefinitionLocation as SlangDefinitionLocation, DefinitionParams as SlangDefinitionParams,
     Diagnostic as SlangDiagnostic, ElaborateParams, ElaborateResult,
@@ -751,7 +752,11 @@ impl Backend {
         let result = match slang.definition(&params).await {
             Ok(r) => r,
             Err(e) => {
-                error!(error = %e, "slang hover transport error; falling back to syntax");
+                if is_slang_transient(&e) {
+                    debug!(error = %e, "slang hover: connection busy with elaborate; falling back to syntax");
+                } else {
+                    error!(error = %e, "slang hover transport error; falling back to syntax");
+                }
                 return None;
             }
         };
@@ -847,7 +852,11 @@ impl Backend {
                 Some(SlangDefinitionOutcome::Resolved(locations))
             }
             Err(e) => {
-                error!(error = %e, "slang definition transport error; falling back to syntax");
+                if is_slang_transient(&e) {
+                    debug!(error = %e, "slang definition: connection busy with elaborate; falling back to syntax");
+                } else {
+                    error!(error = %e, "slang definition transport error; falling back to syntax");
+                }
                 Some(SlangDefinitionOutcome::TransportError)
             }
         }
@@ -888,7 +897,11 @@ impl Backend {
                 Some(SlangTypeDefinitionOutcome::Resolved(locations))
             }
             Err(e) => {
-                error!(error = %e, "slang type_definition transport error");
+                if is_slang_transient(&e) {
+                    debug!(error = %e, "slang type_definition: connection busy with elaborate; falling back");
+                } else {
+                    error!(error = %e, "slang type_definition transport error");
+                }
                 Some(SlangTypeDefinitionOutcome::TransportError)
             }
         }
@@ -929,7 +942,11 @@ impl Backend {
                 Some(SlangImplementationOutcome::Resolved(locations))
             }
             Err(e) => {
-                error!(error = %e, "slang implementation transport error");
+                if is_slang_transient(&e) {
+                    debug!(error = %e, "slang implementation: connection busy with elaborate; falling back");
+                } else {
+                    error!(error = %e, "slang implementation transport error");
+                }
                 Some(SlangImplementationOutcome::TransportError)
             }
         }
@@ -1023,7 +1040,11 @@ impl Backend {
         match slang.complete(&params).await {
             Ok(result) => Some(result.items),
             Err(e) => {
-                warn!(error = %e, "slang complete error; falling back to syntax");
+                if is_slang_transient(&e) {
+                    debug!(error = %e, "slang complete: connection busy with elaborate; falling back to syntax");
+                } else {
+                    warn!(error = %e, "slang complete error; falling back to syntax");
+                }
                 None
             }
         }
@@ -1433,6 +1454,22 @@ impl Backend {
 /// `old_end_byte` refer to offsets in the old text, as tree-sitter requires.
 /// Returns `None` when the LSP range is out of bounds (we fall back to a
 /// full re-parse in that case).
+/// Returns `true` for slang client errors that indicate the sidecar was
+/// temporarily unavailable rather than broken: the connection was occupied by
+/// a concurrent elaborate ([`SlangClientError::Busy`]) or the sidecar took
+/// longer than the interactive deadline ([`SlangConnectionError::Timeout`]).
+///
+/// These are expected under active editing and should be logged at `debug!`
+/// level, not `error!` — the caller falls through to the tree-sitter path.
+#[inline]
+fn is_slang_transient(e: &SlangClientError) -> bool {
+    matches!(e, SlangClientError::Busy)
+        || matches!(
+            e,
+            SlangClientError::Connection(SlangConnectionError::Timeout { .. })
+        )
+}
+
 fn make_input_edit(rope: &Rope, range: MRange, new_text: &str) -> Option<InputEdit> {
     let start_byte = range.start.to_byte_offset(rope).ok()?;
     let old_end_byte = range.end.to_byte_offset(rope).ok()?;
@@ -1977,13 +2014,15 @@ impl LanguageServer for Backend {
         // empty (the user opted into the semantic resolver; an
         // authoritative "no" is more accurate than syntactic guesses).
         // Transport errors fall through to the syntax path.
-        let outcome = self.try_slang_definition(&uri, target).await;
+        let outcome = Box::pin(self.try_slang_definition(&uri, target)).await;
         match route_definition(outcome) {
             DefinitionRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang definition resolved");
                 Ok(slang_locations_to_response(locs))
             }
-            DefinitionRoute::UseSyntaxFallback => Ok(self.syntax_definition(&uri, target).await),
+            DefinitionRoute::UseSyntaxFallback => {
+                Ok(Box::pin(self.syntax_definition(&uri, target)).await)
+            }
         }
     }
 
@@ -2009,13 +2048,15 @@ impl LanguageServer for Backend {
         // v2 deferral: prototype-vs-body distinction for `extern function` /
         // `pure virtual` requires either a dedicated slang RPC or
         // `is_prototype` tracking in the symbol index.
-        let outcome = self.try_slang_definition(&uri, target).await;
+        let outcome = Box::pin(self.try_slang_definition(&uri, target)).await;
         match route_definition(outcome) {
             DefinitionRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang declaration resolved");
                 Ok(slang_locations_to_response(locs))
             }
-            DefinitionRoute::UseSyntaxFallback => Ok(self.syntax_definition(&uri, target).await),
+            DefinitionRoute::UseSyntaxFallback => {
+                Ok(Box::pin(self.syntax_definition(&uri, target)).await)
+            }
         }
     }
 
@@ -2034,7 +2075,7 @@ impl LanguageServer for Backend {
 
         // Slang-only: no tree-sitter fallback for type resolution.
         // None (slang not configured / transport error) → returns None to editor.
-        let outcome = self.try_slang_type_definition(&uri, target).await;
+        let outcome = Box::pin(self.try_slang_type_definition(&uri, target)).await;
         match route_type_definition(outcome) {
             TypeDefinitionRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang type_definition resolved");
@@ -2059,7 +2100,7 @@ impl LanguageServer for Backend {
 
         // Slang-only: implementation queries need full semantic analysis.
         // None (slang not configured / transport error) → returns None to editor.
-        let outcome = self.try_slang_implementation(&uri, target).await;
+        let outcome = Box::pin(self.try_slang_implementation(&uri, target)).await;
         match route_implementation(outcome) {
             ImplementationRoute::UseSlangResult(locs) => {
                 debug!(count = locs.len(), "slang implementation resolved");
@@ -2261,13 +2302,15 @@ impl LanguageServer for Backend {
         };
 
         // Slang-first lookup, then tree-sitter fallback.
-        if let Some(hover) = self.try_slang_hover(&uri, &rope, target).await {
+        // Box::pin moves each sub-future's state machine to the heap, preventing
+        // the large SlangDefinitionParams (all file texts) from being stored
+        // inline in this handler's stack-allocated state machine.
+        if let Some(hover) = Box::pin(self.try_slang_hover(&uri, &rope, target)).await {
             return Ok(Some(hover));
         }
 
-        if let Some(hover) = self
-            .hover_via_tree_sitter(&uri, &tree, &rope, &index, target)
-            .await
+        if let Some(hover) =
+            Box::pin(self.hover_via_tree_sitter(&uri, &tree, &rope, &index, target)).await
         {
             return Ok(Some(hover));
         }
@@ -2466,7 +2509,7 @@ impl LanguageServer for Backend {
         let target = MPosition::new(pos.line, pos.character);
 
         // --- slang path ---
-        if let Some(sigs) = self.try_slang_signature_help(&uri, target).await {
+        if let Some(sigs) = Box::pin(self.try_slang_signature_help(&uri, target)).await {
             let result = slang_signatures_to_lsp(sigs, 0);
             return Ok(Some(result));
         }
@@ -2686,14 +2729,13 @@ impl LanguageServer for Backend {
         // Route 1: `` ` `` trigger — macro-name completion.
         if let Some(rope) = &rope {
             if let Some(macro_prefix) = detect_macro_trigger(rope, target) {
-                if let Some(resp) = self
-                    .try_slang_macro_completion(&uri, target, &macro_prefix)
-                    .await
+                if let Some(resp) =
+                    Box::pin(self.try_slang_macro_completion(&uri, target, &macro_prefix)).await
                 {
                     return Ok(Some(resp));
                 }
                 // Syntax fallback: `define symbols from the index.
-                return Ok(self.syntax_macro_completion(&uri, &macro_prefix).await);
+                return Ok(Box::pin(self.syntax_macro_completion(&uri, &macro_prefix)).await);
             }
         }
 
@@ -2707,7 +2749,7 @@ impl LanguageServer for Backend {
             .map(|r| detect_member_access(r, target).is_some())
             .unwrap_or(false);
 
-        if let Some(resp) = self.try_slang_member_completion(&uri, target).await {
+        if let Some(resp) = Box::pin(self.try_slang_member_completion(&uri, target)).await {
             return Ok(Some(resp));
         }
         if has_member_trigger {
@@ -2716,10 +2758,10 @@ impl LanguageServer for Backend {
 
         // Route 3: plain identifier — scope-aware completion.
         // Slang first (scope-correct); falls back to syntax+workspace+keywords.
-        if let Some(resp) = self.try_slang_identifier_completion(&uri, target).await {
+        if let Some(resp) = Box::pin(self.try_slang_identifier_completion(&uri, target)).await {
             return Ok(Some(resp));
         }
-        Ok(self.syntax_completion(&uri, target).await)
+        Ok(Box::pin(self.syntax_completion(&uri, target)).await)
     }
 
     /// Lazily enrich a completion item with the declaration line as

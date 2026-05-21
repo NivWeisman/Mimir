@@ -53,7 +53,13 @@ pub fn init() -> Result<(), tracing_subscriber::util::TryInitError> {
                 .with_target(true)
                 .with_ansi(false)              // editor log panes don't render ANSI
                 .with_line_number(true)
-                .with_file(true),
+                .with_file(true)
+                // Log when each span is entered so the last line before a
+                // crash tells us exactly which LSP handler was active.
+                // These events fire at the span's own level (debug for
+                // #[instrument(level = "debug")]) so they only appear when
+                // RUST_LOG=mimir=debug is set — no noise in normal operation.
+                .with_span_events(fmt::format::FmtSpan::ENTER),
         )
         .try_init()
 }

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import select
 import subprocess
 import sys
 import threading
@@ -271,25 +272,37 @@ class MimirLspClient:
         self._proc.stdin.flush()
 
     def _recv(self, timeout: float) -> dict:
-        # subprocess pipes are blocking. We rely on the test runner to set
-        # a wall-clock timeout via the request() loop. The OS read here
-        # will block until the server writes a complete frame.
+        # Use select() before every read so the deadline is actually honoured.
+        # The old pattern of checking time.monotonic() *after* read(1) would
+        # block indefinitely when the server stopped responding (hung or slow).
         deadline = time.monotonic() + timeout
         assert self._proc.stdout is not None
+        fd = self._proc.stdout.fileno()
 
-        # Read headers.
+        def _read_bytes(n: int) -> bytes:
+            """Read exactly n bytes, respecting the outer deadline."""
+            buf = b""
+            while len(buf) < n:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out reading from server")
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    raise TimeoutError("timed out reading from server")
+                chunk = self._proc.stdout.read(n - len(buf))
+                if not chunk:
+                    stderr_tail = "".join(self._stderr_lines[-50:])
+                    raise RuntimeError(
+                        "server stdout closed unexpectedly. "
+                        f"recent stderr:\n{stderr_tail}"
+                    )
+                buf += chunk
+            return buf
+
+        # Read the header one byte at a time until we see \r\n\r\n.
         header_bytes = b""
         while b"\r\n\r\n" not in header_bytes:
-            if time.monotonic() > deadline:
-                raise TimeoutError("timed out reading LSP header")
-            chunk = self._proc.stdout.read(1)
-            if not chunk:
-                stderr_tail = "".join(self._stderr_lines[-50:])
-                raise RuntimeError(
-                    "server stdout closed unexpectedly. "
-                    f"recent stderr:\n{stderr_tail}"
-                )
-            header_bytes += chunk
+            header_bytes += _read_bytes(1)
 
         headers_str = header_bytes.decode("ascii")
         content_length = 0
@@ -300,14 +313,7 @@ class MimirLspClient:
         if content_length <= 0:
             raise RuntimeError(f"missing/invalid Content-Length in {headers_str!r}")
 
-        body = b""
-        while len(body) < content_length:
-            if time.monotonic() > deadline:
-                raise TimeoutError("timed out reading LSP body")
-            chunk = self._proc.stdout.read(content_length - len(body))
-            if not chunk:
-                raise RuntimeError("server stdout closed mid-body")
-            body += chunk
+        body = _read_bytes(content_length)
         return json.loads(body.decode("utf-8"))
 
     def _drain_stderr(self) -> None:

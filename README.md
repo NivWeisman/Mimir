@@ -487,6 +487,25 @@ When VS Code launches the server, set the env var in your settings:
 }
 ```
 
+### Crash diagnostics
+
+Panics are routed through `tracing` before the process exits, so the full
+panic message and backtrace appear in the editor's LSP output channel (not
+silently on the OS console). Enable backtraces:
+
+```jsonc
+{
+  "mimir.server.env": {
+    "RUST_LOG": "mimir=debug",
+    "RUST_BACKTRACE": "full"
+  }
+}
+```
+
+Every `#[instrument]`-decorated handler emits an "enter" breadcrumb at
+`debug` level, so the last line of the log before a crash identifies the
+exact handler that triggered it.
+
 [tracing]: https://docs.rs/tracing
 
 ---

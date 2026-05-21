@@ -39,6 +39,22 @@ async fn main() {
     // test harness wired one up), because there's nothing actionable to do.
     let _ = mimir_core::logging::init();
 
+    // Install a panic hook that routes the panic message and backtrace through
+    // `tracing` so it lands on stderr (and thus in the editor's LSP output
+    // channel) before the process exits.  Without this, panics are silent from
+    // the editor's perspective, making crashes very hard to diagnose.
+    // `RUST_BACKTRACE=1` (or "full") must be set for the backtrace to be
+    // populated; editors can set it via their server-env configuration.
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::capture();
+        tracing::error!(
+            panic = %info,
+            backtrace = %backtrace,
+            "mimir-server panicked — please report this at \
+             https://github.com/nvweisman/mimir/issues",
+        );
+    }));
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "mimir-server starting on stdio",
