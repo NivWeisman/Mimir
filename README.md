@@ -414,6 +414,16 @@ spinning up a tokio runtime, and keeps tree-sitter's native code out of the
 core types crate. It also forces clean module APIs — anything `mimir-server`
 needs from `mimir-syntax` has to be `pub`.
 
+Within `mimir-server`, heavy logic is split into focused service modules:
+
+| Module               | Owns                                                              |
+| -------------------- | ----------------------------------------------------------------- |
+| `slang_service`      | Sidecar IPC, project config, closed-file cache, param assembly    |
+| `syntax_service`     | Document store + parser + workspace index access                  |
+| `elaborate_service`  | Debounce, input-hash dedup, diagnostic publish lifecycle          |
+| `filelist`           | `.f` tokenization, path resolution, `${VAR}` expansion            |
+| `project`            | `.mimir.toml` schema, `ResolvedProject::discover` / `load`        |
+
 ```
 ┌──────────────┐   LSP/JSON-RPC over stdio    ┌────────────────────────────┐
 │   editor     │ ───────────────────────────▶ │   mimir-server (binary)    │

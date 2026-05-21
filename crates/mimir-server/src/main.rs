@@ -21,6 +21,7 @@ use tower_lsp::{LspService, Server};
 mod backend;
 mod completion_score;
 mod elaborate_service;
+mod filelist;
 mod format;
 mod includes;
 mod project;
