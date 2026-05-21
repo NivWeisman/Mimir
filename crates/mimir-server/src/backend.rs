@@ -28,13 +28,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use mimir_core::{Position as MPosition, Range as MRange, TextDocument};
-use mimir_slang::{
-    Diagnostic as SlangDiagnostic, ElaborateResult, Severity as SlangSeverity,
-};
+use mimir_slang::Diagnostic as SlangDiagnostic;
 use mimir_syntax::{
     calls::{active_arg_index, call_site_at, call_sites_in, CallKind},
     inlay::hints_for,
@@ -45,20 +42,20 @@ use mimir_syntax::{
 use ropey::Rope;
 use tokio::sync::{Mutex, RwLock};
 use tree_sitter::InputEdit;
-use tokio::task::JoinHandle;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::completion_score;
+use crate::elaborate_service::{ElaborateService, slang_to_lsp_diagnostic};
 use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
 use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
 use crate::slang_service::{
     SlangService, SlangDefinitionOutcome, DefinitionRoute, route_definition,
     TypeDefinitionRoute, route_type_definition,
     ImplementationRoute, route_implementation,
-    detect_member_access, detect_macro_trigger, path_to_url, m_range_to_lsp,
+    detect_member_access, detect_macro_trigger, m_range_to_lsp,
 };
 use crate::syntax_service::{SyntaxCandidates, SyntaxService};
 use crate::workspace_index::{self, WorkspaceIndex, WorkspaceState};
@@ -128,24 +125,10 @@ pub(crate) struct Backend {
     /// through `self.documents` etc. are immediately visible here.
     syntax: SyntaxService,
 
-    /// One in-flight (sleeping or running) elaborate task per URI that
-    /// triggered it. On a new edit for the same URI we `.abort()` the
-    /// existing handle and schedule a fresh one — that's the debounce.
-    pending_elaborations: Arc<RwLock<HashMap<Url, JoinHandle<()>>>>,
-
-    /// URLs we published non-empty slang diagnostics to in the previous
-    /// elaboration cycle. We diff this against the current cycle's set so
-    /// we can publish empty for URLs that *were* flagged but are now clean
-    /// — otherwise the editor keeps showing stale red squiggles after the
-    /// user fixes the root-cause error.
-    slang_published: Arc<RwLock<HashSet<Url>>>,
-
-    /// Hash of the inputs of the most recent **successful** slang elaborate.
-    last_elaborate_input_hash: Arc<RwLock<Option<u64>>>,
-
-    /// Latched `true` after the first successful elaborate has emitted its
-    /// per-file `info!("indexed by startup slang elaborate")` lines.
-    startup_index_logged: Arc<AtomicBool>,
+    /// Debounce + dedup + diagnostic-publish lifecycle for slang elaboration.
+    /// All elaborate state (pending handles, last hash, published URLs) lives
+    /// here; handlers call `self.elaborate.schedule(uri)` and return.
+    elaborate: ElaborateService,
 
     /// Combined workspace symbol index and parse trees under a single lock.
     workspace: Arc<RwLock<WorkspaceState>>,
@@ -166,20 +149,18 @@ impl Backend {
         ));
         let workspace: Arc<RwLock<WorkspaceState>> =
             Arc::new(RwLock::new(WorkspaceState::default()));
+        let slang = Arc::new(SlangService::new(documents.clone(), slang));
         Self {
             syntax: SyntaxService::new(
                 documents.clone(),
                 parser.clone(),
                 workspace.clone(),
             ),
-            slang: Arc::new(SlangService::new(documents.clone(), slang)),
+            elaborate: ElaborateService::new(slang.clone(), client.clone()),
+            slang,
             client,
             documents,
             parser,
-            pending_elaborations: Arc::new(RwLock::new(HashMap::new())),
-            slang_published: Arc::new(RwLock::new(HashSet::new())),
-            last_elaborate_input_hash: Arc::new(RwLock::new(None)),
-            startup_index_logged: Arc::new(AtomicBool::new(false)),
             workspace,
         }
     }
@@ -336,92 +317,6 @@ impl Backend {
         self.syntax.cached_tree_and_index(uri).await
     }
 
-    /// Schedule a debounced slang elaborate. Called from `did_open` and
-    /// `did_change`. Returns immediately; the actual elaborate happens in
-    /// a tokio task after the project's `debounce_ms` quiet time.
-    ///
-    /// `trigger_uri` is the URI that just changed; it's used as the
-    /// debounce key so a fast typist editing one file doesn't cancel a
-    /// pending elaborate triggered by a different file.
-    ///
-    /// No-op when slang isn't configured (no `MIMIR_SLANG_PATH`) or the
-    /// project lacks a `.mimir.toml` — both are normal "tree-sitter only"
-    /// states the user opts into by not configuring the sidecar.
-    async fn schedule_elaborate(&self, trigger_uri: Url) {
-        let debounce = match self.slang.current_debounce().await {
-            Some(d) => d,
-            None => return,
-        };
-
-        {
-            let mut pending = self.pending_elaborations.write().await;
-            if let Some(prior) = pending.remove(&trigger_uri) {
-                prior.abort();
-                debug!(uri = %trigger_uri, "cancelled prior pending elaborate");
-            }
-        }
-
-        let slang_svc = self.slang.clone();
-        let pending = self.pending_elaborations.clone();
-        let slang_published = self.slang_published.clone();
-        let last_hash = self.last_elaborate_input_hash.clone();
-        let startup_logged = self.startup_index_logged.clone();
-        let lsp_client = self.client.clone();
-        let trigger_for_task = trigger_uri.clone();
-
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(debounce).await;
-
-            let Some((params, files_in_request)) = slang_svc.build_elaborate_params().await else {
-                pending.write().await.remove(&trigger_for_task);
-                return;
-            };
-
-            let input_hash = SlangService::hash_inputs(&params);
-            if *last_hash.read().await == Some(input_hash) {
-                debug!(
-                    hash = input_hash,
-                    files = params.files.len(),
-                    "slang inputs unchanged since last elaborate; skipping",
-                );
-                pending.write().await.remove(&trigger_for_task);
-                return;
-            }
-
-            debug!(
-                files = params.files.len(),
-                include_dirs = params.include_dirs.len(),
-                hash = input_hash,
-                "sending elaborate request",
-            );
-            match slang_svc.elaborate(&params).await {
-                Ok(result) => {
-                    publish_slang_result(&lsp_client, &files_in_request, result, &slang_published)
-                        .await;
-                    *last_hash.write().await = Some(input_hash);
-
-                    if startup_logged
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        for url in &files_in_request {
-                            info!(file = %url, "indexed by startup slang elaborate");
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "slang elaborate failed");
-                }
-            }
-
-            pending.write().await.remove(&trigger_for_task);
-        });
-
-        self.pending_elaborations
-            .write()
-            .await
-            .insert(trigger_uri, handle);
-    }
 
     /// Re-discover and re-load the project rooted at the directory
     /// containing `mimir_toml_path`, then re-hydrate the workspace
@@ -978,17 +873,16 @@ impl LanguageServer for Backend {
                     // Kick off a workspace-wide slang elaborate so semantic
                     // cross-file features (definition, completion,
                     // signatureHelp) are warm before the user opens any
-                    // file. `schedule_elaborate` reads `self.project`, so
-                    // we must call it after the write above. It's a no-op
-                    // when slang isn't configured. The trigger URI is just
-                    // a debounce-map key — reuse the first filelist entry.
+                    // file. It's a no-op when slang isn't configured. The
+                    // trigger URI is just a debounce-map key — reuse the
+                    // first filelist entry.
                     if let Some(first) = first_project_file {
                         if let Ok(trigger) = Url::from_file_path(&first) {
                             debug!(
                                 trigger = %trigger,
                                 "scheduling startup slang elaborate",
                             );
-                            self.schedule_elaborate(trigger).await;
+                            self.elaborate.schedule(trigger).await;
                         }
                     }
                 }
@@ -1209,7 +1103,7 @@ impl LanguageServer for Backend {
         }
 
         self.reparse_and_publish(uri.clone(), Vec::new()).await;
-        self.schedule_elaborate(uri).await;
+        self.elaborate.schedule(uri).await;
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -1277,7 +1171,7 @@ impl LanguageServer for Backend {
         }
 
         self.reparse_and_publish(uri.clone(), edits).await;
-        self.schedule_elaborate(uri).await;
+        self.elaborate.schedule(uri).await;
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -1306,7 +1200,7 @@ impl LanguageServer for Backend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         debug!("did_save");
-        self.schedule_elaborate(uri).await;
+        self.elaborate.schedule(uri).await;
     }
 
     /// External file-system events (LSP `workspace/didChangeWatchedFiles`).
@@ -2919,136 +2813,6 @@ fn slang_locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResp
     }
 }
 
-
-/// Apply a slang elaborate result to the editor's diagnostic state.
-///
-/// Strategy:
-///
-/// 1. Bucket diagnostics by file URL.
-/// 2. For every file we sent in the request: publish either the slang
-///    diagnostics for it, or empty (which honours the conflict policy by
-///    overwriting any prior tree-sitter publish).
-/// 3. For files slang reported but we didn't send (transitive includes):
-///    publish those too.
-/// 4. For files that *had* slang diagnostics in the previous cycle and
-///    aren't in the current cycle's request or result: publish empty.
-///    Otherwise the editor keeps showing stale red squiggles after the
-///    user fixes the trigger.
-///
-/// The version number passed to `publish_diagnostics` is `None` because
-/// slang's response can lag behind the editor's view of the document by
-/// several edits — letting the editor decide whether to display means we
-/// don't need to invent a synthetic version.
-async fn publish_slang_result(
-    lsp_client: &Client,
-    files_in_request: &[Url],
-    result: ElaborateResult,
-    slang_published: &Arc<RwLock<HashSet<Url>>>,
-) {
-    let prev_snapshot = slang_published.read().await.clone();
-    let plan = plan_slang_publishes(files_in_request, result, &prev_snapshot);
-
-    for (url, diags) in &plan.publishes {
-        lsp_client
-            .publish_diagnostics(url.clone(), diags.clone(), None)
-            .await;
-    }
-
-    debug!(
-        publishes = plan.publishes.len(),
-        new_dirty = plan.new_published.len(),
-        "applied slang elaborate result",
-    );
-
-    *slang_published.write().await = plan.new_published;
-}
-
-/// One round of slang publishes, computed without touching tower-lsp.
-struct SlangPublishPlan {
-    /// In-order publish calls to make. Each `(url, diags)` becomes one
-    /// `publish_diagnostics` call. Empty `diags` clears that URL.
-    publishes: Vec<(Url, Vec<Diagnostic>)>,
-    /// URLs that ended up with non-empty slang diagnostics this cycle —
-    /// stored in `slang_published` so the *next* cycle can clear any
-    /// that drop off.
-    new_published: HashSet<Url>,
-}
-
-/// Pure decision logic: given the files we just sent slang, the result
-/// it returned, and the URLs we left non-empty *last* cycle, decide
-/// which `publish_diagnostics` calls to make.
-///
-/// Rules in priority order:
-///
-/// 1. Every file in the request gets exactly one publish (possibly
-///    empty). Even an empty publish is meaningful — it overwrites the
-///    tree-sitter diagnostics tower-lsp already published, which is the
-///    "slang says clean, drop the syntax false positives" policy.
-/// 2. Files slang reported diagnostics for that *weren't* in the
-///    request (transitive `` `include `` targets) get a publish each.
-/// 3. URLs that had non-empty slang diagnostics last cycle but appear
-///    in neither (1) nor (2) get an empty publish — otherwise the
-///    editor keeps their old red squiggles after the user fixed the
-///    underlying error.
-fn plan_slang_publishes(
-    files_in_request: &[Url],
-    result: ElaborateResult,
-    previous_published: &HashSet<Url>,
-) -> SlangPublishPlan {
-    let mut by_url: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
-    for d in result.diagnostics {
-        let Some(url) = path_to_url(&d.path) else {
-            warn!(path = %d.path, "could not map slang path back to a URL; dropping");
-            continue;
-        };
-        by_url
-            .entry(url)
-            .or_default()
-            .push(slang_to_lsp_diagnostic(d));
-    }
-
-    let mut publishes: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
-    let mut new_published: HashSet<Url> = HashSet::new();
-
-    // Rule 1: one publish per requested file, in request order.
-    let mut request_seen: HashSet<&Url> = HashSet::new();
-    for url in files_in_request {
-        if !request_seen.insert(url) {
-            continue;
-        }
-        let diags = by_url.remove(url).unwrap_or_default();
-        if !diags.is_empty() {
-            new_published.insert(url.clone());
-        }
-        publishes.push((url.clone(), diags));
-    }
-
-    // Rule 2: diagnostics slang reported for files we didn't request.
-    for (url, diags) in by_url {
-        new_published.insert(url.clone());
-        publishes.push((url, diags));
-    }
-
-    // Rule 3: clear URLs that had slang diagnostics last cycle but
-    // aren't accounted for above. Skip URLs we already published for
-    // (those are already cleared / overwritten). The set is built from
-    // the in-progress `publishes` vec, so we clone the URLs out before
-    // we start pushing — otherwise we'd be reading and writing the same
-    // vec at once.
-    let already_publishing: HashSet<Url> = publishes.iter().map(|(u, _)| u.clone()).collect();
-    for stale in previous_published.difference(&new_published) {
-        if already_publishing.contains(stale) {
-            continue;
-        }
-        publishes.push((stale.clone(), Vec::new()));
-    }
-
-    SlangPublishPlan {
-        publishes,
-        new_published,
-    }
-}
-
 /// Resolve a name to its declaration sites, same-file first, workspace
 /// second.
 ///
@@ -3756,39 +3520,6 @@ fn syntax_to_lsp_diagnostic(d: MDiagnostic) -> Diagnostic {
     }
 }
 
-/// Map a slang diagnostic onto the wire format. Mirrors
-/// [`syntax_to_lsp_diagnostic`] — the `code` field carries slang's stable
-/// diagnostic code (e.g. `"UnknownModule"`) so editors can group/filter on
-/// it. `source` stays `"mimir"` so users don't have to learn two filter
-/// labels; the code already disambiguates.
-fn slang_to_lsp_diagnostic(d: SlangDiagnostic) -> Diagnostic {
-    Diagnostic {
-        range: Range {
-            start: Position {
-                line: d.range.start.line,
-                character: d.range.start.character,
-            },
-            end: Position {
-                line: d.range.end.line,
-                character: d.range.end.character,
-            },
-        },
-        severity: Some(match d.severity {
-            SlangSeverity::Error => DiagnosticSeverity::ERROR,
-            SlangSeverity::Warning => DiagnosticSeverity::WARNING,
-            SlangSeverity::Information => DiagnosticSeverity::INFORMATION,
-            SlangSeverity::Hint => DiagnosticSeverity::HINT,
-        }),
-        code: Some(NumberOrString::String(d.code)),
-        source: Some("mimir".to_string()),
-        message: d.message,
-        related_information: None,
-        tags: None,
-        code_description: None,
-        data: None,
-    }
-}
-
 /// Merge tree-sitter and slang diagnostics for a single file into the LSP
 /// shape we publish.
 ///
@@ -3832,6 +3563,7 @@ fn merge_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mimir_slang::Severity as SlangSeverity;
     use mimir_syntax::Diagnostic as MDiag;
 
     /// Helper: a tree-sitter diagnostic at a given severity.
@@ -3886,47 +3618,6 @@ mod tests {
         for (ours, theirs) in cases {
             assert_eq!(
                 syntax_to_lsp_diagnostic(syntax_diag(ours)).severity,
-                Some(theirs)
-            );
-        }
-    }
-
-    /// slang → LSP conversion preserves the slang-specific code string and
-    /// keeps the same `source` label as syntax diagnostics — `code`
-    /// disambiguates, so users only have to filter by one source.
-    #[test]
-    fn slang_diagnostic_conversion_preserves_fields() {
-        let d = SlangDiagnostic {
-            path: "/proj/m.sv".into(),
-            range: MRange::new(MPosition::new(7, 0), MPosition::new(7, 12)),
-            severity: SlangSeverity::Error,
-            code: "UnknownModule".into(),
-            message: "module 'foo' not found".into(),
-        };
-        let lsp = slang_to_lsp_diagnostic(d);
-        assert_eq!(lsp.range.start.line, 7);
-        assert_eq!(lsp.range.end.character, 12);
-        assert_eq!(lsp.severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(lsp.source.as_deref(), Some("mimir"));
-        assert_eq!(
-            lsp.code,
-            Some(NumberOrString::String("UnknownModule".into()))
-        );
-        assert_eq!(lsp.message, "module 'foo' not found");
-    }
-
-    /// All four slang severity variants map to the right LSP severity.
-    #[test]
-    fn slang_severity_maps_completely() {
-        let cases = [
-            (SlangSeverity::Error, DiagnosticSeverity::ERROR),
-            (SlangSeverity::Warning, DiagnosticSeverity::WARNING),
-            (SlangSeverity::Information, DiagnosticSeverity::INFORMATION),
-            (SlangSeverity::Hint, DiagnosticSeverity::HINT),
-        ];
-        for (ours, theirs) in cases {
-            assert_eq!(
-                slang_to_lsp_diagnostic(slang_diag(ours, "x")).severity,
                 Some(theirs)
             );
         }
@@ -3988,122 +3679,6 @@ mod tests {
     fn merge_empty_in_empty_out() {
         assert!(merge_diagnostics(vec![], vec![], false).is_empty());
         assert!(merge_diagnostics(vec![], vec![], true).is_empty());
-    }
-
-    // --- Stage 3: elaborate-params assembly + publish planning ----------
-
-    use crate::project::ResolvedProject;
-    use mimir_slang::ElaborateResult;
-    use std::path::PathBuf;
-
-    /// Helper: a `ResolvedProject` with `n` files, `top` set, default
-    /// debounce.
-    fn project_with_files(files: Vec<PathBuf>) -> ResolvedProject {
-        ResolvedProject {
-            root: PathBuf::from("/proj"),
-            files,
-            include_dirs: vec![PathBuf::from("/proj/inc")],
-            defines: vec![],
-            top: Some("tb_top".into()),
-            debounce_ms: 350,
-            env: HashMap::new(),
-            features: crate::project::FeatureToggles::default(),
-            formatter: crate::project::FormatterConfig::default(),
-        }
-    }
-
-    /// Helper: a slang diagnostic for a given path.
-    fn slang_diag_at(path: &str, code: &str) -> SlangDiagnostic {
-        SlangDiagnostic {
-            path: path.into(),
-            range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 1)),
-            severity: SlangSeverity::Error,
-            code: code.into(),
-            message: "boom".into(),
-        }
-    }
-
-    /// Plan: every requested file gets a publish, including files with
-    /// no diagnostics (empty publish overwrites tree-sitter).
-    #[test]
-    fn plan_publishes_every_requested_file_even_when_clean() {
-        let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let url_b = Url::parse("file:///proj/b.sv").unwrap();
-        let result = ElaborateResult {
-            diagnostics: vec![slang_diag_at("/proj/a.sv", "X")],
-        };
-        let plan = plan_slang_publishes(&[url_a.clone(), url_b.clone()], result, &HashSet::new());
-
-        assert_eq!(plan.publishes.len(), 2);
-        let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
-        let b_pub = plan.publishes.iter().find(|(u, _)| u == &url_b).unwrap();
-        assert_eq!(a_pub.1.len(), 1);
-        assert!(b_pub.1.is_empty());
-        assert_eq!(plan.new_published, HashSet::from([url_a]));
-    }
-
-    /// Plan: a URL that had diagnostics last cycle and isn't in this
-    /// cycle's request or result gets an explicit empty publish — so
-    /// the editor's stale red squiggles disappear.
-    #[test]
-    fn plan_clears_url_that_dropped_off() {
-        let url_dropped = Url::parse("file:///proj/old.sv").unwrap();
-        let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let result = ElaborateResult {
-            diagnostics: vec![],
-        };
-        let prev = HashSet::from([url_dropped.clone()]);
-
-        let plan = plan_slang_publishes(&[url_a.clone()], result, &prev);
-
-        // Two publishes: empty for url_a (in request), empty for
-        // url_dropped (stale-clear).
-        assert_eq!(plan.publishes.len(), 2);
-        assert!(plan
-            .publishes
-            .iter()
-            .any(|(u, d)| u == &url_a && d.is_empty()));
-        assert!(plan
-            .publishes
-            .iter()
-            .any(|(u, d)| u == &url_dropped && d.is_empty()));
-        assert!(plan.new_published.is_empty());
-    }
-
-    /// Plan: a stale URL that *also* shows up in this cycle's request
-    /// isn't published twice — Rule 1 already handled it.
-    #[test]
-    fn plan_does_not_double_publish_stale_url_in_request() {
-        let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let result = ElaborateResult {
-            diagnostics: vec![],
-        };
-        let prev = HashSet::from([url_a.clone()]);
-
-        let plan = plan_slang_publishes(&[url_a.clone()], result, &prev);
-
-        assert_eq!(plan.publishes.len(), 1);
-        assert!(plan.publishes[0].1.is_empty());
-    }
-
-    /// Plan: diagnostics for a file we didn't request (transitive
-    /// include) still get published.
-    #[test]
-    fn plan_publishes_transitive_include_diagnostics() {
-        let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let result = ElaborateResult {
-            diagnostics: vec![slang_diag_at("/proj/inc/uvm.svh", "X")],
-        };
-
-        let plan = plan_slang_publishes(&[url_a.clone()], result, &HashSet::new());
-
-        assert_eq!(plan.publishes.len(), 2);
-        let inc_url = Url::parse("file:///proj/inc/uvm.svh").unwrap();
-        assert!(plan
-            .publishes
-            .iter()
-            .any(|(u, d)| u == &inc_url && d.len() == 1));
-        assert!(plan.new_published.contains(&inc_url));
     }
 
     // --- Stage 2: go-to-definition resolver ---------------------------
