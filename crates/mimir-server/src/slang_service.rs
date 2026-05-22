@@ -398,14 +398,28 @@ impl SlangService {
             .flatten();
         let send_pos = patch.as_ref().map_or(pos, |p| p.adjusted_position);
 
-        let items = self
+        debug!(
+            is_pkg_scope,
+            prefix = %member_prefix,
+            sentinel = patch.is_some(),
+            "member completion: trigger detected, calling slang",
+        );
+        let Some(items) = self
             .complete_request_with_patch(uri, send_pos, kind, wire_prefix, patch)
-            .await?;
+            .await
+        else {
+            debug!(
+                is_pkg_scope,
+                prefix = %member_prefix,
+                "member completion: slang unavailable (no client, project config, or file path)",
+            );
+            return None;
+        };
         if items.is_empty() {
             debug!(
                 is_pkg_scope,
                 prefix = %member_prefix,
-                "slang member completion: 0 items; popup will be empty (no syntax fallback for member-access)",
+                "slang member completion: 0 items returned; popup will be empty (no syntax fallback for member-access)",
             );
             return None;
         }
@@ -565,8 +579,10 @@ pub(crate) enum SlangDefinitionOutcome {
 /// Routing decision for `goto_definition`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DefinitionRoute {
-    /// Use slang's locations (may be empty — trust-slang short-circuits
-    /// the empty case to `None` in the response, never the syntax index).
+    /// Use slang's locations. An empty vector means "no declaration found"
+    /// — the handler returns `None` to the editor without consulting the
+    /// syntax index (which would return all same-named symbols and be less
+    /// accurate than slang's authoritative empty answer).
     UseSlangResult(Vec<Location>),
     /// Slang isn't configured, no project loaded, or the sidecar request
     /// hit a transport error. The handler should consult the syntax
@@ -576,12 +592,16 @@ pub(crate) enum DefinitionRoute {
 
 /// Pure routing policy for `goto_definition`.
 ///
-/// Policy: slang is primary; an *empty* slang answer falls back to the
-/// tree-sitter workspace index. Unlike `goto_type_definition` /
-/// `goto_implementation`, definition has a meaningful syntax fallback.
+/// Policy: slang is primary; a `Resolved` answer — even empty — is
+/// authoritative "no declaration found" and is returned to the editor
+/// without falling back to the syntax index (the name-based syntax
+/// fallback would return all symbols with the same name, which is
+/// less accurate than slang's "nothing here").
+/// Only `TransportError` and `None` (slang not run — no project config
+/// or URI has no filesystem path) fall through to the syntax path.
 pub(crate) fn route_definition(outcome: Option<SlangDefinitionOutcome>) -> DefinitionRoute {
     match outcome {
-        Some(SlangDefinitionOutcome::Resolved(locs)) if !locs.is_empty() => {
+        Some(SlangDefinitionOutcome::Resolved(locs)) => {
             DefinitionRoute::UseSlangResult(locs)
         }
         _ => DefinitionRoute::UseSyntaxFallback,
@@ -1105,9 +1125,12 @@ mod tests {
     }
 
     #[test]
-    fn route_definition_falls_back_when_slang_resolved_empty() {
+    fn route_definition_trusts_slang_when_resolved_empty() {
+        // Empty Resolved is "no declaration found" — do NOT fall back to
+        // the name-based syntax index (which would return all same-named
+        // symbols and be less accurate than slang's authoritative answer).
         let route = route_definition(Some(SlangDefinitionOutcome::Resolved(Vec::new())));
-        assert_eq!(route, DefinitionRoute::UseSyntaxFallback);
+        assert_eq!(route, DefinitionRoute::UseSlangResult(Vec::new()));
     }
 
     #[test]
