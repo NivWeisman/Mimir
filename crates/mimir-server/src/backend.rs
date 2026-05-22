@@ -2176,19 +2176,38 @@ impl LanguageServer for Backend {
         }
 
         // Route 2: `.` or `::` trigger — member / package-scope completion.
-        // Slang-only: without type information, any fallback would suggest
-        // unrelated workspace symbols (the "workspace dump" anti-pattern).
-        // If the trigger is present but slang can't resolve it, return empty
-        // rather than polluting the popup with irrelevant candidates.
-        let has_member_trigger = rope
+        // Slang is the primary source (full semantics). When slang is
+        // unavailable or busy, fall back to the cached AST for receivers
+        // whose type is syntactically known (`super`, `this`, typed locals).
+        // For any other receiver (undeclared variable, chained call, `::`)
+        // we still return empty to avoid the workspace-dump anti-pattern.
+        let member_trigger = rope
             .as_ref()
-            .map(|r| detect_member_access(r, target).is_some())
-            .unwrap_or(false);
+            .and_then(|r| detect_member_access(r, target));
+        let has_member_trigger = member_trigger.is_some();
 
         if let Some(resp) = Box::pin(self.slang.member_completion(&uri, target)).await {
             return Ok(Some(resp));
         }
         if has_member_trigger {
+            // Slang unavailable/busy — try AST fallback for known-type receivers.
+            // Skip for `::` (package scope): member_trigger is Some((true, _)).
+            let is_dot_trigger = member_trigger.as_ref().map_or(false, |(is_pkg, _)| !is_pkg);
+            if is_dot_trigger {
+                if let (Some(tree), Some(r)) =
+                    (self.cached_tree(&uri).await, rope.as_ref())
+                {
+                    let prefix = member_trigger
+                        .map(|(_, p)| p)
+                        .unwrap_or_default();
+                    let ws = self.workspace.read().await;
+                    if let Some(resp) =
+                        syntax_member_completion(&ws.index, &tree, r, target, &prefix)
+                    {
+                        return Ok(Some(resp));
+                    }
+                }
+            }
             return Ok(Some(CompletionResponse::Array(vec![])));
         }
 
@@ -2756,6 +2775,184 @@ fn method_url_in_class(
         }
     }
     None
+}
+
+// --------------------------------------------------------------------------
+// Syntax-only member completion (AST fallback for `super.` / `this.` / `obj.`)
+// --------------------------------------------------------------------------
+
+/// Extract the plain identifier immediately before the `.` trigger.
+///
+/// Given `super.` at cursor, returns `"super"`. Given `obj.fo` at cursor
+/// (partial prefix), returns `"obj"`. Returns `None` when the trigger is
+/// `::` (package scope) or when nothing plain sits left of the dot (e.g. a
+/// closing `)` from a chained call like `get_obj().`).
+fn receiver_ident_before_dot(rope: &Rope, pos: MPosition) -> Option<String> {
+    if (pos.line as usize) >= rope.len_lines() {
+        return None;
+    }
+    let line = rope.line(pos.line as usize);
+
+    let mut buf = String::new();
+    let mut utf16: u32 = 0;
+    for ch in line.chars() {
+        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
+            break;
+        }
+        buf.push(ch);
+        utf16 += ch.len_utf16() as u32;
+    }
+
+    let chars: Vec<char> = buf.chars().collect();
+    let mut i = chars.len();
+
+    // Strip the completion prefix (e.g. "fo" in "obj.fo").
+    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
+        i -= 1;
+    }
+
+    // Only handle `.` — not `::`.
+    if i == 0 || chars[i - 1] != '.' {
+        return None;
+    }
+    i -= 1; // skip the `.`
+
+    // Read the receiver identifier backwards.
+    let end = i;
+    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
+        i -= 1;
+    }
+    if i == end {
+        return None;
+    }
+    Some(chars[i..end].iter().collect())
+}
+
+/// Enumerate all member symbols declared in `class_name` and its ancestors
+/// (via `Symbol::parent_class_name`). Capped at 16 hops to guard against
+/// cycles in malformed code.
+///
+/// Closest-ancestor wins: if a subclass overrides a parent's method, only
+/// the subclass version is included (matching SV override semantics).
+///
+/// Returns `(Symbol, Url)` pairs so callers can show the declaring file name
+/// in the completion item's `detail` field.
+fn collect_class_members(
+    wi: &WorkspaceIndex,
+    class_name: &str,
+) -> Vec<(Symbol, Url)> {
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut result: Vec<(Symbol, Url)> = Vec::new();
+    let mut current = class_name.to_string();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    for _ in 0..16 {
+        if !visited.insert(current.clone()) {
+            break;
+        }
+        let Some(class_entry) = wi
+            .lookup(&current)
+            .iter()
+            .find(|e| e.symbol.kind == MSymbolKind::Class)
+            .cloned()
+        else {
+            break;
+        };
+        let class_url = class_entry.url.clone();
+        let class_range = class_entry.symbol.full_range;
+
+        for e in wi.entries() {
+            if e.url != class_url {
+                continue;
+            }
+            if e.symbol.kind == MSymbolKind::Class {
+                continue;
+            }
+            if !range_contains(class_range, e.symbol.full_range) {
+                continue;
+            }
+            if seen_names.insert(e.symbol.name.clone()) {
+                result.push((e.symbol.clone(), class_url.clone()));
+            }
+        }
+
+        match class_entry.symbol.parent_class_name {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    result
+}
+
+/// Best-effort member completion backed by the cached AST and workspace
+/// index. Used when slang is unavailable or busy with a background elaborate.
+///
+/// Handles three receiver kinds:
+/// - `super` → members of the parent class (from `extends` on the enclosing class)
+/// - `this`  → members of the enclosing class and its ancestors
+/// - `<ident>` → resolves the identifier's declared type via
+///   [`mimir_syntax::symbols::find_variable_type_at`], then enumerates its members
+///
+/// Returns `None` when the receiver's type cannot be determined from syntax
+/// alone (e.g. undeclared variable, chained call). This avoids the workspace-
+/// dump anti-pattern — no irrelevant candidates are ever returned.
+fn syntax_member_completion(
+    wi: &WorkspaceIndex,
+    tree: &SyntaxTree,
+    rope: &Rope,
+    pos: MPosition,
+    prefix: &str,
+) -> Option<CompletionResponse> {
+    let receiver = receiver_ident_before_dot(rope, pos)?;
+
+    let class_name: String = match receiver.as_str() {
+        "super" => {
+            let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, pos)?;
+            info.parent_class_name?
+        }
+        "this" => {
+            let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, pos)?;
+            info.class_name
+        }
+        ident => {
+            let raw = mimir_syntax::symbols::find_variable_type_at(tree, rope, pos, ident)?;
+            mimir_syntax::symbols::normalize_type_name(&raw)?
+        }
+    };
+
+    let members = collect_class_members(wi, &class_name);
+    if members.is_empty() {
+        return None;
+    }
+
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let items: Vec<CompletionItem> = members
+        .into_iter()
+        .filter(|(s, _)| {
+            prefix_lower.is_empty() || s.name.to_ascii_lowercase().starts_with(&prefix_lower)
+        })
+        .map(|(sym, url)| {
+            let detail = url
+                .path_segments()
+                .and_then(|mut segs| segs.next_back())
+                .map(str::to_owned);
+            CompletionItem {
+                label: sym.name.clone(),
+                kind: Some(symbol_kind_to_completion_kind(sym.kind)),
+                detail,
+                data: make_resolve_data(&url, sym.name_range.start.line),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    debug!(
+        class = %class_name,
+        receiver = %receiver,
+        count = items.len(),
+        "member completion: syntax fallback",
+    );
+    Some(CompletionResponse::Array(items))
 }
 
 /// Build a `Hover` from a resolved [`Symbol`] by:
@@ -5244,5 +5441,139 @@ mod tests {
             }
             other => panic!("expected RenameOptions with prepare_provider, got {other:?}"),
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // syntax_member_completion helpers
+    // ----------------------------------------------------------------------
+
+    /// `receiver_ident_before_dot` extracts the identifier left of the `.`.
+    #[test]
+    fn receiver_ident_before_dot_super() {
+        let rope = Rope::from_str("    super.");
+        // cursor after the dot (col 10)
+        let pos = MPosition::new(0, 10);
+        assert_eq!(receiver_ident_before_dot(&rope, pos).as_deref(), Some("super"));
+    }
+
+    #[test]
+    fn receiver_ident_before_dot_with_prefix() {
+        // partial prefix: "obj.fo" — cursor at end
+        let rope = Rope::from_str("obj.fo");
+        let pos = MPosition::new(0, 6);
+        assert_eq!(receiver_ident_before_dot(&rope, pos).as_deref(), Some("obj"));
+    }
+
+    #[test]
+    fn receiver_ident_before_dot_chained_call_returns_none() {
+        // "get_obj()." — nothing plain before the dot
+        let rope = Rope::from_str("get_obj().");
+        let pos = MPosition::new(0, 10);
+        assert!(receiver_ident_before_dot(&rope, pos).is_none());
+    }
+
+    #[test]
+    fn receiver_ident_before_dot_scope_trigger_returns_none() {
+        // "::" is not a `.` trigger
+        let rope = Rope::from_str("pkg::");
+        let pos = MPosition::new(0, 5);
+        assert!(receiver_ident_before_dot(&rope, pos).is_none());
+    }
+
+    /// `collect_class_members` returns all symbols inside a class body,
+    /// walks the `extends` chain, and closest-ancestor wins on name collision.
+    #[test]
+    fn collect_class_members_single_class() {
+        let url = url("file:///a.sv");
+        let src = "\
+class Base;
+  function void foo(); endfunction
+  int bar;
+endclass
+";
+        let wi = workspace_index_from(&[(&url, src)]);
+        let members = collect_class_members(&wi, "Base");
+        let names: Vec<&str> = members.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"foo"), "should include method foo");
+        assert!(names.contains(&"bar"), "should include field bar");
+        assert!(!names.contains(&"Base"), "should not include the class itself");
+    }
+
+    #[test]
+    fn collect_class_members_walks_extends_chain() {
+        let url = url("file:///a.sv");
+        let src = "\
+class Base;
+  function void base_fn(); endfunction
+endclass
+class Child extends Base;
+  function void child_fn(); endfunction
+endclass
+";
+        let wi = workspace_index_from(&[(&url, src)]);
+        let members = collect_class_members(&wi, "Child");
+        let names: Vec<&str> = members.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"child_fn"), "own method");
+        assert!(names.contains(&"base_fn"), "inherited method");
+    }
+
+    #[test]
+    fn collect_class_members_override_deduplication() {
+        let url = url("file:///a.sv");
+        let src = "\
+class Base;
+  function void run(); endfunction
+endclass
+class Child extends Base;
+  function void run(); endfunction
+endclass
+";
+        let wi = workspace_index_from(&[(&url, src)]);
+        let members = collect_class_members(&wi, "Child");
+        let run_count = members.iter().filter(|(s, _)| s.name == "run").count();
+        assert_eq!(run_count, 1, "overridden method should appear only once");
+    }
+
+    /// `syntax_member_completion` returns candidates for `super.` when the
+    /// enclosing class has a known parent.
+    #[test]
+    fn syntax_member_completion_super() {
+        let url = url("file:///a.sv");
+        let src = "\
+class Base;
+  function void base_method(); endfunction
+endclass
+class Child extends Base;
+  function void my_fn();
+    super.
+  endfunction
+endclass
+";
+        let wi = workspace_index_from(&[(&url, src)]);
+        let tree = parse_tree(src);
+        let rope = Rope::from_str(src);
+        // Line 5 (0-indexed): "    super." — cursor after the dot at col 10.
+        let pos = MPosition::new(5, 10);
+        let resp = syntax_member_completion(&wi, &tree, &rope, pos, "");
+        assert!(resp.is_some(), "should return Some for super.");
+        if let Some(CompletionResponse::Array(items)) = resp {
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(labels.contains(&"base_method"), "parent method should appear");
+        }
+    }
+
+    /// `syntax_member_completion` returns `None` for an unknown receiver
+    /// (undeclared variable) — no workspace dump.
+    #[test]
+    fn syntax_member_completion_unknown_receiver_returns_none() {
+        let wi = WorkspaceIndex::default();
+        let src = "module m; initial unknown_var. endmodule\n";
+        let tree = parse_tree(src);
+        let rope = Rope::from_str(src);
+        let pos = MPosition::new(0, 30);
+        assert!(
+            syntax_member_completion(&wi, &tree, &rope, pos, "").is_none(),
+            "undeclared variable should return None"
+        );
     }
 }
