@@ -443,6 +443,13 @@ impl Backend {
                     })
             }
             None => {
+                // Skip bare-identifier lookup when the cursor is on the
+                // right-hand side of `::` (class/package scope resolution).
+                // The workspace index can't distinguish `get` from
+                // `uvm_config_db::get`, so an unrelated match would be wrong.
+                if mimir_syntax::symbols::is_scope_qualified_at(tree, rope, target) {
+                    return None;
+                }
                 // Bare identifier: same-file index first, workspace fallback.
                 if let Some(sym) = same_file_index.iter().find(|s| s.name == name).cloned() {
                     Some((uri.clone(), sym))
@@ -667,6 +674,21 @@ impl Backend {
         }
 
         for (entry_url, sym) in candidates.cross_file {
+            // For plain-identifier completion, only globally accessible
+            // declarations are useful cross-file. Variables, ports, parameters,
+            // and methods belong to specific objects and only appear correctly
+            // in dot-triggered or AST-aware completion.
+            if matches!(
+                sym.kind,
+                MSymbolKind::Variable
+                    | MSymbolKind::Port
+                    | MSymbolKind::Method
+                    | MSymbolKind::Parameter
+                    | MSymbolKind::Constraint
+                    | MSymbolKind::EnumMember
+            ) {
+                continue;
+            }
             let Some(s) = completion_score::score(&mut matcher, &prefix, &sym.name) else {
                 continue;
             };
@@ -2426,12 +2448,57 @@ impl LanguageServer for Backend {
         }
 
         // Route 3: plain identifier — scope-aware completion.
-        // AST path first (scope-correct from cached symbol table).
+        // AST path first (scope-correct local scope from cached symbol table),
+        // then always augment with workspace global-scope declarations (classes,
+        // modules, packages, typedefs, top-level functions/tasks) so that
+        // cross-file types are always reachable even when slang has only
+        // resolved the current file's local scope.
         if let Some(ast) = self.adapter.cached_ast().await {
             let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
             if let Some(path) = file_path {
-                let items = ast_features::identifier_completion(&ast, &path, mimir_pos);
+                let mut items = ast_features::identifier_completion(&ast, &path, mimir_pos);
                 if !items.is_empty() {
+                    let seen: std::collections::HashSet<String> =
+                        items.iter().map(|i| i.label.clone()).collect();
+                    let ws = self.workspace.read().await;
+                    for entry in ws.index.entries() {
+                        if matches!(
+                            entry.symbol.kind,
+                            MSymbolKind::Class
+                                | MSymbolKind::Module
+                                | MSymbolKind::Interface
+                                | MSymbolKind::Package
+                                | MSymbolKind::Typedef
+                                | MSymbolKind::Function
+                                | MSymbolKind::Task
+                                | MSymbolKind::Program
+                        ) && !seen.contains(&entry.symbol.name)
+                        {
+                            let detail = entry
+                                .url
+                                .path_segments()
+                                .and_then(|mut s| s.next_back())
+                                .map(str::to_owned);
+                            items.push(CompletionItem {
+                                label: entry.symbol.name.clone(),
+                                kind: Some(symbol_kind_to_completion_kind(entry.symbol.kind)),
+                                detail,
+                                data: make_resolve_data(
+                                    &entry.url,
+                                    entry.symbol.name_range.start.line,
+                                ),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    // Also add SV keywords so the AST-augmented path is
+                    // complete (syntax_completion isn't reached when AST
+                    // returns non-empty results).
+                    for kw in mimir_syntax::keywords::KEYWORDS.iter().copied() {
+                        if !seen.contains(kw) {
+                            items.push(keyword_completion_item(kw));
+                        }
+                    }
                     return Ok(Some(CompletionResponse::Array(items)));
                 }
             }
@@ -2589,7 +2656,13 @@ impl LanguageServer for Backend {
                         )
                         .await;
                 }
-                Ok(Some(whole_file_edit(&rope, &formatted)))
+                // Return an edit confined to the requested range.
+                // Verible emits the whole file; we extract only the lines
+                // that changed within [lsp_start_line, lsp_end_line].
+                let lsp_start = params.range.start.line;
+                let lsp_end = params.range.end.line;
+                Ok(range_lines_edit(&rope, &formatted, lsp_start, lsp_end)
+                    .or_else(|| Some(vec![])))
             }
             Err(e) => {
                 error!(error = %e, "verible-verilog-format failed; returning no edits");
@@ -2670,6 +2743,63 @@ fn whole_file_edit(rope: &ropey::Rope, new_text: &str) -> Vec<TextEdit> {
         },
         new_text: new_text.to_owned(),
     }]
+}
+
+/// Build a [`TextEdit`] that replaces only lines `lsp_start..=lsp_end`
+/// (0-based, inclusive) in the document with the corresponding lines from
+/// `formatted_text` (the full Verible output).
+///
+/// Used by `range_formatting` so that the returned edit is confined to the
+/// requested range — clients validate that edits don't escape the viewport.
+///
+/// Returns `None` when the two snippets are identical (no change needed).
+fn range_lines_edit(
+    original: &ropey::Rope,
+    formatted_text: &str,
+    lsp_start: u32,
+    lsp_end: u32,
+) -> Option<Vec<TextEdit>> {
+    let fmt_rope = ropey::Rope::from_str(formatted_text);
+
+    let orig_lines = original.len_lines();
+    let fmt_lines = fmt_rope.len_lines();
+
+    let s = lsp_start as usize;
+    // `lsp_end` is inclusive in the LSP range; the edit covers through the
+    // *start* of line lsp_end+1 so that the trailing newline is included.
+    let e = (lsp_end as usize + 1).min(orig_lines).min(fmt_lines);
+
+    let orig_start_byte = original.line_to_byte(s);
+    let orig_end_byte = original.line_to_byte(e.min(orig_lines));
+    let fmt_start_byte = fmt_rope.line_to_byte(s.min(fmt_lines));
+    let fmt_end_byte = fmt_rope.line_to_byte(e.min(fmt_lines));
+
+    let orig_slice = &original.to_string()[orig_start_byte..orig_end_byte];
+    let fmt_slice = &formatted_text[fmt_start_byte..fmt_end_byte];
+
+    if orig_slice == fmt_slice {
+        return None;
+    }
+
+    // End the edit at the last character of lsp_end (not the start of
+    // lsp_end+1) so that the edit range stays within the requested viewport.
+    // Use the formatted line's length in UTF-16 code units (the LSP wire
+    // format) to handle non-ASCII identifiers correctly.
+    let end_line_content = fmt_rope
+        .line(e.saturating_sub(1).min(fmt_lines.saturating_sub(1)));
+    let end_char: u32 = end_line_content
+        .chars()
+        .filter(|&c| c != '\n' && c != '\r')
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+
+    Some(vec![TextEdit {
+        range: Range {
+            start: Position { line: lsp_start, character: 0 },
+            end: Position { line: lsp_end, character: end_char },
+        },
+        new_text: fmt_slice.to_owned(),
+    }])
 }
 
 /// Pick a filesystem path to start `.mimir.toml` discovery from.

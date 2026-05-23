@@ -20,8 +20,8 @@ capabilities are gone or never existed:
 
 [p1]: ../crates/mimir-syntax/src/parser.rs
 
-These tests fail today (``@expectedFailure`` + ``XFAIL:`` note); when
-the corresponding fix lands the test flips to *unexpected success*,
+Remaining known failures are marked with ``@expectedFailure`` + ``XFAIL:``
+note; when the corresponding fix lands the test flips to *unexpected success*,
 which is the signal to drop the decorator in the same PR.
 
 Run::
@@ -102,17 +102,10 @@ class ApbMonitorCrossFileTest(unittest.TestCase):
             f"no location pointed at apb_rw.sv; got {locations}",
         )
 
-    @unittest.expectedFailure
     def test_goto_def_apb_rw_inside_parameterized_class_arg(self) -> None:
-        """XFAIL: goto-def on the ``apb_rw`` token used as a type argument
+        """goto-def on the ``apb_rw`` token used as a type argument
         inside ``uvm_analysis_port#(apb_rw) ap;`` (line 39, 0-indexed 38)
-        currently resolves to the surrounding ``uvm_analysis_port`` class
-        — slang treats the parameterized class instantiation as the
-        innermost named thing under the cursor.
-
-        Documents the specific corner case so a future fix (whichever
-        layer ends up owning it — slang's resolver or a mimir-side
-        position rewrite before sending to slang) can flip this test."""
+        now correctly resolves to ``apb_rw.sv``."""
         result = self.lsp.request(
             "textDocument/definition",
             {

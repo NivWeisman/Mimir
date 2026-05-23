@@ -537,6 +537,30 @@ pub(crate) fn node_range(node: Node<'_>, rope: &Rope) -> Range {
 /// or `system_tf_identifier` token, `None` otherwise (whitespace,
 /// punctuation, comments, keywords, end-of-document).
 ///
+/// Return `true` when the identifier at `pos` is immediately preceded by `::`
+/// in the source text, indicating a class/package-scope qualified name such
+/// as `uvm_config_db#(T)::get(...)` or `pkg::CONST`.
+///
+/// Used by `hover_via_tree_sitter` to skip the bare-identifier workspace
+/// lookup when the cursor is on the right-hand side of `::` — the workspace
+/// index cannot know that `get` means `uvm_config_db::get`, so returning an
+/// unrelated match would be misleading.
+#[must_use]
+pub fn is_scope_qualified_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> bool {
+    let Ok(byte) = pos.to_byte_offset(rope) else { return false };
+    let root = tree.tree.root_node();
+    let Some(leaf) = root.descendant_for_byte_range(byte, byte) else { return false };
+    if !matches!(leaf.kind(), "simple_identifier" | "system_tf_identifier") {
+        return false;
+    }
+    let start = leaf.start_byte();
+    if start < 2 {
+        return false;
+    }
+    let src = tree.source();
+    src.get(start - 2..start) == Some("::")
+}
+
 /// `pos` uses LSP coordinates (UTF-16 columns); we convert via
 /// `Position::to_byte_offset` exactly once and work in bytes after
 /// that, per the crate-wide pattern in
@@ -1761,6 +1785,29 @@ endclass
         let src = "module m;\nparameter int W = 8;\ninitial W = W;\nendmodule\n";
         // Line 2 ("initial W = W;"), column 8 is the 'W' after `=`.
         assert_eq!(ident_at(src, 2, 12).as_deref(), Some("W"));
+    }
+
+    // --- is_scope_qualified_at -----------------------------------------
+
+    fn scope_qualified_at(src: &str, line: u32, col: u32) -> bool {
+        init_for_tests();
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        is_scope_qualified_at(&tree, &Rope::from_str(src), Position::new(line, col))
+    }
+
+    #[test]
+    fn scope_qualified_detects_double_colon() {
+        let src = "module m;\ninitial begin\n  pkg::FOO;\nend\nendmodule\n";
+        // `FOO` at line 2: `  pkg::FOO;` — 2 spaces + "pkg" + "::" = col 7.
+        assert!(scope_qualified_at(src, 2, 7));
+    }
+
+    #[test]
+    fn scope_qualified_false_for_plain_identifier() {
+        let src = "module m;\ninitial begin\n  foo_bar;\nend\nendmodule\n";
+        // `foo_bar` starts at col 2.
+        assert!(!scope_qualified_at(src, 2, 2));
     }
 
     // --- word_at -------------------------------------------------------
