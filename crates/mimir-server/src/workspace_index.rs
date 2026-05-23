@@ -303,6 +303,8 @@ mod tests {
             full_range: Range::new(Position::new(line, 0), Position::new(line, 10)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         }
     }
 

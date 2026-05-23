@@ -140,6 +140,8 @@ mod tests {
             full_range: dummy_range(),
             params: Some(params),
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         }
     }
 
@@ -197,6 +199,8 @@ mod tests {
             full_range: dummy_range(),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         assert!(signature_for(&sym).is_none());
     }

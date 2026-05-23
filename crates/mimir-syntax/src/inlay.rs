@@ -142,6 +142,8 @@ mod tests {
             full_range: r,
             params: Some(params),
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         }
     }
 
@@ -290,6 +292,8 @@ mod tests {
             full_range: make_range(0, 0, 1),
             params: None, // not callable / no params info
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         assert!(hints_for(&call, &sym, MethodHintMode::Name).is_empty());
     }

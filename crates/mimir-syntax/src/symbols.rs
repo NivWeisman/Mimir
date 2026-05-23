@@ -124,6 +124,15 @@ pub struct Symbol {
     /// caller walk the inheritance chain without re-parsing each ancestor.
     /// `None` for non-class symbols and for classes with no `extends` clause.
     pub parent_class_name: Option<String>,
+    /// Declared return type for `Function`/`Task`/`Method` symbols.
+    /// Extracted from the `function_data_type_or_implicit` node in the parse
+    /// tree. `None` for `void` returns, tasks (implicitly void), constructors,
+    /// and all non-callable symbol kinds.
+    pub return_type: Option<String>,
+    /// Declared variable type for `Variable`/`Port`/`Parameter` symbols.
+    /// Extracted from the enclosing `data_declaration` or `ansi_port_declaration`.
+    /// `None` for callables, classes, modules, typedefs, and other non-variable kinds.
+    pub decl_type: Option<String>,
 }
 
 /// Walk `tree` and return every declaration we can recognise.
@@ -192,6 +201,16 @@ fn symbol_for(
     } else {
         None
     };
+    let return_type = match kind {
+        SymbolKind::Function | SymbolKind::Method => extract_return_type(node, source),
+        _ => None,
+    };
+    let decl_type = match kind {
+        SymbolKind::Variable | SymbolKind::Port | SymbolKind::Parameter => {
+            extract_decl_type(node, source)
+        }
+        _ => None,
+    };
     Some(Symbol {
         name,
         kind,
@@ -199,7 +218,66 @@ fn symbol_for(
         full_range: node_range(node, rope),
         params,
         parent_class_name,
+        return_type,
+        decl_type,
     })
+}
+
+/// Extract the return type from a `function_body_declaration` or
+/// `function_prototype` node. Returns `None` for `void` or implicit returns.
+///
+/// In tree-sitter-systemverilog 0.3.1 the return type is the first named
+/// child of kind `data_type_or_void`. `void` functions and tasks have that
+/// node with text `"void"`, which we treat as no return type.
+fn extract_return_type(node: Node<'_>, source: &str) -> Option<String> {
+    let dt = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "data_type_or_void")?;
+    let text = dt.utf8_text(source.as_bytes()).ok()?.trim().to_string();
+    if text.is_empty() || text == "void" {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Extract the declared type for a `variable_decl_assignment` or
+/// `ansi_port_declaration` node.
+///
+/// For variables: walks up to the enclosing `data_declaration` and reads its
+/// `data_type_or_implicit` child. For ports: reads the child directly.
+fn extract_decl_type(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "variable_decl_assignment" => {
+            // variable_decl_assignment → list_of_variable_decl_assignments → data_declaration
+            let list = node.parent()?;
+            let dd = list.parent()?;
+            if dd.kind() != "data_declaration" {
+                return None;
+            }
+            let dt = first_named_child_of_kinds(dd, &["data_type_or_implicit", "data_type"])?;
+            let text = dt.utf8_text(source.as_bytes()).ok()?.trim().to_string();
+            if text.is_empty() { None } else { Some(text) }
+        }
+        "ansi_port_declaration" => {
+            let dt = first_named_child_of_kinds(
+                node,
+                &["data_type_or_implicit", "data_type"],
+            )?;
+            let text = dt.utf8_text(source.as_bytes()).ok()?.trim().to_string();
+            if text.is_empty() { None } else { Some(text) }
+        }
+        "param_assignment" => {
+            // param_assignment's type lives on the grandparent
+            // `parameter_declaration` → `data_type_or_implicit`.
+            let list = node.parent()?; // list_of_param_assignments
+            let pd = list.parent()?;  // parameter_declaration or local_parameter_declaration
+            let dt = first_named_child_of_kinds(pd, &["data_type_or_implicit", "data_type"])?;
+            let text = dt.utf8_text(source.as_bytes()).ok()?.trim().to_string();
+            if text.is_empty() { None } else { Some(text) }
+        }
+        _ => None,
+    }
 }
 
 /// Read a class's `extends P;` clause and return `P` as a plain name.
@@ -731,6 +809,284 @@ pub fn hover_receiver_at(
             | "class_declaration"
             | "module_declaration" => return None,
             _ => node = parent,
+        }
+    }
+    None
+}
+
+// --------------------------------------------------------------------------
+// Member-access chain types and parser
+// --------------------------------------------------------------------------
+
+/// One segment of a member-access chain parsed from the syntax tree.
+///
+/// Used by [`MemberChain`] and the multi-hop resolver in `mimir-server`.
+/// The variant determines which field of the resolved intermediate symbol
+/// is used to advance the type: `Member` uses `decl_type`, `MethodCall`
+/// uses `return_type`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainSegment {
+    /// The root identifier: `a` in `a.b.c` (first segment, not after a dot).
+    Root(String),
+    /// `this` keyword — receiver is the enclosing class.
+    This,
+    /// `super` keyword — receiver is the enclosing class's parent.
+    /// Always a single hop; `super.super` is not valid SystemVerilog.
+    Super,
+    /// A plain field/member access: `.field` — resolution uses `decl_type`.
+    Member(String),
+    /// A method call: `.method(...)` — resolution uses `return_type`.
+    MethodCall(String),
+}
+
+impl ChainSegment {
+    /// Return the identifier name for `Root`, `Member`, and `MethodCall`
+    /// variants. Returns `None` for `This` and `Super` keywords.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            ChainSegment::Root(n) | ChainSegment::Member(n) | ChainSegment::MethodCall(n) => {
+                Some(n.as_str())
+            }
+            ChainSegment::This | ChainSegment::Super => None,
+        }
+    }
+}
+
+/// A parsed member-access chain with the segment under the cursor identified.
+///
+/// `segments[0]` is always the root (`Root`, `This`, or `Super`).
+/// `segments[target_idx]` is the symbol the cursor is on — the one to
+/// resolve for hover/definition, or the one whose type feeds completion
+/// candidates (for the segment just before a `.` trigger).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberChain {
+    /// All segments in order, root first.
+    pub segments: Vec<ChainSegment>,
+    /// Index of the segment under the cursor.
+    pub target_idx: usize,
+}
+
+/// Walk upward from `pos` to detect a member-access chain and return it
+/// as a [`MemberChain`]. Returns `None` for:
+///
+/// * Bare identifiers (no `.` context) — handled by the existing single-name lookup.
+/// * The cursor sitting on the root segment itself (index 0).
+/// * Grammar shapes we don't recognise (fall back to slang).
+///
+/// Handles two grammar shapes produced by tree-sitter-systemverilog 0.3.1:
+///
+/// * **`hierarchical_identifier`** — flat list of `simple_identifier` siblings.
+///   Covers `a.b.c` (LHS / RHS) and `obj.method(...)` inside a `tf_call`.
+/// * **Nested `method_call`** — used for `this.X.method(...)`,
+///   `super.run(...)`, and `this.field` access. The tree is recursive:
+///   the receiver of each `method_call` is either an `implicit_class_handle`
+///   (`this`/`super`) or a `primary` wrapping an inner `method_call`.
+#[must_use]
+pub fn parse_member_chain_at(
+    tree: &SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+) -> Option<MemberChain> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let leaf = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    if leaf.kind() != "simple_identifier" {
+        return None;
+    }
+    let source = tree.source();
+
+    let mut node = leaf;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            // Flat chain: `a.b.c` in assignment/expression or `obj.method()`
+            // inside a `tf_call`.
+            "hierarchical_identifier" => {
+                return chain_from_hierarchical_identifier(parent, leaf, source);
+            }
+            // Nested chain: `this.X`, `super.X`, `this.ap.write(tr)`.
+            "method_call_body" => {
+                let mc = parent.parent()?;
+                if mc.kind() == "method_call" {
+                    let segments = collect_method_call_segments(mc, source)?;
+                    if segments.len() < 2 {
+                        return None;
+                    }
+                    let target_idx = segments.len() - 1;
+                    if target_idx == 0 {
+                        return None;
+                    }
+                    return Some(MemberChain { segments, target_idx });
+                }
+                return None;
+            }
+            // Stop at scope boundaries — the identifier is not a member access.
+            "statement_or_null"
+            | "data_declaration"
+            | "list_of_arguments"
+            | "function_body_declaration"
+            | "task_body_declaration"
+            | "class_declaration"
+            | "module_declaration"
+            | "source_file" => return None,
+            _ => node = parent,
+        }
+    }
+    None
+}
+
+/// Build a [`MemberChain`] from a flat `hierarchical_identifier` node.
+///
+/// Returns `None` if the cursor is on the root segment (index 0) or if
+/// the node has fewer than 2 `simple_identifier` children.
+fn chain_from_hierarchical_identifier<'a>(
+    hi: Node<'a>,
+    leaf: Node<'a>,
+    source: &str,
+) -> Option<MemberChain> {
+    let mut cursor = hi.walk();
+    let simple_ids: Vec<Node<'_>> = hi
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == "simple_identifier")
+        .collect();
+
+    if simple_ids.len() < 2 {
+        return None;
+    }
+
+    let leaf_idx = simple_ids.iter().position(|n| n.id() == leaf.id())?;
+    if leaf_idx == 0 {
+        return None; // cursor on the root — bare-identifier path handles this
+    }
+
+    // Mark the last segment as MethodCall when inside a tf_call (call site).
+    let is_tf_call = hi.parent().map(|p| p.kind() == "tf_call").unwrap_or(false);
+    let last_idx = simple_ids.len() - 1;
+
+    let segments: Vec<ChainSegment> = simple_ids
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let name = n
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .to_string();
+            if i == 0 {
+                ChainSegment::Root(name)
+            } else if is_tf_call && i == last_idx {
+                ChainSegment::MethodCall(name)
+            } else {
+                ChainSegment::Member(name)
+            }
+        })
+        .collect();
+
+    Some(MemberChain { segments, target_idx: leaf_idx })
+}
+
+/// Recursively flatten a `method_call` node into an ordered list of
+/// [`ChainSegment`]s. Returns `None` if the structure is unexpected.
+///
+/// Grammar shape (tree-sitter-systemverilog 0.3.1):
+/// ```text
+/// method_call
+///   implicit_class_handle ("this" | "super")   // or primary wrapping inner method_call
+///   "."
+///   method_call_body
+///     simple_identifier  (field/method name)
+///     [ "(" list_of_arguments ")" ]             // present only for calls
+/// ```
+fn collect_method_call_segments(mc: Node<'_>, source: &str) -> Option<Vec<ChainSegment>> {
+    let mut walker = mc.walk();
+    let children: Vec<Node<'_>> = mc.named_children(&mut walker).collect();
+
+    let body = children.iter().find(|n| n.kind() == "method_call_body")?;
+    let receiver = children.iter().find(|n| n.kind() != "method_call_body")?;
+
+    // Collect body's named children once, then query.
+    let body_named: Vec<Node<'_>> = {
+        let mut bc = body.walk();
+        body.named_children(&mut bc).collect()
+    };
+    let body_all: Vec<Node<'_>> = {
+        let mut bc = body.walk();
+        body.children(&mut bc).collect()
+    };
+
+    let name = body_named
+        .iter()
+        .find(|n| n.kind() == "simple_identifier")?
+        .utf8_text(source.as_bytes())
+        .ok()?
+        .to_string();
+
+    let is_call = body_all.iter().any(|n| n.kind() == "(");
+
+    let seg = if is_call {
+        ChainSegment::MethodCall(name)
+    } else {
+        ChainSegment::Member(name)
+    };
+
+    match receiver.kind() {
+        "implicit_class_handle" => {
+            let text = receiver
+                .utf8_text(source.as_bytes())
+                .ok()?
+                .trim();
+            let root = match text {
+                "this" => ChainSegment::This,
+                "super" => ChainSegment::Super,
+                _ => return None,
+            };
+            Some(vec![root, seg])
+        }
+        "primary" => {
+            // Unwrap: primary → function_subroutine_call → subroutine_call → method_call
+            // or possibly → hierarchical_identifier for field chains.
+            if let Some(inner_mc) = find_descendant_by_kind(*receiver, "method_call") {
+                let mut segs = collect_method_call_segments(inner_mc, source)?;
+                segs.push(seg);
+                Some(segs)
+            } else if let Some(hi) = find_descendant_by_kind(*receiver, "hierarchical_identifier") {
+                let mut bc = hi.walk();
+                let ids: Vec<Node<'_>> = hi
+                    .named_children(&mut bc)
+                    .filter(|n| n.kind() == "simple_identifier")
+                    .collect();
+                let mut segs: Vec<ChainSegment> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| {
+                        let nm = n
+                            .utf8_text(source.as_bytes())
+                            .unwrap_or("")
+                            .to_string();
+                        if i == 0 {
+                            ChainSegment::Root(nm)
+                        } else {
+                            ChainSegment::Member(nm)
+                        }
+                    })
+                    .collect();
+                segs.push(seg);
+                Some(segs)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// First-match DFS for a descendant node of the given `kind`.
+fn find_descendant_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = find_descendant_by_kind(child, kind) {
+            return Some(found);
         }
     }
     None
@@ -2303,6 +2659,56 @@ endclass
             other => panic!("expected DeclaredType, got {other:?}"),
         }
     }
+
+    // ── return_type / decl_type extraction ────────────────────────────────
+
+    #[test]
+    fn function_with_int_return_has_return_type() {
+        let s = idx("function int get_addr(); endfunction\n");
+        let sym = pick(&s, "get_addr");
+        assert_eq!(sym.return_type, Some("int".to_string()));
+        assert_eq!(sym.decl_type, None);
+    }
+
+    #[test]
+    fn function_void_return_has_no_return_type() {
+        let s = idx("function void run_phase(int phase); endfunction\n");
+        let sym = pick(&s, "run_phase");
+        assert_eq!(sym.return_type, None);
+        assert_eq!(sym.decl_type, None);
+    }
+
+    #[test]
+    fn task_has_no_return_type() {
+        let s = idx("task run(int n); endtask\n");
+        let sym = pick(&s, "run");
+        assert_eq!(sym.return_type, None);
+        assert_eq!(sym.decl_type, None);
+    }
+
+    #[test]
+    fn function_with_class_return_type() {
+        let s = idx("class c; function c build(); endfunction\nendclass\n");
+        let sym = pick(&s, "build");
+        assert_eq!(sym.return_type, Some("c".to_string()));
+        assert_eq!(sym.decl_type, None);
+    }
+
+    #[test]
+    fn variable_decl_has_decl_type() {
+        let s = idx("class c;\n  apb_rw tr;\nendclass\n");
+        let sym = pick(&s, "tr");
+        assert_eq!(sym.decl_type, Some("apb_rw".to_string()));
+        assert_eq!(sym.return_type, None);
+    }
+
+    #[test]
+    fn variable_decl_parameterized_type() {
+        let s = idx("class c;\n  uvm_analysis_port #(apb_rw) ap;\nendclass\n");
+        let sym = pick(&s, "ap");
+        assert_eq!(sym.decl_type, Some("uvm_analysis_port #(apb_rw)".to_string()));
+        assert_eq!(sym.return_type, None);
+    }
 }
 
 
@@ -2409,5 +2815,70 @@ mod _class_inheritance_indexing_tests {
         let src = "class C;\n  function void f();\n    my_obj.go();\n  endfunction\nendclass\n";
         // cursor on the `m` of `my_obj`
         assert_eq!(receiver_at(src, 2, 4), None);
+    }
+
+    // ── parse_member_chain_at ──────────────────────────────────────────────
+
+    fn chain_at(src: &str, line: u32, col: u32) -> Option<MemberChain> {
+        mimir_core::logging::init_for_tests();
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        parse_member_chain_at(&tree, &Rope::from_str(src), Position::new(line, col))
+    }
+
+    #[test]
+    fn chain_flat_abc_cursor_on_c() {
+        // `a.b.c = 1;` — flat hierarchical_identifier in LHS
+        let src = "class C; function void f(); a.b.c = 1; endfunction endclass\n";
+        let chain = chain_at(src, 0, 32).expect("should parse chain"); // cursor on 'c'
+        assert_eq!(chain.segments, vec![
+            ChainSegment::Root("a".into()),
+            ChainSegment::Member("b".into()),
+            ChainSegment::Member("c".into()),
+        ]);
+        assert_eq!(chain.target_idx, 2);
+    }
+
+    #[test]
+    fn chain_tf_call_obj_method_cursor_on_method() {
+        // `obj.method()` — tf_call with hierarchical_identifier
+        let src = "class C; function void f(); obj.method(); endfunction endclass\n";
+        let chain = chain_at(src, 0, 32).expect("should parse chain"); // cursor on 'method'
+        assert_eq!(chain.segments, vec![
+            ChainSegment::Root("obj".into()),
+            ChainSegment::MethodCall("method".into()),
+        ]);
+        assert_eq!(chain.target_idx, 1);
+    }
+
+    #[test]
+    fn chain_super_run_cursor_on_run() {
+        // `super.run(p)` — method_call with implicit_class_handle
+        let src = "class C extends P; function void f(); super.run(p); endfunction endclass\n";
+        let chain = chain_at(src, 0, 44).expect("should parse chain"); // cursor on 'run'
+        assert_eq!(chain.segments, vec![
+            ChainSegment::Super,
+            ChainSegment::MethodCall("run".into()),
+        ]);
+        assert_eq!(chain.target_idx, 1);
+    }
+
+    #[test]
+    fn chain_this_ap_write_cursor_on_write() {
+        // `this.ap.write(x)` — nested method_call
+        let src = "class C; function void f(); this.ap.write(x); endfunction endclass\n";
+        let chain = chain_at(src, 0, 36).expect("should parse chain"); // cursor on 'write'
+        assert_eq!(chain.segments, vec![
+            ChainSegment::This,
+            ChainSegment::Member("ap".into()),
+            ChainSegment::MethodCall("write".into()),
+        ]);
+        assert_eq!(chain.target_idx, 2);
+    }
+
+    #[test]
+    fn chain_bare_identifier_returns_none() {
+        let src = "class C; function void f(); x = 1; endfunction endclass\n";
+        assert_eq!(chain_at(src, 0, 28), None); // cursor on bare 'x'
     }
 }

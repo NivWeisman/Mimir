@@ -57,6 +57,7 @@ use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::ast_features;
+use crate::chain_resolve;
 use crate::completion_score;
 use crate::hierarchy_features;
 use crate::elaborate_service::ElaborateService;
@@ -405,42 +406,24 @@ impl Backend {
         // Receiver-aware: `this.X` / `super.X` / `obj.X`.
         let receiver = mimir_syntax::symbols::hover_receiver_at(tree, rope, target);
 
-        let resolved: Option<(Url, Symbol)> = match &receiver {
+        let mut resolved: Option<(Url, Symbol)> = match &receiver {
             Some(mimir_syntax::symbols::HoverReceiver::This) => {
                 let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, target)?;
                 let ws = self.workspace.read().await;
-                find_method_in_class(&ws.index, &info.class_name, name)
-                    .or_else(|| find_field_in_class(&ws.index, &info.class_name, name))
-                    .map(|sym| {
-                        let url = method_url_in_class(&ws.index, &info.class_name, &sym)
-                            .unwrap_or_else(|| uri.clone());
-                        (url, sym)
-                    })
+                chain_resolve::find_member(&ws.index, &info.class_name, name)
             }
             Some(mimir_syntax::symbols::HoverReceiver::Super) => {
                 let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, target)?;
                 let parent = info.parent_class_name?;
                 let ws = self.workspace.read().await;
-                find_method_in_class(&ws.index, &parent, name)
-                    .or_else(|| find_field_in_class(&ws.index, &parent, name))
-                    .map(|sym| {
-                        let url = method_url_in_class(&ws.index, &parent, &sym)
-                            .unwrap_or_else(|| uri.clone());
-                        (url, sym)
-                    })
+                chain_resolve::find_member(&ws.index, &parent, name)
             }
             Some(mimir_syntax::symbols::HoverReceiver::Object(recv_name)) => {
                 let ty =
                     mimir_syntax::symbols::find_variable_type_at(tree, rope, target, recv_name)?;
                 let cls = mimir_syntax::symbols::normalize_type_name(&ty)?;
                 let ws = self.workspace.read().await;
-                find_method_in_class(&ws.index, &cls, name)
-                    .or_else(|| find_field_in_class(&ws.index, &cls, name))
-                    .map(|sym| {
-                        let url = method_url_in_class(&ws.index, &cls, &sym)
-                            .unwrap_or_else(|| uri.clone());
-                        (url, sym)
-                    })
+                chain_resolve::find_member(&ws.index, &cls, name)
             }
             None => {
                 // Skip bare-identifier lookup when the cursor is on the
@@ -462,6 +445,21 @@ impl Backend {
                 }
             }
         };
+
+        // Multi-hop chain fallback (e.g. `a.b.c`, `this.ap.write`).
+        // The single-hop arms above only read the first receiver segment; for
+        // deeper chains `hover_receiver_at` returns the wrong receiver and the
+        // result is None.  Parse the full chain and resolve all hops.
+        if resolved.is_none() {
+            if let Some(chain) = mimir_syntax::symbols::parse_member_chain_at(tree, rope, target) {
+                if chain.target_idx > 0 {
+                    let ws = self.workspace.read().await;
+                    resolved = chain_resolve::resolve_member_chain(
+                        &chain, target, tree, rope, &ws.index,
+                    );
+                }
+            }
+        }
 
         let (sym_url, sym) = resolved?;
         let docs = self.documents.read().await;
@@ -497,20 +495,38 @@ impl Backend {
         };
 
         let matches = resolve_definition(name, uri, &index, &workspace_hits);
-        if matches.is_empty() {
-            debug!(name, "no symbol matches in same-file or workspace index");
-            return None;
+        if !matches.is_empty() {
+            let locations: Vec<Location> = matches
+                .into_iter()
+                .map(|(url, sym)| Location {
+                    uri: url,
+                    range: m_range_to_lsp(sym.name_range),
+                })
+                .collect();
+            debug!(name, count = locations.len(), "syntax definition resolved");
+            return Some(GotoDefinitionResponse::Array(locations));
         }
 
-        let locations: Vec<Location> = matches
-            .into_iter()
-            .map(|(url, sym)| Location {
-                uri: url,
-                range: m_range_to_lsp(sym.name_range),
-            })
-            .collect();
-        debug!(name, count = locations.len(), "syntax definition resolved");
-        Some(GotoDefinitionResponse::Array(locations))
+        // Multi-hop member chain fallback (e.g. `a.b.c`, `this.ap.write`).
+        // `resolve_definition` handles bare names and single-hop via workspace
+        // index; deeper chains need the chain resolver.
+        if let Some(chain) = mimir_syntax::symbols::parse_member_chain_at(&tree, &rope, target) {
+            if chain.target_idx > 0 {
+                let ws = self.workspace.read().await;
+                if let Some((url, sym)) =
+                    chain_resolve::resolve_member_chain(&chain, target, &tree, &rope, &ws.index)
+                {
+                    debug!(name, "chain definition resolved");
+                    return Some(GotoDefinitionResponse::Array(vec![Location {
+                        uri: url,
+                        range: m_range_to_lsp(sym.name_range),
+                    }]));
+                }
+            }
+        }
+
+        debug!(name, "no symbol matches in same-file or workspace index");
+        None
     }
 
     /// Gather syntax-side candidates for `uri`, split into same-file and
@@ -1914,9 +1930,8 @@ impl LanguageServer for Backend {
 
     /// Hover: declaration line for the symbol under the cursor, with a
     /// synthesized signature for callables and the full `define` body
-    /// for macros. Receiver-aware for `this.X` / `super.X` / `obj.X` —
-    /// reuses the same enclosing-class + `find_method_in_class` chain
-    /// that drives inlay hints.
+    /// for macros. Receiver-aware for `this.X` / `super.X` / `obj.X` /
+    /// multi-hop chains — uses `chain_resolve` for class-member lookup.
     ///
     /// Slang-first when configured: routes through
     /// Slang-first when configured: calls `slang.definition` and reads the
@@ -2891,7 +2906,7 @@ enum MethodResolution {
 ///   * `recv == "this"`  → look up `call.name` as a Method in the enclosing
 ///     class's same-file index entries.
 ///   * `recv == "super"` → walk the enclosing class's `extends` chain via
-///     [`find_method_in_class`].
+///     [`chain_resolve::find_method_in_class`].
 ///   * `recv == ""`      → constructor-expression form (`class_new`); use
 ///     [`mimir_syntax::symbols::class_new_lhs_at`] to find the LHS context,
 ///     then look up `"new"` in the resolved class.
@@ -2935,8 +2950,8 @@ fn resolve_method_symbol(
             let Some(parent) = info.and_then(|i| i.parent_class_name) else {
                 return MethodResolution::NotResolved("super used but no extends clause");
             };
-            find_method_in_class(wi, &parent, &call.name)
-                .map(|s| MethodResolution::Resolved(s, "super/inheritance walk"))
+            chain_resolve::find_method_in_class(wi, &parent, &call.name)
+                .map(|(_, s)| MethodResolution::Resolved(s, "super/inheritance walk"))
                 .unwrap_or(MethodResolution::NotResolved(
                     "super.X not found in any ancestor",
                 ))
@@ -2962,46 +2977,50 @@ fn resolve_method_symbol(
             let Some(cls) = target_class else {
                 return MethodResolution::NotResolved("class_new LHS type unresolvable from AST");
             };
-            find_method_in_class(wi, &cls, "new")
-                .map(|s| MethodResolution::Resolved(s, "class_new/LHS-type"))
+            chain_resolve::find_method_in_class(wi, &cls, "new")
+                .map(|(_, s)| MethodResolution::Resolved(s, "class_new/LHS-type"))
                 .unwrap_or(MethodResolution::NotResolved(
                     "constructor not found for resolved class",
                 ))
         }
         _ => {
-            // `obj.method` style. `recv` is the whole hierarchical_identifier
-            // including the method name (an artefact of how `tf_call`
-            // call-site detection captures the receiver). Strip the trailing
-            // segment to get just the receiver chain, then accept only
-            // single-segment receivers — chained access (`obj.field.method`)
-            // would need recursive resolution that's closer to a type
-            // checker and out of scope here.
+            // `obj.method` or `a.b.method` style. `recv` is the whole
+            // hierarchical_identifier including the method name. Strip the
+            // trailing segment to get the receiver chain, then build a
+            // MemberChain and resolve with the chain resolver (supports up to
+            // 2 intermediate hops on the tree-sitter path).
             let receiver_chain = match recv.rsplit_once('.') {
                 Some((before, _method)) => before,
                 None => recv,
             };
-            if receiver_chain.contains('.') {
-                return MethodResolution::NotResolved("chained receiver access needs slang");
+            let chain = chain_resolve::build_chain_for_receiver(receiver_chain, &call.name);
+            if let Some((_, sym)) = chain_resolve::resolve_member_chain(
+                &chain, call.name_range.start, tree, rope, wi,
+            ) {
+                return MethodResolution::Resolved(sym, "obj.method/chain");
             }
-            let ty = find_variable_type_at(tree, rope, call.name_range.start, receiver_chain);
-            let Some(cls) = ty.as_deref().and_then(normalize_type_name) else {
-                return MethodResolution::NotResolved("receiver type unresolvable from AST");
+            // Single-segment receiver fast path for built-in methods.
+            let cls_opt = if !receiver_chain.contains('.') {
+                find_variable_type_at(tree, rope, call.name_range.start, receiver_chain)
+                    .as_deref()
+                    .and_then(normalize_type_name)
+                    .map(|s| s.to_string())
+            } else {
+                None
             };
-            find_method_in_class(wi, &cls, &call.name)
-                .map(|s| MethodResolution::Resolved(s, "obj.method/AST-typed"))
-                .or_else(|| {
-                    // Built-in method for the resolved type (e.g. string.len()),
-                    // or a universal method (rand_mode, constraint_mode) on any class.
-                    mimir_syntax::builtin_methods::find_method(&cls, &call.name)
-                        .or_else(|| mimir_syntax::builtin_methods::find_universal(&call.name))
-                        .map(|m| MethodResolution::Resolved(
-                            builtin_to_symbol(m, call.name_range),
-                            "obj.method/builtin",
-                        ))
-                })
-                .unwrap_or(MethodResolution::NotResolved(
-                    "method not found in resolved receiver class",
-                ))
+            if let Some(cls) = cls_opt {
+                if let Some(m) = mimir_syntax::builtin_methods::find_method(&cls, &call.name)
+                    .or_else(|| mimir_syntax::builtin_methods::find_universal(&call.name))
+                {
+                    return MethodResolution::Resolved(
+                        builtin_to_symbol(m, call.name_range),
+                        "obj.method/builtin",
+                    );
+                }
+            }
+            MethodResolution::NotResolved(
+                "method not found in resolved receiver class",
+            )
         }
     }
 }
@@ -3031,6 +3050,8 @@ fn builtin_to_symbol(
                 .collect(),
         ),
         parent_class_name: None,
+        return_type: None,
+        decl_type: None,
     }
 }
 
@@ -3053,123 +3074,8 @@ fn builtin_to_symbol(
 ///      `full_range`. That's the method declared in that class body.
 ///   3. If no match, recurse on the parent class name. Capped at 16 hops
 ///      to prevent runaway searches if the index has a cycle.
-fn find_method_in_class(
-    wi: &workspace_index::WorkspaceIndex,
-    class_name: &str,
-    method_name: &str,
-) -> Option<Symbol> {
-    let mut current = class_name.to_string();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for _ in 0..16 {
-        if !visited.insert(current.clone()) {
-            return None;
-        }
-        let class_entry = wi
-            .lookup(&current)
-            .iter()
-            .find(|e| e.symbol.kind == MSymbolKind::Class)
-            .cloned()?;
-        if let Some(method) = wi
-            .lookup(method_name)
-            .iter()
-            .find(|e| {
-                e.url == class_entry.url
-                    && range_contains(class_entry.symbol.full_range, e.symbol.full_range)
-                    && e.symbol.kind == MSymbolKind::Method
-            })
-            .map(|e| e.symbol.clone())
-        {
-            return Some(method);
-        }
-        match class_entry.symbol.parent_class_name {
-            Some(parent) => current = parent,
-            None => return None,
-        }
-    }
-    None
-}
-
-/// Variant of [`find_method_in_class`] for class fields / variables.
-///
-/// Walks the `extends` chain identically but matches kind=Variable
-/// against entries whose `full_range` is contained in the class body.
-/// Used by hover for cursor on `this.cfg`, `obj.field`, etc.
-fn find_field_in_class(
-    wi: &workspace_index::WorkspaceIndex,
-    class_name: &str,
-    field_name: &str,
-) -> Option<Symbol> {
-    let mut current = class_name.to_string();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for _ in 0..16 {
-        if !visited.insert(current.clone()) {
-            return None;
-        }
-        let class_entry = wi
-            .lookup(&current)
-            .iter()
-            .find(|e| e.symbol.kind == MSymbolKind::Class)
-            .cloned()?;
-        if let Some(field) = wi
-            .lookup(field_name)
-            .iter()
-            .find(|e| {
-                e.url == class_entry.url
-                    && range_contains(class_entry.symbol.full_range, e.symbol.full_range)
-                    && matches!(
-                        e.symbol.kind,
-                        MSymbolKind::Variable | MSymbolKind::Port | MSymbolKind::Parameter
-                    )
-            })
-            .map(|e| e.symbol.clone())
-        {
-            return Some(field);
-        }
-        match class_entry.symbol.parent_class_name {
-            Some(parent) => current = parent,
-            None => return None,
-        }
-    }
-    None
-}
-
-/// Find the URL of the file that contains the class body in which `sym`
-/// is declared. Walks the `extends` chain like
-/// [`find_method_in_class`] / [`find_field_in_class`] do, so a method
-/// resolved on an ancestor returns the ancestor's file URL.
-fn method_url_in_class(
-    wi: &workspace_index::WorkspaceIndex,
-    class_name: &str,
-    sym: &Symbol,
-) -> Option<Url> {
-    let mut current = class_name.to_string();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for _ in 0..16 {
-        if !visited.insert(current.clone()) {
-            return None;
-        }
-        let class_entry = wi
-            .lookup(&current)
-            .iter()
-            .find(|e| e.symbol.kind == MSymbolKind::Class)
-            .cloned()?;
-        if wi
-            .lookup(&sym.name)
-            .iter()
-            .any(|e| e.url == class_entry.url && e.symbol.name_range == sym.name_range)
-        {
-            return Some(class_entry.url);
-        }
-        match class_entry.symbol.parent_class_name {
-            Some(parent) => current = parent,
-            None => return None,
-        }
-    }
-    None
-}
-
 // --------------------------------------------------------------------------
-// Syntax-only member completion (AST fallback for `super.` / `this.` / `obj.`)
+// Syntax-only member completion (AST fallback for `super.` / `this.` / `obj.` / chains)
 // --------------------------------------------------------------------------
 
 /// Extract the plain identifier immediately before the `.` trigger.
@@ -3178,6 +3084,10 @@ fn method_url_in_class(
 /// (partial prefix), returns `"obj"`. Returns `None` when the trigger is
 /// `::` (package scope) or when nothing plain sits left of the dot (e.g. a
 /// closing `)` from a chained call like `get_obj().`).
+///
+/// Single-segment variant kept for tests; [`receiver_chain_before_dot`] is
+/// the production path used by [`syntax_member_completion`].
+#[cfg(test)]
 fn receiver_ident_before_dot(rope: &Rope, pos: MPosition) -> Option<String> {
     if (pos.line as usize) >= rope.len_lines() {
         return None;
@@ -3217,6 +3127,62 @@ fn receiver_ident_before_dot(rope: &Rope, pos: MPosition) -> Option<String> {
         return None;
     }
     Some(chars[i..end].iter().collect())
+}
+
+/// Extend [`receiver_ident_before_dot`] to handle multi-hop chains.
+///
+/// For `a.b.` at cursor returns `["a", "b"]`; for `obj.` returns `["obj"]`.
+/// Returns `None` when the trigger is `::`, or when a non-identifier character
+/// (e.g. `)` from a call return) sits left of the dot.
+fn receiver_chain_before_dot(rope: &Rope, pos: MPosition) -> Option<Vec<String>> {
+    if (pos.line as usize) >= rope.len_lines() {
+        return None;
+    }
+    let line = rope.line(pos.line as usize);
+
+    let mut buf = String::new();
+    let mut utf16: u32 = 0;
+    for ch in line.chars() {
+        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
+            break;
+        }
+        buf.push(ch);
+        utf16 += ch.len_utf16() as u32;
+    }
+
+    let chars: Vec<char> = buf.chars().collect();
+    let mut i = chars.len();
+
+    // Strip the completion prefix.
+    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
+        i -= 1;
+    }
+
+    // Only handle `.` — not `::`.
+    if i == 0 || chars[i - 1] != '.' {
+        return None;
+    }
+    i -= 1; // skip the `.`
+
+    // Read segments backwards, stopping at a non-identifier non-dot char.
+    let mut segments: Vec<String> = Vec::new();
+    loop {
+        let end = i;
+        while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
+            i -= 1;
+        }
+        if i == end {
+            return None; // non-identifier char (e.g. `)`) — bail
+        }
+        segments.push(chars[i..end].iter().collect());
+        if i > 0 && chars[i - 1] == '.' {
+            i -= 1; // consume the `.` and read the next segment
+        } else {
+            break;
+        }
+    }
+    segments.reverse();
+    Some(segments)
 }
 
 /// Enumerate all member symbols declared in `class_name` and its ancestors
@@ -3278,14 +3244,15 @@ fn collect_class_members(
 /// Best-effort member completion backed by the cached AST and workspace
 /// index. Used when slang is unavailable or busy with a background elaborate.
 ///
-/// Handles three receiver kinds:
+/// Handles single-hop and multi-hop receiver chains:
 /// - `super` → members of the parent class (from `extends` on the enclosing class)
 /// - `this`  → members of the enclosing class and its ancestors
-/// - `<ident>` → resolves the identifier's declared type via
-///   [`mimir_syntax::symbols::find_variable_type_at`], then enumerates its members
+/// - `<ident>` → resolves the identifier's declared type, then enumerates members
+/// - `a.b.` → resolves `a` to a type, then `b` to a member type, then enumerates
+///   members of that type (up to 2 intermediate hops on the tree-sitter path)
 ///
 /// Returns `None` when the receiver's type cannot be determined from syntax
-/// alone (e.g. undeclared variable, chained call). This avoids the workspace-
+/// alone (e.g. undeclared variable, deeper chain). This avoids the workspace-
 /// dump anti-pattern — no irrelevant candidates are ever returned.
 fn syntax_member_completion(
     wi: &WorkspaceIndex,
@@ -3294,21 +3261,45 @@ fn syntax_member_completion(
     pos: MPosition,
     prefix: &str,
 ) -> Option<CompletionResponse> {
-    let receiver = receiver_ident_before_dot(rope, pos)?;
+    let segments = receiver_chain_before_dot(rope, pos)?;
 
-    let class_name: String = match receiver.as_str() {
-        "super" => {
-            let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, pos)?;
-            info.parent_class_name?
+    let class_name: String = if segments.len() == 1 {
+        match segments[0].as_str() {
+            "super" => {
+                let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, pos)?;
+                info.parent_class_name?
+            }
+            "this" => {
+                let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, pos)?;
+                info.class_name
+            }
+            ident => {
+                let raw = mimir_syntax::symbols::find_variable_type_at(tree, rope, pos, ident)?;
+                mimir_syntax::symbols::normalize_type_name(&raw)?
+            }
         }
-        "this" => {
-            let info = mimir_syntax::symbols::enclosing_class_info_at(tree, rope, pos)?;
-            info.class_name
+    } else {
+        // Multi-hop: walk the receiver segments manually to find the type at
+        // the end of the chain, then enumerate that type's members.
+        let root_name = &segments[0];
+        let root_type = match root_name.as_str() {
+            "this" => mimir_syntax::symbols::enclosing_class_info_at(tree, rope, pos)?.class_name,
+            "super" => {
+                mimir_syntax::symbols::enclosing_class_info_at(tree, rope, pos)?.parent_class_name?
+            }
+            _ => {
+                let raw =
+                    mimir_syntax::symbols::find_variable_type_at(tree, rope, pos, root_name)?;
+                mimir_syntax::symbols::normalize_type_name(&raw)?
+            }
+        };
+        let mut current_type = root_type;
+        for seg in &segments[1..] {
+            let (_, sym) = chain_resolve::find_member(wi, &current_type, seg)?;
+            let raw = sym.decl_type.as_deref().or(sym.return_type.as_deref())?;
+            current_type = mimir_syntax::symbols::normalize_type_name(raw)?;
         }
-        ident => {
-            let raw = mimir_syntax::symbols::find_variable_type_at(tree, rope, pos, ident)?;
-            mimir_syntax::symbols::normalize_type_name(&raw)?
-        }
+        current_type
     };
 
     let workspace_members = collect_class_members(wi, &class_name);
@@ -3360,7 +3351,7 @@ fn syntax_member_completion(
 
     debug!(
         class = %class_name,
-        receiver = %receiver,
+        receiver = ?segments,
         count = items.len(),
         builtin_methods = builtins.len(),
         "member completion: syntax fallback",
@@ -4218,6 +4209,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(line, 0), MPosition::new(line, 10)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         }
     }
 
@@ -4355,6 +4348,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 9)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let out = nest_symbols(&[s]);
         assert_eq!(out.len(), 1);
@@ -4374,6 +4369,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(6, 8)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let f = Symbol {
             name: "f".into(),
@@ -4382,6 +4379,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(1, 4), MPosition::new(2, 12)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let g = Symbol {
             name: "g".into(),
@@ -4390,6 +4389,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(3, 4), MPosition::new(4, 8)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let out = nest_symbols(&[class, f, g]);
         assert_eq!(out.len(), 1);
@@ -4415,6 +4416,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(1, 9)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let b = Symbol {
             name: "b".into(),
@@ -4423,6 +4426,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(2, 0), MPosition::new(3, 9)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let out = nest_symbols(&[a, b]);
         let names: Vec<&str> = out.iter().map(|n| n.name.as_str()).collect();
@@ -4439,6 +4444,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(8, 10)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let cls = Symbol {
             name: "c".into(),
@@ -4447,6 +4454,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(1, 0), MPosition::new(6, 8)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let m = Symbol {
             name: "f".into(),
@@ -4455,6 +4464,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(2, 4), MPosition::new(3, 12)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let out = nest_symbols(&[pkg, cls, m]);
         assert_eq!(out.len(), 1);
@@ -5007,6 +5018,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(2, 8)),
             params: None,
             parent_class_name: Some("uvm_monitor".to_string()),
+            return_type: None,
+            decl_type: None,
         };
         let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
         assert_eq!(
@@ -5038,6 +5051,8 @@ mod tests {
                 },
             ]),
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
         let v = hover_markdown_value(&h);
@@ -5068,6 +5083,8 @@ mod tests {
                 ty: None,
             }]),
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
         let v = hover_markdown_value(&h);
@@ -5097,6 +5114,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 10)),
             params: None,
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         // No doc, and the path doesn't exist on disk either → None.
         assert!(hover_for_symbol(&s, &url, &docs).is_none());
@@ -5277,6 +5296,8 @@ mod tests {
                 },
             ]),
             parent_class_name: None,
+            return_type: None,
+            decl_type: None,
         };
         let body = read_macro_body(&s, &url, Some(&rope)).expect("body extracted");
         assert_eq!(body, "a + b");

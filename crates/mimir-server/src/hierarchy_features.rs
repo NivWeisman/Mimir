@@ -315,6 +315,8 @@ mod tests {
             full_range: MRange::new(MPosition::new(line, 0), MPosition::new(line + 1, 0)),
             params: None,
             parent_class_name: parent.map(str::to_string),
+            return_type: None,
+            decl_type: None,
         }
     }
 

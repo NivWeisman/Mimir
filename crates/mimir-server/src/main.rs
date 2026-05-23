@@ -20,6 +20,7 @@ use tower_lsp::{LspService, Server};
 
 mod ast_features;
 mod backend;
+mod chain_resolve;
 mod completion_score;
 mod diagnostics;
 mod elaborate_service;
