@@ -56,6 +56,8 @@ _OPS = [
     ("definition",     10),  # textDocument/definition
     ("semantic_tokens", 6),  # textDocument/semanticTokens/full
     ("doc_symbol",      8),  # textDocument/documentSymbol
+    ("call_hierarchy",  4),  # callHierarchy/outgoingCalls (workspace-wide scan)
+    ("type_hierarchy",  4),  # typeHierarchy/supertypes or /subtypes
 ]
 _OP_NAMES  = [n for n, _ in _OPS]
 _OP_WEIGHTS = [w for _, w in _OPS]
@@ -245,6 +247,53 @@ class StressTest(unittest.TestCase):
                         {"textDocument": {"uri": uri}},
                         timeout=8.0,
                     )
+
+                elif op == "call_hierarchy":
+                    # Phase 1: resolve cursor to a CallHierarchyItem.  Most
+                    # random positions won't land on a callable — that's fine;
+                    # the server returns null and we move on.
+                    row  = rng.randrange(min(n_lines, 200))
+                    char = rng.randrange(60)
+                    items = self.lsp.request(
+                        "textDocument/prepareCallHierarchy",
+                        {
+                            "textDocument": {"uri": uri},
+                            "position": {"line": row, "character": char},
+                        },
+                        timeout=8.0,
+                    )
+                    # Phase 2: if we landed on a callable, fire outgoingCalls.
+                    if items:
+                        self.lsp.request(
+                            "callHierarchy/outgoingCalls",
+                            {"item": items[0]},
+                            timeout=10.0,
+                        )
+
+                elif op == "type_hierarchy":
+                    # Phase 1: resolve cursor to a TypeHierarchyItem.
+                    row  = rng.randrange(min(n_lines, 200))
+                    char = rng.randrange(60)
+                    items = self.lsp.request(
+                        "textDocument/prepareTypeHierarchy",
+                        {
+                            "textDocument": {"uri": uri},
+                            "position": {"line": row, "character": char},
+                        },
+                        timeout=8.0,
+                    )
+                    # Phase 2: alternate between supertypes and subtypes.
+                    if items:
+                        method = (
+                            "typeHierarchy/supertypes"
+                            if rng.random() < 0.5
+                            else "typeHierarchy/subtypes"
+                        )
+                        self.lsp.request(
+                            method,
+                            {"item": items[0]},
+                            timeout=10.0,
+                        )
 
                 op_count += 1
 
