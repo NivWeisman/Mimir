@@ -7,8 +7,12 @@ LSP/JSON-RPC over stdio.
 
 ## Status
 
-Early development. Document sync + parse-error diagnostics ship today;
-everything else is in [README.md](./README.md) under "Feature checklist".
+Active development. The core LSP skeleton (document sync, parse-error
+diagnostics, semantic tokens, hover, completion, signature help, go-to-definition,
+declaration, type-definition, implementation, references, rename, document
+highlights, document symbols, workspace symbols, inlay hints, folding ranges,
+formatting, call hierarchy, and type hierarchy) are all shipped. Everything
+else is tracked in [README.md](./README.md) under "Feature checklist".
 That checklist is canonical — flip an item in the same change that lands the
 feature.
 
@@ -26,23 +30,27 @@ feature.
 
 ## Workspace layout
 
-| Path                         | Role                                                                                   |
-| ---------------------------- | -------------------------------------------------------------------------------------- |
-| `crates/mimir-core/`         | Pure-data: `TextDocument` (rope), `Position`/`Range` math, tracing init. No tokio, no parser. |
-| `crates/mimir-syntax/`       | tree-sitter wrapper: `SyntaxParser`, parse-error / `MISSING`-node diagnostic extraction.       |
-| `crates/mimir-server/`       | tower-lsp `Backend` + `mimir-server` binary. Owns the document store and LSP wire glue.        |
-| `editors/vscode/`            | TypeScript extension client. Spawns the binary; no real logic.                         |
-| `editors/emacs/init.el`      | eglot / lsp-mode config snippet.                                                       |
+| Path                         | Role                                                                                        |
+| ---------------------------- | ------------------------------------------------------------------------------------------- |
+| `crates/mimir-core/`         | Pure-data: `TextDocument` (rope), `Position`/`Range` math, tracing init. No tokio, no parser.|
+| `crates/mimir-syntax/`       | tree-sitter wrapper: `SyntaxParser`, parse-error / `MISSING`-node diagnostics, symbols, semantic tokens, calls, inlay, folding, hover, keywords.|
+| `crates/mimir-slang/`        | Async client for the C++ slang sidecar. Owns process lifecycle, NDJSON framing, and typed protocol types. No parser, no LSP.|
+| `crates/mimir-ast/`          | Backend-agnostic AST types (`MimirAst`, `MimirDecl`, `MimirDiag`, `MimirScope`, …). Pure data + serde, no I/O.|
+| `crates/mimir-server/`       | tower-lsp `Backend` + `mimir-server` binary. Owns the document store and LSP wire glue.     |
+| `editors/vscode/`            | TypeScript extension client. Spawns the binary; no real logic.                              |
+| `editors/emacs/init.el`      | eglot / lsp-mode config snippet.                                                            |
 
 Dependencies flow strictly downward:
-`mimir-server → {mimir-syntax, mimir-core}`, `mimir-syntax → mimir-core`.
+`mimir-server → {mimir-syntax, mimir-slang, mimir-ast, mimir-core}`,
+`mimir-syntax → mimir-core`.
+`mimir-slang` and `mimir-ast` have no deps on other workspace crates.
 Don't introduce cycles; don't pull `tower-lsp` or `tokio` into the lower crates.
 
 ## Build, test, lint
 
 ```bash
 cargo check  --workspace
-cargo test   --workspace                   # 19 unit tests today
+cargo test   --workspace                   # 436 unit tests today
 cargo clippy --workspace -- -D warnings
 cargo build  --release                     # produces target/release/mimir-server
 ```
@@ -54,10 +62,35 @@ debugging — it'll just sit on stdin otherwise):
 RUST_LOG=mimir=debug cargo run -p mimir-server
 ```
 
-Per-crate test entry points:
-- `mimir-core`: [crates/mimir-core/src/document.rs:339](./crates/mimir-core/src/document.rs), [crates/mimir-core/src/logging.rs:82](./crates/mimir-core/src/logging.rs)
-- `mimir-syntax`: [crates/mimir-syntax/src/parser.rs:128](./crates/mimir-syntax/src/parser.rs), [crates/mimir-syntax/src/diagnostics.rs:150](./crates/mimir-syntax/src/diagnostics.rs), [crates/mimir-syntax/src/keywords.rs](./crates/mimir-syntax/src/keywords.rs)
-- `mimir-server`: [crates/mimir-server/src/backend.rs:310](./crates/mimir-server/src/backend.rs)
+Per-crate test entry points (unit tests co-located with source):
+- `mimir-core`: [crates/mimir-core/src/document.rs](./crates/mimir-core/src/document.rs), [crates/mimir-core/src/logging.rs](./crates/mimir-core/src/logging.rs)
+- `mimir-syntax`: [crates/mimir-syntax/src/parser.rs](./crates/mimir-syntax/src/parser.rs), [crates/mimir-syntax/src/diagnostics.rs](./crates/mimir-syntax/src/diagnostics.rs), [crates/mimir-syntax/src/symbols.rs](./crates/mimir-syntax/src/symbols.rs), [crates/mimir-syntax/src/keywords.rs](./crates/mimir-syntax/src/keywords.rs)
+- `mimir-slang`: [crates/mimir-slang/src/client.rs](./crates/mimir-slang/src/client.rs), [crates/mimir-slang/src/protocol.rs](./crates/mimir-slang/src/protocol.rs)
+- `mimir-server`: [crates/mimir-server/src/backend.rs](./crates/mimir-server/src/backend.rs), [crates/mimir-server/src/filelist.rs](./crates/mimir-server/src/filelist.rs), [crates/mimir-server/src/project.rs](./crates/mimir-server/src/project.rs)
+- Integration / semantic-token tests: [crates/mimir-syntax/tests/semantic_tokens.rs](./crates/mimir-syntax/tests/semantic_tokens.rs)
+
+## Pre-commit test protocol
+
+Run **all three tiers** before every commit:
+
+```bash
+# Tier 1 — unit tests (always, ~1 s)
+cargo test --workspace
+
+# Tier 2 — integration tests (needs release binary + examples/riscv-dv clone)
+cargo build --release -p mimir-server
+make integration
+
+# Tier 3 — stress tests (for any change touching parsing, indexing, or IPC)
+MIMIR_STRESS_DURATION=30 python3 -m unittest tests.test_stress -v
+```
+
+If `examples/riscv-dv` is absent, Tier 2 tests that depend on it are skipped
+automatically — this is expected on CI and fresh checkouts. The hermetic tests
+(`test_hello_world.py`, `test_hierarchy.py`) always run regardless.
+
+Tier 3 is optional for purely mechanical changes (doc edits, formatting
+fixes) but required whenever the server's hot-path logic changes.
 
 ## Critical invariants
 
@@ -100,10 +133,20 @@ one.
   |------|-----------------------|
   | `TreeSitterProvider` | `SyntaxParser` ownership + all parse operations |
   | `SlangService` | Sidecar IPC + param assembly |
+  | `SlangAdapter` | Compile RPC round-trip + `MimirAst` cache + `CompileOutcome` |
   | `SyntaxService` | Document store + workspace index access |
   | `ElaborateService` | Debounce + dedup + diagnostic publish |
+  | `ast_features` | Feature lookups (`definition`, `hover`, `completion`, …) on `MimirAst` |
+  | `hierarchy_features` | `callHierarchy/*` + `typeHierarchy/*` (sync helpers, no locks) |
+  | `diagnostics` | `MimirDiag` → LSP `Diagnostic` conversion (one place, all backends) |
+  | `workspace_index` | Tree-sitter symbol index + identifier presence index |
   | `filelist` | `.f` tokenization + path resolution + `${VAR}` expansion |
   | `project` | `.mimir.toml` schema + `ResolvedProject` discovery/load |
+  | `format` | Verible subprocess management for `formatting` / `rangeFormatting` |
+  | `includes` | `` `include `` directive scanning for transitive header expansion |
+  | `completion_score` | Fuzzy subsequence scorer (used by completion + workspace symbols) |
+  | `mimir-slang` crate | Sidecar process lifecycle + NDJSON framing + protocol types |
+  | `mimir-ast` crate | Backend-agnostic AST data types — no I/O, no parser, no LSP deps |
   | `backend` | LSP wire glue — thin coordinator only |
 
 ## When making changes
@@ -112,12 +155,13 @@ one.
 - New fallible op → extend the crate's existing `*Error` enum (`thiserror`).
 - Logging → `tracing::{debug, info, warn, error}` with structured fields, not
   formatted strings. Never `println!` / `eprintln!`.
-- More debug logging to help identify issues, especially with sidecar comunication.
+- More debug logging to help identify issues, especially with sidecar communication.
 - New LSP feature → flip its checklist item in [README.md](./README.md) in
   the same commit.
 - Ask me questions to clarify the product requirements, technical requirements, engineering principles, and hard constraints.
 - Update [README.md](./README.md) after all changes done.
 - Update crates versions or sub-versions.
+- **Run the full pre-commit test protocol** (see [Pre-commit test protocol](#pre-commit-test-protocol) above) before creating any commit. All three tiers must pass.
 - Create a commit.
 
 ## Additional documentation

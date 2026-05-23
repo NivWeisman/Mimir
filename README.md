@@ -401,44 +401,61 @@ tree-sitter-only mode silently — build it first with `make sidecar`.
 
 ## Architecture
 
-A Cargo workspace with three crates, each independently testable:
+A Cargo workspace with five crates, each independently testable:
 
-| Crate           | Role                                                                      |
-| --------------- | ------------------------------------------------------------------------- |
-| `mimir-core`    | Pure-data types: `TextDocument` (rope-backed), positions, logging setup.  |
-| `mimir-syntax`  | tree-sitter wrapper. Parses SystemVerilog, extracts diagnostics.          |
-| `mimir-server`  | `tower-lsp` `Backend`. Owns the document store. Ships the binary.         |
+| Crate           | Role                                                                                        |
+| --------------- | ------------------------------------------------------------------------------------------- |
+| `mimir-core`    | Pure-data types: `TextDocument` (rope-backed), positions, logging setup.                    |
+| `mimir-syntax`  | tree-sitter wrapper. Parses SystemVerilog, extracts diagnostics and structural info.         |
+| `mimir-slang`   | Async client for the C++ slang sidecar. Owns process lifecycle and the NDJSON wire protocol.|
+| `mimir-ast`     | Backend-agnostic AST types (`MimirAst`, `MimirDecl`, `MimirDiag`, …). Pure data, no I/O.  |
+| `mimir-server`  | `tower-lsp` `Backend`. Owns the document store. Ships the binary.                           |
 
-**Why three crates?** Splitting boundaries lets us unit-test parsing without
-spinning up a tokio runtime, and keeps tree-sitter's native code out of the
-core types crate. It also forces clean module APIs — anything `mimir-server`
-needs from `mimir-syntax` has to be `pub`.
+**Why five crates?** Splitting boundaries lets us unit-test parsing without
+spinning up a tokio runtime, keeps the sidecar IPC contract explicit, and
+lets feature logic operate on `MimirAst` without knowing whether slang or
+a future backend produced it.
 
 Within `mimir-server`, heavy logic is split into focused service modules:
 
-| Module               | Owns                                                              |
-| -------------------- | ----------------------------------------------------------------- |
-| `parse_provider`     | `SyntaxParser` mutex, single-file parse, bulk path hydration      |
-| `slang_service`      | Sidecar IPC, project config, closed-file cache, param assembly    |
-| `syntax_service`     | Document store + workspace index access                           |
-| `elaborate_service`  | Debounce, input-hash dedup, diagnostic publish lifecycle          |
-| `filelist`           | `.f` tokenization, path resolution, `${VAR}` expansion            |
-| `project`            | `.mimir.toml` schema, `ResolvedProject::discover` / `load`        |
+| Module               | Owns                                                                         |
+| -------------------- | ---------------------------------------------------------------------------- |
+| `parse_provider`     | `SyntaxParser` mutex, single-file parse, bulk path hydration                 |
+| `slang_service`      | Sidecar IPC, project config, closed-file cache, param assembly               |
+| `slang_adapter`      | Compile RPC round-trip, `MimirAst` cache, `CompileOutcome` production        |
+| `syntax_service`     | Document store + workspace index access                                      |
+| `elaborate_service`  | Debounce, input-hash dedup, diagnostic publish lifecycle                     |
+| `ast_features`       | LSP feature lookups (definition, hover, completion, …) operating on `MimirAst` |
+| `hierarchy_features` | `callHierarchy/*` and `typeHierarchy/*` helpers (sync, lock-free)            |
+| `diagnostics`        | Backend-agnostic `MimirDiag` → LSP `Diagnostic` conversion                  |
+| `workspace_index`    | Workspace-wide tree-sitter symbol index, identifier presence index           |
+| `filelist`           | `.f` tokenization, path resolution, `${VAR}` expansion                       |
+| `project`            | `.mimir.toml` schema, `ResolvedProject::discover` / `load`                   |
+| `format`             | Verible formatter integration for `formatting` / `rangeFormatting`           |
+| `includes`           | `` `include `` directive scanner for transitive header expansion              |
+| `completion_score`   | Fuzzy subsequence-with-bonus scorer for completion / workspace-symbol ranking |
 
 ```
 ┌──────────────┐   LSP/JSON-RPC over stdio    ┌────────────────────────────┐
 │   editor     │ ───────────────────────────▶ │   mimir-server (binary)    │
 │  (vscode/    │ ◀─────────────────────────── │   - tower-lsp Backend      │
 │   emacs/...) │   diagnostics, hovers, …     │   - document store         │
-└──────────────┘                              └────────────┬───────────────┘
-                                                           │
-                                          ┌────────────────┴───────────────┐
-                                          ▼                                ▼
-                              ┌──────────────────────┐       ┌────────────────────────┐
-                              │     mimir-syntax     │       │       mimir-core       │
-                              │  tree-sitter parser, │       │  TextDocument (rope),  │
-                              │  parse diagnostics   │       │  positions, logging    │
-                              └──────────────────────┘       └────────────────────────┘
+└──────────────┘                              └──────────┬─────────────────┘
+                                                         │
+                      ┌──────────────────────────────────┼──────────────────────────┐
+                      ▼                                  ▼                          ▼
+          ┌──────────────────────┐          ┌────────────────────┐    ┌─────────────────────┐
+          │     mimir-syntax     │          │    mimir-slang     │    │     mimir-ast       │
+          │  tree-sitter parser, │          │  sidecar process   │    │  MimirAst, MimirDecl│
+          │  parse diagnostics   │          │  client + protocol │    │  MimirDiag  (data)  │
+          └──────────┬───────────┘          └────────────────────┘    └─────────────────────┘
+                     │
+                     ▼
+          ┌────────────────────────┐
+          │       mimir-core       │
+          │  TextDocument (rope),  │
+          │  positions, logging    │
+          └────────────────────────┘
 ```
 
 ---
@@ -449,22 +466,36 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (437 today)
+cargo test   --workspace                    # run all unit tests (436 today)
 cargo clippy --workspace -- -D warnings     # lint with warnings as errors
 cargo fmt    --all                          # format
-make integration                            # python LSP tests against the riscv-dv example
+make integration                            # python LSP integration tests (builds release binary first)
 ```
 
 Unit tests live in-tree (`#[cfg(test)] mod tests` per file). End-to-end
 LSP tests live under `tests/` and drive the release server over stdio
-exactly like an editor — `make integration` builds the release binary,
-opens files from `examples/riscv-dv/` (skipped if the local clone is
-absent — the riscv-dv sources aren't bundled), and exercises every
-implemented LSP feature: diagnostics, semantic tokens, hover, completion,
-go-to-definition, references, signature help, inlay hints, document
-highlights, document symbols, workspace symbols, and folding ranges.
-Two tests are known incomplete (SV keyword and cross-file class
-completion) and are left failing to track the gap.
+exactly like an editor — `make integration` builds the release binary and
+runs `python3 -m unittest discover` on every `test_*.py` file. Tests cover:
+- `test_hello_world.py` — server handshake, basic diagnostics
+- `test_riscv_dv.py` — full feature suite against `examples/riscv-dv/` (hover,
+  completion, definition, references, semantic tokens, inlay hints, document
+  symbols, workspace symbols, folding ranges, signature help, document highlights)
+- `test_apb_monitor.py` / `test_apb_cross_file.py` — cross-file symbol resolution
+- `test_interfaces.py` — interface and modport features
+- `test_elaborate_cache.py` — input-hash dedup logic
+- `test_hierarchy.py` — `callHierarchy/*` and `typeHierarchy/*` (hermetic, no example repo)
+
+A randomised long-running stress test (`test_stress.py`) simulates extended
+editing sessions against three large riscv-dv files. Run it manually (not
+part of `make integration`):
+
+```bash
+cargo build --release -p mimir-server
+MIMIR_STRESS_DURATION=60 python3 -m unittest tests.test_stress -v
+```
+
+Two integration tests are known incomplete (SV keyword completion, cross-file
+class member completion) and are left failing to track the gap.
 
 A typical inner-loop while adding a feature:
 
