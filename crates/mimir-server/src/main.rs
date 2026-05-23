@@ -21,6 +21,7 @@ use tower_lsp::{LspService, Server};
 mod ast_features;
 mod backend;
 mod completion_score;
+mod diagnostics;
 mod elaborate_service;
 mod filelist;
 mod format;

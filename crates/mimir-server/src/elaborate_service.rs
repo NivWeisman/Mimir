@@ -30,17 +30,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use mimir_slang::{
-    Diagnostic as SlangDiagnostic, ElaborateResult, Severity as SlangSeverity,
-};
+use mimir_ast::{MimirDiag};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url,
-};
+use tower_lsp::lsp_types::{Diagnostic, Url};
 use tower_lsp::Client;
 use tracing::{debug, info, warn};
 
+use crate::diagnostics::mimir_diag_to_lsp;
 use crate::slang_adapter::SlangAdapter;
 use crate::slang_service::{path_to_url, SlangService};
 
@@ -162,10 +159,7 @@ impl ElaborateService {
                 "sending compile request",
             );
             if let Some(outcome) = adapter.compile(&params, files_in_request).await {
-                let elab_result = ElaborateResult {
-                    diagnostics: outcome.diagnostics,
-                };
-                publish_slang_result(&lsp_client, &outcome.files_in_request, elab_result, &published)
+                publish_slang_result(&lsp_client, &outcome.files_in_request, outcome.diagnostics, &published)
                     .await;
                 *last_hash.write().await = Some(input_hash);
 
@@ -202,39 +196,6 @@ impl ElaborateService {
 // Diagnostic helpers
 // --------------------------------------------------------------------------
 
-/// Convert a slang [`SlangDiagnostic`] to its LSP [`Diagnostic`] shape.
-///
-/// `source` stays `"mimir"` so editors don't need two filter labels;
-/// `code` carries slang's stable diagnostic code (e.g. `"UnknownModule"`)
-/// so editors can group or filter per-code.
-pub(crate) fn slang_to_lsp_diagnostic(d: SlangDiagnostic) -> Diagnostic {
-    Diagnostic {
-        range: Range {
-            start: Position {
-                line: d.range.start.line,
-                character: d.range.start.character,
-            },
-            end: Position {
-                line: d.range.end.line,
-                character: d.range.end.character,
-            },
-        },
-        severity: Some(match d.severity {
-            SlangSeverity::Error => DiagnosticSeverity::ERROR,
-            SlangSeverity::Warning => DiagnosticSeverity::WARNING,
-            SlangSeverity::Information => DiagnosticSeverity::INFORMATION,
-            SlangSeverity::Hint => DiagnosticSeverity::HINT,
-        }),
-        code: Some(NumberOrString::String(d.code)),
-        source: Some("mimir".to_string()),
-        message: d.message,
-        related_information: None,
-        tags: None,
-        code_description: None,
-        data: None,
-    }
-}
-
 /// Publish a completed slang elaborate result as LSP diagnostics.
 ///
 /// Diffs against `slang_published` to ensure URLs that were flagged last
@@ -249,11 +210,11 @@ pub(crate) fn slang_to_lsp_diagnostic(d: SlangDiagnostic) -> Diagnostic {
 async fn publish_slang_result(
     lsp_client: &Client,
     files_in_request: &[Url],
-    result: ElaborateResult,
+    diagnostics: Vec<(String, MimirDiag)>,
     slang_published: &Arc<RwLock<HashSet<Url>>>,
 ) {
     let prev_snapshot = slang_published.read().await.clone();
-    let plan = plan_slang_publishes(files_in_request, result, &prev_snapshot);
+    let plan = plan_slang_publishes(files_in_request, diagnostics, &prev_snapshot);
 
     for (url, diags) in &plan.publishes {
         lsp_client
@@ -288,19 +249,19 @@ async fn publish_slang_result(
 ///    underlying error.
 fn plan_slang_publishes(
     files_in_request: &[Url],
-    result: ElaborateResult,
+    diagnostics: Vec<(String, MimirDiag)>,
     previous_published: &HashSet<Url>,
 ) -> SlangPublishPlan {
     let mut by_url: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
-    for d in result.diagnostics {
-        let Some(url) = path_to_url(&d.path) else {
-            warn!(path = %d.path, "could not map slang path back to a URL; dropping");
+    for (path, d) in diagnostics {
+        let Some(url) = path_to_url(&path) else {
+            warn!(path = %path, "could not map slang path back to a URL; dropping");
             continue;
         };
         by_url
             .entry(url)
             .or_default()
-            .push(slang_to_lsp_diagnostic(d));
+            .push(mimir_diag_to_lsp(&d));
     }
 
     let mut publishes: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
@@ -352,61 +313,22 @@ fn plan_slang_publishes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mimir_core::{Position as MPosition, Range as MRange};
-    use mimir_slang::ElaborateResult;
+    use mimir_ast::{DiagSeverity, MimirPos, MimirRange};
 
-    fn slang_diag_at(path: &str, code: &str) -> SlangDiagnostic {
-        SlangDiagnostic {
-            path: path.into(),
-            range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 1)),
-            severity: SlangSeverity::Error,
-            code: code.into(),
-            message: "boom".into(),
-        }
-    }
-
-    /// slang → LSP conversion preserves the slang-specific code string and
-    /// keeps the same `source` label as syntax diagnostics.
-    #[test]
-    fn slang_diagnostic_conversion_preserves_fields() {
-        let d = SlangDiagnostic {
-            path: "/proj/m.sv".into(),
-            range: MRange::new(MPosition::new(7, 0), MPosition::new(7, 12)),
-            severity: SlangSeverity::Error,
-            code: "UnknownModule".into(),
-            message: "module 'foo' not found".into(),
-        };
-        let lsp = slang_to_lsp_diagnostic(d);
-        assert_eq!(lsp.range.start.line, 7);
-        assert_eq!(lsp.range.end.character, 12);
-        assert_eq!(lsp.severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(lsp.source.as_deref(), Some("mimir"));
-        assert_eq!(
-            lsp.code,
-            Some(NumberOrString::String("UnknownModule".into()))
-        );
-        assert_eq!(lsp.message, "module 'foo' not found");
-    }
-
-    /// All four slang severity variants map to the right LSP severity.
-    #[test]
-    fn slang_severity_maps_completely() {
-        let cases = [
-            (SlangSeverity::Error, DiagnosticSeverity::ERROR),
-            (SlangSeverity::Warning, DiagnosticSeverity::WARNING),
-            (SlangSeverity::Information, DiagnosticSeverity::INFORMATION),
-            (SlangSeverity::Hint, DiagnosticSeverity::HINT),
-        ];
-        for (sev, expected) in cases {
-            let d = SlangDiagnostic {
-                path: "a.sv".into(),
-                range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 1)),
-                severity: sev,
-                code: "X".into(),
-                message: "m".into(),
-            };
-            assert_eq!(slang_to_lsp_diagnostic(d).severity, Some(expected));
-        }
+    /// Build a `(path, MimirDiag)` test fixture at the given path and code.
+    fn mimir_diag_at(path: &str, code: &str) -> (String, MimirDiag) {
+        (
+            path.into(),
+            MimirDiag {
+                range: MimirRange {
+                    start: MimirPos { line: 0, character: 0 },
+                    end:   MimirPos { line: 0, character: 1 },
+                },
+                severity: DiagSeverity::Error,
+                code:    code.into(),
+                message: "boom".into(),
+            },
+        )
     }
 
     /// Plan: every requested file gets a publish, including files with
@@ -415,10 +337,8 @@ mod tests {
     fn plan_publishes_every_requested_file_even_when_clean() {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let url_b = Url::parse("file:///proj/b.sv").unwrap();
-        let result = ElaborateResult {
-            diagnostics: vec![slang_diag_at("/proj/a.sv", "X")],
-        };
-        let plan = plan_slang_publishes(&[url_a.clone(), url_b.clone()], result, &HashSet::new());
+        let diags = vec![mimir_diag_at("/proj/a.sv", "X")];
+        let plan = plan_slang_publishes(&[url_a.clone(), url_b.clone()], diags, &HashSet::new());
 
         assert_eq!(plan.publishes.len(), 2);
         let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
@@ -435,10 +355,9 @@ mod tests {
     fn plan_clears_url_that_dropped_off() {
         let url_dropped = Url::parse("file:///proj/old.sv").unwrap();
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let result = ElaborateResult { diagnostics: vec![] };
         let prev = HashSet::from([url_dropped.clone()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], result, &prev);
+        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev);
 
         assert_eq!(plan.publishes.len(), 2);
         assert!(plan
@@ -457,10 +376,9 @@ mod tests {
     #[test]
     fn plan_does_not_double_publish_stale_url_in_request() {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let result = ElaborateResult { diagnostics: vec![] };
         let prev = HashSet::from([url_a.clone()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], result, &prev);
+        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev);
 
         assert_eq!(plan.publishes.len(), 1);
         assert!(plan.publishes[0].1.is_empty());
@@ -471,11 +389,9 @@ mod tests {
     #[test]
     fn plan_publishes_transitive_include_diagnostics() {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
-        let result = ElaborateResult {
-            diagnostics: vec![slang_diag_at("/proj/inc/uvm.svh", "X")],
-        };
+        let diags = vec![mimir_diag_at("/proj/inc/uvm.svh", "X")];
 
-        let plan = plan_slang_publishes(&[url_a.clone()], result, &HashSet::new());
+        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new());
 
         assert_eq!(plan.publishes.len(), 2);
         let inc_url = Url::parse("file:///proj/inc/uvm.svh").unwrap();

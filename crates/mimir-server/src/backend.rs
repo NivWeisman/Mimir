@@ -45,7 +45,7 @@ use mimir_syntax::{
     calls::{active_arg_index, call_site_at, call_sites_in, CallKind},
     inlay::hints_for,
     signature::signature_for,
-    Diagnostic as MDiagnostic, DiagnosticSeverity as MSeverity, Symbol, SymbolKind as MSymbolKind,
+    Diagnostic as MDiagnostic, Symbol, SymbolKind as MSymbolKind,
     SyntaxTree,
 };
 use ropey::Rope;
@@ -3845,36 +3845,12 @@ fn range_contains(outer: MRange, inner: MRange) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
-/// Map a tree-sitter (`mimir-syntax`) diagnostic onto the wire format
-/// `lsp_types` uses. Kept in a free function (not `From`) because both
-/// types live in crates we don't control, so the orphan rule would block a
-/// `From` impl.
+/// Map a tree-sitter (`mimir-syntax`) diagnostic onto the LSP wire format.
+///
+/// Delegates to [`crate::diagnostics`] so the severity/range/code mapping
+/// lives in exactly one place across both the tree-sitter and slang paths.
 fn syntax_to_lsp_diagnostic(d: MDiagnostic) -> Diagnostic {
-    Diagnostic {
-        range: Range {
-            start: Position {
-                line: d.range.start.line,
-                character: d.range.start.character,
-            },
-            end: Position {
-                line: d.range.end.line,
-                character: d.range.end.character,
-            },
-        },
-        severity: Some(match d.severity {
-            MSeverity::Error => DiagnosticSeverity::ERROR,
-            MSeverity::Warning => DiagnosticSeverity::WARNING,
-            MSeverity::Information => DiagnosticSeverity::INFORMATION,
-            MSeverity::Hint => DiagnosticSeverity::HINT,
-        }),
-        code: Some(NumberOrString::String(d.code.to_string())),
-        source: Some("mimir".to_string()),
-        message: d.message,
-        related_information: None,
-        tags: None,
-        code_description: None,
-        data: None,
-    }
+    crate::diagnostics::mimir_diag_to_lsp(&crate::diagnostics::syntax_diag_to_mimir(&d))
 }
 
 /// Merge tree-sitter and slang diagnostics for a single file into the LSP
@@ -3913,6 +3889,7 @@ fn merge_diagnostics(syntax: Vec<MDiagnostic>) -> Vec<Diagnostic> {
 mod tests {
     use super::*;
     use mimir_syntax::Diagnostic as MDiag;
+    use mimir_syntax::DiagnosticSeverity as MSeverity;
 
     /// Helper: a tree-sitter diagnostic at a given severity.
     fn syntax_diag(sev: MSeverity) -> MDiag {

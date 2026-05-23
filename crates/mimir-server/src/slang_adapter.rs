@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use mimir_ast::MimirAst;
-use mimir_slang::{Diagnostic as SlangDiagnostic, ElaborateParams};
+use mimir_ast::{DiagSeverity, MimirAst, MimirDiag, MimirPos, MimirRange};
+use mimir_slang::{Diagnostic as SlangDiag, ElaborateParams, Severity as SlangSeverity};
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::Url;
 use tracing::{debug, error};
@@ -32,8 +32,39 @@ pub(crate) struct CompileOutcome {
     /// [`crate::elaborate_service::ElaborateService`] to decide which
     /// files to clear diagnostics for.
     pub files_in_request: Vec<Url>,
-    /// All diagnostics produced during compilation.
-    pub diagnostics: Vec<SlangDiagnostic>,
+    /// All diagnostics produced during compilation, adapted to the
+    /// backend-agnostic [`MimirDiag`] shape. Each entry pairs the
+    /// file path (as reported by the sidecar) with its diagnostic.
+    pub diagnostics: Vec<(String, MimirDiag)>,
+}
+
+// --------------------------------------------------------------------------
+// Slang → MimirDiag adapter
+// --------------------------------------------------------------------------
+
+/// Convert one slang [`SlangDiag`] to the backend-agnostic
+/// `(file_path, MimirDiag)` pair.
+///
+/// Both types use `(line, UTF-16 character)` coordinates and the same
+/// four-bucket severity model — the conversion is a field-by-field copy.
+/// The file path is extracted from [`SlangDiag::path`] and returned
+/// separately so `MimirDiag` stays file-scope (no path field).
+fn slang_diag_to_mimir(d: SlangDiag) -> (String, MimirDiag) {
+    let diag = MimirDiag {
+        range: MimirRange {
+            start: MimirPos { line: d.range.start.line, character: d.range.start.character },
+            end:   MimirPos { line: d.range.end.line,   character: d.range.end.character   },
+        },
+        severity: match d.severity {
+            SlangSeverity::Error       => DiagSeverity::Error,
+            SlangSeverity::Warning     => DiagSeverity::Warning,
+            SlangSeverity::Information => DiagSeverity::Information,
+            SlangSeverity::Hint        => DiagSeverity::Hint,
+        },
+        code:    d.code,
+        message: d.message,
+    };
+    (d.path, diag)
 }
 
 // --------------------------------------------------------------------------
@@ -86,7 +117,7 @@ impl SlangAdapter {
                 );
                 Some(CompileOutcome {
                     files_in_request,
-                    diagnostics: result.diagnostics,
+                    diagnostics: result.diagnostics.into_iter().map(slang_diag_to_mimir).collect(),
                 })
             }
             Err(mimir_slang::ClientError::Busy) => {

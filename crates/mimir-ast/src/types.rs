@@ -17,6 +17,17 @@ impl MimirAst {
     pub fn find_file(&self, uri: &str) -> Option<&MimirFile> {
         self.files.iter().find(|f| f.uri == uri)
     }
+
+    /// Iterate all diagnostics across every file, paired with the file URI.
+    ///
+    /// Consumers that need to route diagnostics to editor windows by file
+    /// (e.g. `publishDiagnostics`) can use this instead of manually walking
+    /// `files[*].diagnostics`.
+    pub fn all_diagnostics(&self) -> impl Iterator<Item = (&str, &MimirDiag)> {
+        self.files
+            .iter()
+            .flat_map(|f| f.diagnostics.iter().map(|d| (f.uri.as_str(), d)))
+    }
 }
 
 /// All data Mimir extracted for a single source file.
