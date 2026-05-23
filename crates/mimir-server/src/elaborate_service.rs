@@ -39,8 +39,9 @@ use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url,
 };
 use tower_lsp::Client;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
+use crate::slang_adapter::SlangAdapter;
 use crate::slang_service::{path_to_url, SlangService};
 
 // --------------------------------------------------------------------------
@@ -61,35 +62,36 @@ struct SlangPublishPlan {
 // ElaborateService
 // --------------------------------------------------------------------------
 
-/// Elaborate lifecycle: debounce → dedup → sidecar call → diagnostic publish.
+/// Elaborate lifecycle: debounce → dedup → sidecar compile → diagnostic publish.
 ///
-/// Holds the same `Arc<SlangService>` as `Backend` (no extra data copies) and
-/// a `Client` clone for pushing diagnostics.
+/// Holds an `Arc<SlangAdapter>` (which wraps `SlangService`) and a `Client`
+/// clone for pushing diagnostics. The adapter owns the compile RPC call and
+/// the cached MimirAst; this service owns debounce, dedup, and publishing.
 pub(crate) struct ElaborateService {
-    /// Sidecar IPC + param assembly — shared with `Backend`.
-    slang: Arc<SlangService>,
+    /// Compile RPC driver + MimirAst cache — shared with `Backend`.
+    adapter: Arc<SlangAdapter>,
     /// Channel for pushing `publishDiagnostics` back to the editor.
     client: Client,
     /// One in-flight (sleeping or running) elaborate task per trigger URI.
     /// Aborted and replaced on every new edit for the same URI — the debounce.
     pending: Arc<RwLock<HashMap<Url, JoinHandle<()>>>>,
-    /// Hash of inputs sent to the last *successful* elaborate. The same
-    /// hash on the next call → skip the sidecar entirely.
+    /// Hash of inputs sent to the last *successful* compile. The same hash
+    /// on the next call → skip the sidecar entirely.
     last_hash: Arc<RwLock<Option<u64>>>,
     /// URLs we published non-empty slang diagnostics to last cycle.
     /// Diffed each cycle so stale squiggles are cleared when errors are fixed.
     published: Arc<RwLock<HashSet<Url>>>,
-    /// Latched `true` after the first successful elaborate logs its
-    /// per-file "indexed by startup slang elaborate" messages.
+    /// Latched `true` after the first successful compile logs its per-file
+    /// "indexed by startup slang elaborate" messages.
     startup_logged: Arc<AtomicBool>,
 }
 
 impl ElaborateService {
-    /// Construct the service from the shared `SlangService` Arc and a
-    /// `Client` clone. Both are cheap (reference-counted); no data is copied.
-    pub(crate) fn new(slang: Arc<SlangService>, client: Client) -> Self {
+    /// Construct the service from a shared `SlangAdapter` and a `Client`
+    /// clone. Both are cheap (reference-counted); no data is copied.
+    pub(crate) fn new(adapter: Arc<SlangAdapter>, client: Client) -> Self {
         Self {
-            slang,
+            adapter,
             client,
             pending: Arc::new(RwLock::new(HashMap::new())),
             last_hash: Arc::new(RwLock::new(None)),
@@ -111,7 +113,7 @@ impl ElaborateService {
     /// No-op when slang isn't configured or no project has been discovered
     /// (both are normal "tree-sitter only" states).
     pub(crate) async fn schedule(&self, trigger_uri: Url) {
-        let debounce = match self.slang.current_debounce().await {
+        let debounce = match self.adapter.slang().current_debounce().await {
             Some(d) => d,
             None => return,
         };
@@ -124,7 +126,7 @@ impl ElaborateService {
             }
         }
 
-        let slang_svc = self.slang.clone();
+        let adapter = self.adapter.clone();
         let pending = self.pending.clone();
         let published = self.published.clone();
         let last_hash = self.last_hash.clone();
@@ -135,7 +137,9 @@ impl ElaborateService {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(debounce).await;
 
-            let Some((params, files_in_request)) = slang_svc.build_elaborate_params().await else {
+            let Some((params, files_in_request)) =
+                adapter.slang().build_elaborate_params().await
+            else {
                 pending.write().await.remove(&trigger_for_task);
                 return;
             };
@@ -145,7 +149,7 @@ impl ElaborateService {
                 debug!(
                     hash = input_hash,
                     files = params.files.len(),
-                    "slang inputs unchanged since last elaborate; skipping",
+                    "slang inputs unchanged since last compile; skipping",
                 );
                 pending.write().await.remove(&trigger_for_task);
                 return;
@@ -155,26 +159,26 @@ impl ElaborateService {
                 files = params.files.len(),
                 include_dirs = params.include_dirs.len(),
                 hash = input_hash,
-                "sending elaborate request",
+                "sending compile request",
             );
-            match slang_svc.elaborate(&params).await {
-                Ok(result) => {
-                    publish_slang_result(&lsp_client, &files_in_request, result, &published)
-                        .await;
-                    *last_hash.write().await = Some(input_hash);
+            if let Some(outcome) = adapter.compile(&params, files_in_request).await {
+                let elab_result = ElaborateResult {
+                    diagnostics: outcome.diagnostics,
+                };
+                publish_slang_result(&lsp_client, &outcome.files_in_request, elab_result, &published)
+                    .await;
+                *last_hash.write().await = Some(input_hash);
 
-                    if startup_logged
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        for url in &files_in_request {
-                            info!(file = %url, "indexed by startup slang elaborate");
-                        }
+                if startup_logged
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    for url in &outcome.files_in_request {
+                        info!(file = %url, "indexed by startup slang compile");
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "slang elaborate failed");
-                }
+            } else {
+                debug!("compile returned no outcome; diagnostic state unchanged");
             }
 
             pending.write().await.remove(&trigger_for_task);

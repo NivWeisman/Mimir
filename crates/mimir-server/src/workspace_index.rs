@@ -182,10 +182,10 @@ impl WorkspaceIndex {
 
     /// Look up the entry whose declaration starts at `(url, line)`.
     ///
-    /// O(1) via the reverse location index. Used by `try_slang_hover` to
-    /// convert a slang-returned `(path, line)` pair into the matching
-    /// `Symbol` without scanning the entire index.
+    /// O(1) via the reverse location index. Converts a `(path, line)` pair
+    /// into the matching `Symbol` without scanning the entire index.
     #[must_use]
+    #[allow(dead_code)]
     pub fn lookup_by_location(&self, url: &Url, line: u32) -> Option<&Entry> {
         let name = self.by_location.get(&(url.clone(), line))?;
         self.by_name

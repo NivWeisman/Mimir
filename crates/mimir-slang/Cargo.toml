@@ -13,6 +13,7 @@ missing_docs = "warn"
 
 [dependencies]
 mimir-core = { workspace = true, features = ["serde"] }
+mimir-ast  = { workspace = true }
 
 # `process` lets us spawn the sidecar; `io-util` brings in `AsyncBufReadExt`
 # (`read_line`) and `AsyncWriteExt` (`write_all`). The other features come

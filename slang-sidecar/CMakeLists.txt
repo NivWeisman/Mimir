@@ -16,7 +16,7 @@
 
 cmake_minimum_required(VERSION 3.20)
 project(mimir-slang-sidecar
-    VERSION      0.1.4
+    VERSION      0.1.5
     DESCRIPTION  "NDJSON-over-stdio slang elaborator for the Mimir LSP"
     LANGUAGES    CXX
 )
@@ -60,7 +60,7 @@ set(SLANG_INCLUDE_PYLIB    OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slang
     GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
-    GIT_TAG        v10.0
+    GIT_TAG        v11.0
     GIT_SHALLOW    TRUE
 )
 

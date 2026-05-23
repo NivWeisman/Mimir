@@ -39,7 +39,6 @@
 
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -49,17 +48,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, instrument, warn, trace};
 
-/// Maximum wall-clock time an interactive sidecar request (definition,
-/// complete, hover, etc.) may run before the caller falls through to the
-/// tree-sitter fallback. Elaborate runs without a deadline because it is
-/// a background task — latency there is invisible to the user.
-const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(5);
-
-
 use crate::protocol::{
-    methods, CompleteParams, CompleteResult, DefinitionParams, DefinitionResult, ElaborateParams,
-    ElaborateResult, ImplementationParams, ImplementationResult, Request, Response, ResponseError,
-    SignatureHelpParams, SignatureHelpResult, TypeDefinitionParams, TypeDefinitionResult,
+    methods, CompileResult, ElaborateParams, Request, Response, ResponseError,
 };
 
 // --------------------------------------------------------------------------
@@ -289,75 +279,13 @@ where
         }
     }
 
-    /// Convenience wrapper for the [`methods::ELABORATE`] method.
-    pub async fn elaborate(
+    /// Convenience wrapper for the [`methods::COMPILE`] method.
+    pub async fn compile(
         &mut self,
         params: &ElaborateParams,
-    ) -> Result<ElaborateResult, ConnectionError> {
-        self.request(methods::ELABORATE, params).await
+    ) -> Result<CompileResult, ConnectionError> {
+        self.request(methods::COMPILE, params).await
     }
-
-    /// Convenience wrapper for the [`methods::DEFINITION`] method.
-    pub async fn definition(
-        &mut self,
-        params: &DefinitionParams,
-    ) -> Result<DefinitionResult, ConnectionError> {
-        self.request(methods::DEFINITION, params).await
-    }
-
-    /// Convenience wrapper for the [`methods::TYPE_DEFINITION`] method.
-    pub async fn type_definition(
-        &mut self,
-        params: &TypeDefinitionParams,
-    ) -> Result<TypeDefinitionResult, ConnectionError> {
-        self.request(methods::TYPE_DEFINITION, params).await
-    }
-
-    /// Convenience wrapper for the [`methods::IMPLEMENTATION`] method.
-    pub async fn implementation(
-        &mut self,
-        params: &ImplementationParams,
-    ) -> Result<ImplementationResult, ConnectionError> {
-        self.request(methods::IMPLEMENTATION, params).await
-    }
-
-    /// Convenience wrapper for the [`methods::COMPLETE`] method.
-    pub async fn complete(
-        &mut self,
-        params: &CompleteParams,
-    ) -> Result<CompleteResult, ConnectionError> {
-        self.request(methods::COMPLETE, params).await
-    }
-
-    /// Convenience wrapper for the [`methods::SIGNATURE_HELP`] method.
-    pub async fn signature_help(
-        &mut self,
-        params: &SignatureHelpParams,
-    ) -> Result<SignatureHelpResult, ConnectionError> {
-        self.request(methods::SIGNATURE_HELP, params).await
-    }
-}
-
-// --------------------------------------------------------------------------
-// interactive_request — timeout wrapper for editor-facing sidecar calls
-// --------------------------------------------------------------------------
-
-/// Wrap a sidecar future in [`INTERACTIVE_TIMEOUT`].
-///
-/// On expiry the future is dropped (the `MutexGuard<Connection>` inside it is
-/// released) and [`ConnectionError::Timeout`] is returned. The sidecar will
-/// still produce a response for the now-abandoned request; the next caller
-/// that acquires the lock will drain it via the stale-id logic in
-/// [`Connection::request`].
-async fn interactive_request<F, T>(fut: F) -> Result<T, ConnectionError>
-where
-    F: std::future::Future<Output = Result<T, ConnectionError>>,
-{
-    tokio::time::timeout(INTERACTIVE_TIMEOUT, fut)
-        .await
-        .map_err(|_| ConnectionError::Timeout {
-            secs: INTERACTIVE_TIMEOUT.as_secs(),
-        })?
 }
 
 // --------------------------------------------------------------------------
@@ -432,95 +360,16 @@ impl Client {
         })
     }
 
-    /// Run an `elaborate` request against the sidecar.
-    pub async fn elaborate(
+    /// Run a `compile` request against the sidecar.
+    ///
+    /// Elaborates all project files and serialises the full symbol table as a
+    /// [`CompileResult`] containing a [`MimirAst`] and a flat diagnostics list.
+    pub async fn compile(
         &self,
         params: &ElaborateParams,
-    ) -> Result<ElaborateResult, ClientError> {
+    ) -> Result<CompileResult, ClientError> {
         let mut conn = self.connection.lock().await;
-        Ok(conn.elaborate(params).await?)
-    }
-
-    /// Run a `definition` request against the sidecar.
-    ///
-    /// Uses `try_lock` so the call returns [`ClientError::Busy`] immediately
-    /// when the connection is occupied by a background elaborate. If the lock
-    /// is available but the sidecar doesn't respond within
-    /// [`INTERACTIVE_TIMEOUT`], returns [`ConnectionError::Timeout`] and
-    /// releases the lock so the stale response can be drained by the next
-    /// caller. In both cases the server falls through to the tree-sitter path.
-    pub async fn definition(
-        &self,
-        params: &DefinitionParams,
-    ) -> Result<DefinitionResult, ClientError> {
-        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
-        Ok(interactive_request(conn.definition(params)).await?)
-    }
-
-    /// Run a `typeDefinition` request against the sidecar.
-    ///
-    /// Returns the declaration site of the *type* of the symbol under the
-    /// cursor (e.g. `my_class` for a variable of type `my_class`). Empty
-    /// locations means no type declaration was found (built-in scalar,
-    /// void return, etc.) — trust-slang-on-empty applies.
-    ///
-    /// Uses `try_lock` + [`INTERACTIVE_TIMEOUT`]; see [`Client::definition`].
-    pub async fn type_definition(
-        &self,
-        params: &TypeDefinitionParams,
-    ) -> Result<TypeDefinitionResult, ClientError> {
-        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
-        Ok(interactive_request(conn.type_definition(params)).await?)
-    }
-
-    /// Run an `implementation` request against the sidecar.
-    ///
-    /// Returns all overrides of a virtual method in subclasses, or all
-    /// direct subclasses of a class. Empty locations means no implementations
-    /// were found (non-virtual method, leaf class, cursor not on a relevant
-    /// symbol).
-    ///
-    /// Uses `try_lock` + [`INTERACTIVE_TIMEOUT`]; see [`Client::definition`].
-    pub async fn implementation(
-        &self,
-        params: &ImplementationParams,
-    ) -> Result<ImplementationResult, ClientError> {
-        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
-        Ok(interactive_request(conn.implementation(params)).await?)
-    }
-
-    /// Run a `complete` request against the sidecar.
-    ///
-    /// Returns member-access (`obj.`) or package-scope (`pkg::`) completion
-    /// candidates for the expression left of the cursor. An empty `items`
-    /// vector means the sidecar could not resolve the LHS type or the type
-    /// has no members matching the prefix — the caller should fall through
-    /// to syntax-only candidates.
-    ///
-    /// Uses `try_lock` + [`INTERACTIVE_TIMEOUT`]; see [`Client::definition`].
-    pub async fn complete(
-        &self,
-        params: &CompleteParams,
-    ) -> Result<CompleteResult, ClientError> {
-        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
-        Ok(interactive_request(conn.complete(params)).await?)
-    }
-
-    /// Run a `signatureHelp` request against the sidecar.
-    ///
-    /// Returns the declared signature(s) of the callable at the cursor
-    /// position and the list of its formal parameters. An empty `signatures`
-    /// vector means the cursor is not inside a call's argument list or the
-    /// callable could not be resolved — the server falls back to the
-    /// tree-sitter index in that case.
-    ///
-    /// Uses `try_lock` + [`INTERACTIVE_TIMEOUT`]; see [`Client::definition`].
-    pub async fn signature_help(
-        &self,
-        params: &SignatureHelpParams,
-    ) -> Result<SignatureHelpResult, ClientError> {
-        let mut conn = self.connection.try_lock().map_err(|_| ClientError::Busy)?;
-        Ok(interactive_request(conn.signature_help(params)).await?)
+        Ok(conn.compile(params).await?)
     }
 
     /// Send the `shutdown` request, then wait for the child to exit.
@@ -606,32 +455,31 @@ mod tests {
         )
     }
 
-    /// Round-trip: client sends `elaborate`, fake sidecar echoes back a
-    /// canned `ElaborateResult` with one diagnostic, client decodes it.
+    /// Round-trip: client sends `compile`, fake sidecar echoes back a
+    /// canned `CompileResult` with one diagnostic, client decodes it.
     #[tokio::test]
-    async fn elaborate_request_response_roundtrip() {
+    async fn compile_request_response_roundtrip() {
         let ((c_r, c_w), (mut s_r, mut s_w)) = pair();
 
-        // Sidecar role-play. Reads one line, parses the Request, sends
-        // back a hard-coded ElaborateResult with one error diagnostic.
         let sidecar = tokio::spawn(async move {
             let mut line = String::new();
             s_r.read_line(&mut line).await.unwrap();
             let req: Request = serde_json::from_str(&line).unwrap();
-            assert_eq!(req.method, methods::ELABORATE);
+            assert_eq!(req.method, methods::COMPILE);
 
-            let result = ElaborateResult {
-                diagnostics: vec![Diagnostic {
-                    path: "a.sv".into(),
-                    range: Range::new(Position::new(0, 0), Position::new(0, 4)),
-                    severity: Severity::Error,
-                    code: "ExpectedSemicolon".into(),
-                    message: "expected ;".into(),
-                }],
-            };
             let resp = Response {
                 id: req.id,
-                result: Some(serde_json::to_value(result).unwrap()),
+                result: Some(serde_json::json!({
+                    "ast": {"files": []},
+                    "diagnostics": [{
+                        "path": "a.sv",
+                        "range": {"start": {"line": 0, "character": 0},
+                                  "end":   {"line": 0, "character": 4}},
+                        "severity": "error",
+                        "code": "ExpectedSemicolon",
+                        "message": "expected ;"
+                    }]
+                })),
                 error: None,
             };
             let mut out = serde_json::to_string(&resp).unwrap();
@@ -650,7 +498,7 @@ mod tests {
             defines: vec![],
             top: None,
         };
-        let result = conn.elaborate(&params).await.expect("elaborate ok");
+        let result = conn.compile(&params).await.expect("compile ok");
         sidecar.await.unwrap();
 
         assert_eq!(result.diagnostics.len(), 1);
@@ -687,7 +535,7 @@ mod tests {
             defines: vec![],
             top: None,
         };
-        let err = conn.elaborate(&params).await.unwrap_err();
+        let err = conn.compile(&params).await.unwrap_err();
         sidecar.await.unwrap();
 
         match err {
@@ -719,7 +567,7 @@ mod tests {
             defines: vec![],
             top: None,
         };
-        let err = conn.elaborate(&params).await.unwrap_err();
+        let err = conn.compile(&params).await.unwrap_err();
         sidecar.await.unwrap();
 
         assert!(matches!(err, ConnectionError::Closed));
@@ -738,7 +586,7 @@ mod tests {
             let req: Request = serde_json::from_str(&line).unwrap();
             let resp = Response {
                 id: req.id.wrapping_add(999), // jump ahead → protocol error
-                result: Some(serde_json::json!({"diagnostics": []})),
+                result: Some(serde_json::json!({"ast": {"files": []}, "diagnostics": []})),
                 error: None,
             };
             let mut out = serde_json::to_string(&resp).unwrap();
@@ -748,7 +596,7 @@ mod tests {
 
         let mut conn = Connection::new(c_r, c_w);
         let err = conn
-            .elaborate(&ElaborateParams {
+            .compile(&ElaborateParams {
                 files: vec![],
                 include_dirs: vec![],
                 defines: vec![],
@@ -782,7 +630,7 @@ mod tests {
             // Stale response for the prior cancelled request.
             let stale = Response {
                 id: 1,
-                result: Some(serde_json::json!({"diagnostics": []})),
+                result: Some(serde_json::json!({"ast": {"files": []}, "diagnostics": []})),
                 error: None,
             };
             let mut out = serde_json::to_string(&stale).unwrap();
@@ -793,7 +641,7 @@ mod tests {
             // Fresh response for the current request.
             let fresh = Response {
                 id: 2,
-                result: Some(serde_json::json!({"diagnostics": []})),
+                result: Some(serde_json::json!({"ast": {"files": []}, "diagnostics": []})),
                 error: None,
             };
             let mut out = serde_json::to_string(&fresh).unwrap();
@@ -805,7 +653,7 @@ mod tests {
         // written but never read (Tokio task aborted before read_line).
         let mut conn = Connection::with_next_id(c_r, c_w, 2);
         let result = conn
-            .elaborate(&ElaborateParams {
+            .compile(&ElaborateParams {
                 files: vec![],
                 include_dirs: vec![],
                 defines: vec![],
@@ -830,7 +678,7 @@ mod tests {
                 let req: Request = serde_json::from_str(&line).unwrap();
                 let resp = Response {
                     id: req.id,
-                    result: Some(serde_json::json!({"diagnostics": []})),
+                    result: Some(serde_json::json!({"ast": {"files": []}, "diagnostics": []})),
                     error: None,
                 };
                 let mut out = serde_json::to_string(&resp).unwrap();
@@ -846,8 +694,8 @@ mod tests {
             defines: vec![],
             top: None,
         };
-        let _ = conn.elaborate(&p).await.unwrap();
-        let _ = conn.elaborate(&p).await.unwrap();
+        let _ = conn.compile(&p).await.unwrap();
+        let _ = conn.compile(&p).await.unwrap();
         sidecar.await.unwrap();
     }
 

@@ -19,6 +19,7 @@ path = "src/main.rs"
 mimir-core   = { workspace = true }
 mimir-syntax = { workspace = true }
 mimir-slang  = { workspace = true }
+mimir-ast    = { workspace = true }
 tree-sitter  = { workspace = true }
 
 tower-lsp          = { workspace = true }

@@ -4,37 +4,20 @@
 // writes one JSON response per line to stdout. All logging goes to stderr
 // (stdout is reserved for the protocol — same constraint as an LSP server).
 //
-// Wire shape mirrors `mimir-slang::protocol`. Methods today:
-//   * "elaborate"       — preprocess + parse + elaborate the supplied files,
-//                         return diagnostics in LSP coordinates.
-//   * "definition"      — same compile front-end plus cursor; returns the
-//                         declaration site of the symbol under the cursor.
-//   * "typeDefinition"  — like definition but resolves to the *type* of the
-//                         symbol under the cursor (e.g. `my_class` for a
-//                         variable of that type).
-//   * "implementation"  — cursor on virtual method → all overrides in
-//                         subclasses; cursor on class → all direct subclasses.
-//   * "complete"        — completion candidates keyed by `kind`:
-//                           "memberAccess"  — obj. → fields/methods of LHS type
-//                           "packageScope"  — pkg:: → members of a package
-//                           "identifier"    — scope-aware identifier completion
-//                           "macro"         — `define names in the compilation
-//   * "shutdown"        — reply with null result, exit cleanly.
+// Wire shape mirrors `mimir-slang::protocol`. Methods:
+//   * "compile"   — elaborate the supplied files and return the full
+//                   MimirAst JSON (schema: mimir-ast/src/types.rs) plus
+//                   diagnostics.
+//   * "shutdown"  — reply with null result, exit cleanly.
 //
 // Anything else is replied to with `error.code = -32601` ("method not
 // found") and the loop continues so a misbehaving client doesn't take the
 // sidecar down.
-//
-// The handler is intentionally a free function (not a class) — there's no
-// shared state between requests today. When that changes (e.g. caching a
-// `Compilation` across edits) we'll fold it into a Server class.
 
-#include <cctype>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -44,27 +27,21 @@
 
 #include <nlohmann/json.hpp>
 
-#include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
-#include <slang/ast/Lookup.h>
 #include <slang/ast/Symbol.h>
-#include <slang/ast/expressions/CallExpression.h>
-#include <slang/ast/expressions/MiscExpressions.h>
-#include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/symbols/ClassSymbols.h>
 #include <slang/ast/symbols/InstanceSymbols.h>
+#include <slang/ast/symbols/ParameterSymbols.h>
 #include <slang/ast/symbols/SubroutineSymbols.h>
+#include <slang/ast/symbols/PortSymbols.h>
 #include <slang/ast/symbols/ValueSymbol.h>
-#include <slang/ast/types/DeclaredType.h>
 #include <slang/ast/types/Type.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/Diagnostics.h>
 #include <slang/parsing/Preprocessor.h>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxKind.h>
-#include <slang/syntax/SyntaxNode.h>
 #include <slang/syntax/SyntaxTree.h>
-#include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceLocation.h>
 #include <slang/text/SourceManager.h>
 #include <slang/util/Bag.h>
@@ -119,32 +96,6 @@ static uint32_t utf8_prefix_to_utf16_units(std::string_view prefix) {
 // points, not bytes. A client never points at the middle of a UTF-8
 // sequence; if it did, we round forward to the start of the next
 // codepoint, which is the same boundary `utf8_prefix_to_utf16_units`
-// would treat as one code unit.
-static size_t utf16_to_byte_offset(std::string_view line, uint32_t utf16_char) {
-    uint32_t units = 0;
-    size_t i = 0;
-    while (i < line.size() && units < utf16_char) {
-        unsigned char b = static_cast<unsigned char>(line[i]);
-        if (b < 0x80) {
-            units += 1;
-            i += 1;
-        } else if ((b & 0xE0) == 0xC0) {
-            units += 1;
-            i += 2;
-        } else if ((b & 0xF0) == 0xE0) {
-            units += 1;
-            i += 3;
-        } else if ((b & 0xF8) == 0xF0) {
-            units += 2;
-            i += 4;
-        } else {
-            units += 1;
-            i += 1;
-        }
-    }
-    return i;
-}
-
 // --- LSP position from a slang SourceLocation ----------------------------
 
 struct LspPos {
@@ -186,39 +137,6 @@ static LspPos to_lsp_pos(const slang::SourceManager& sm, slang::SourceLocation l
     auto utf16 = utf8_prefix_to_utf16_units(buffer_text.substr(cursor, prefix_bytes));
 
     return {line_1based - 1, utf16};
-}
-
-// LSP `(line, character)` → byte offset within a slang `SourceBuffer`.
-//
-// Walks the buffer linewise to find the start of `lsp_line`, then
-// converts the UTF-16 `lsp_char` to a byte offset within that line.
-// Returns `nullopt` when the line index runs off the end of the buffer.
-static std::optional<size_t> lsp_position_to_byte_offset(
-    const slang::SourceManager& sm,
-    slang::BufferID buffer,
-    uint32_t lsp_line,
-    uint32_t lsp_char) {
-    auto text = sm.getSourceText(buffer);
-    size_t cursor = 0;
-    uint32_t cur_line = 0;
-    while (cur_line < lsp_line && cursor < text.size()) {
-        if (text[cursor] == '\n') {
-            ++cur_line;
-        }
-        ++cursor;
-    }
-    if (cur_line < lsp_line) {
-        return std::nullopt;  // line is past EOF
-    }
-
-    // Slice the line out (without trailing newline) so the UTF-16 walk
-    // doesn't run into the next line's bytes.
-    size_t line_end = cursor;
-    while (line_end < text.size() && text[line_end] != '\n') {
-        ++line_end;
-    }
-    auto line_view = text.substr(cursor, line_end - cursor);
-    return cursor + utf16_to_byte_offset(line_view, lsp_char);
 }
 
 // --- Severity mapping ----------------------------------------------------
@@ -394,1207 +312,282 @@ static json diagnostics_for_compilation(const slang::SourceManager& sm,
     return diagnostics;
 }
 
-// --- elaborate handler ---------------------------------------------------
+// --- compile handler (MimirAst export) -----------------------------------
+//
+// Exports the elaborated symbol table as a MimirAst JSON document matching
+// the schema in `crates/mimir-ast/src/types.rs`. Called by the "compile"
+// wire method. Produces:
+//   { "ast": { "files": [...] }, "diagnostics": [...] }
+//
+// All positions are UTF-16 code units (same as every other handler).
 
-static json handle_elaborate(const json& params) {
-    auto built = build_compilation(params);
-    json result;
-    result["diagnostics"] = diagnostics_for_compilation(*built.sm, *built.compilation);
-    return result;
+static json make_mimir_range(const slang::SourceManager& sm, slang::SourceRange r) {
+    auto s = to_lsp_pos(sm, r.start());
+    auto e = to_lsp_pos(sm, r.end());
+    return {{"start", {{"line", s.line}, {"character", s.character}}},
+            {"end",   {{"line", e.line}, {"character", e.character}}}};
 }
 
-// --- Stage 4: macro `define resolution -----------------------------------
-//
-// Macro invocations (`MY_MACRO) are preprocessed away before the AST is
-// built, so DefinitionFinder never sees them. They survive as
-// TriviaKind::Directive trivia (containing a MacroUsageSyntax) on the
-// first token of each macro's expansion. We scan those trivia entries
-// looking for one whose source range covers the cursor, then look the name
-// up in the compilation's DefineDirectiveSyntax list.
-//
-// This visitor must run BEFORE DefinitionFinder: if the cursor is on a
-// macro name, DefinitionFinder returns nothing (or, worse, resolves a
-// same-named identifier inside the expansion body).
-
-struct MacroWalker : public slang::syntax::SyntaxVisitor<MacroWalker> {
-    const slang::SourceManager* sm;
-    const std::string& target_path;
-    uint32_t target_offset;
-    const slang::syntax::MacroUsageSyntax* found = nullptr;
-
-    MacroWalker(const slang::SourceManager* sm_,
-                const std::string& path,
-                uint32_t offset)
-        : sm(sm_), target_path(path), target_offset(offset) {}
-
-    void visitToken(slang::parsing::Token t) {
-        if (found) return;
-        for (const auto& tr : t.trivia()) {
-            if (tr.kind != slang::parsing::TriviaKind::Directive) continue;
-            auto* s = tr.syntax();
-            if (!s || s->kind != slang::syntax::SyntaxKind::MacroUsage) continue;
-            auto* u = static_cast<const slang::syntax::MacroUsageSyntax*>(s);
-            auto r = u->directive.range();
-            if (!r.start().valid() || !r.end().valid()) continue;
-            auto orig_s = sm->getFullyOriginalLoc(r.start());
-            if (sm->getFullPath(orig_s.buffer()).string() != target_path) continue;
-            auto orig_e = sm->getFullyOriginalLoc(r.end());
-            if (orig_s.offset() <= target_offset && target_offset < orig_e.offset()) {
-                found = u;
-                return;
-            }
-        }
+static json make_mimir_point_range(const slang::SourceManager& sm,
+                                   slang::SourceLocation loc) {
+    if (!loc.valid()) {
+        return {{"start", {{"line", 0}, {"character", 0}}},
+                {"end",   {{"line", 0}, {"character", 0}}}};
     }
-};
-
-// Returns the DefineDirectiveSyntax* for the macro whose `reference spans
-// cursor, or nullptr. Walks directive trivia across all compiled trees;
-// looks up the define name in all trees' getDefinedMacros() lists.
-//
-// O(tokens + defines) with early exit on first cursor hit. Cheap enough
-// for interactive latency — the cursor's compilation unit is typically
-// one file.
-static const slang::syntax::DefineDirectiveSyntax*
-find_macro_at_cursor(
-    const slang::ast::Compilation& compilation,
-    const slang::SourceManager& sm,
-    const std::string& target_path,
-    uint32_t target_offset) {
-
-    MacroWalker walker(&sm, target_path, target_offset);
-    for (const auto& tree : compilation.getSyntaxTrees()) {
-        tree->root().visit(walker);
-        if (walker.found) break;
-    }
-    if (!walker.found) return nullptr;
-
-    // Strip the leading backtick from the directive token's raw text to
-    // get the plain name ("MY_MACRO") used as the key in getDefinedMacros().
-    std::string_view macro_name = walker.found->directive.rawText();
-    if (!macro_name.empty() && macro_name[0] == '`')
-        macro_name = macro_name.substr(1);
-
-    // Search all trees for the matching define. Headers pulled in first
-    // in the filelist typically hold the define; searching all trees
-    // handles the cross-file case transparently.
-    for (const auto& tree : compilation.getSyntaxTrees()) {
-        for (const auto* def : tree->getDefinedMacros()) {
-            if (def && def->name.valueText() == macro_name)
-                return def;
-        }
-    }
-    return nullptr;
+    auto p = to_lsp_pos(sm, loc);
+    return {{"start", {{"line", p.line}, {"character", p.character}}},
+            {"end",   {{"line", p.line}, {"character", p.character}}}};
 }
 
-// --- definition handler --------------------------------------------------
-//
-// AST visitor that finds the `ValueExpressionBase` (i.e. an identifier
-// reference whose AST-resolution slang has already done) whose source
-// range covers the cursor. We record the deepest such expression — for
-// `pkg::sym` and `u_dut.fsm.state`, slang lowers the dotted path to a
-// `HierarchicalValueExpression` whose `symbol` is the final declaration,
-// which is exactly the F12 target.
-//
-// What we cover today:
-// * variable / parameter / port / class-field references
-//   (`NamedValueExpression`)
-// * hierarchical paths like `u_dut.fsm.state`
-//   (`HierarchicalValueExpression`)
-// * `obj.member` access (`MemberAccessExpression`)
-// * subroutine calls — `f(x)`, `obj.method()` (`CallExpression`)
-// * type references in declarations — cursor on the type token of
-//   `my_class c;` resolves to `class my_class` (`ValueSymbol` + its
-//   declared type's syntax range)
-// * module / interface instantiations — cursor on the type token of
-//   `apb_master u_dut(...)` resolves to `module apb_master`
-//   (`InstanceSymbol`)
-// * base-class references in `extends` clauses — cursor on `uvm_agent`
-//   in `class apb_agent extends uvm_agent;` resolves to the base
-//   class declaration (`ClassType` + its extendsClause syntax range)
-//
-// Still deferred (separate slices):
-// * macro expansions (`` `MY_MACRO ``) — the slang preprocessor's
-//   macro-definition map is exposed but stitching its locations back
-//   through `SourceManager::getOriginalLoc()` to a `` `define `` site
-//   needs more care than this slice spends.
-struct DefinitionFinder : public slang::ast::ASTVisitor<DefinitionFinder,
-                                                       /*VisitStatements=*/true,
-                                                       /*VisitExpressions=*/true> {
-    // SourceManager pointer so `covers_target` can resolve a symbol's
-    // buffer back to a filename. Set in `handle_definition`.
-    const slang::SourceManager* sm = nullptr;
-    // Cursor identity: path + byte-offset. We deliberately *don't* key
-    // on `BufferID` — slang regularly ends up with two buffers for the
-    // same file (e.g. one we seeded via `assignText` for the open
-    // editor buffer, plus a second one the preprocessor loaded from
-    // disk while resolving `` `include `` in another compilation
-    // unit). The AST attaches to the preprocessor's buffer; the cursor
-    // lives in ours; matching by path makes them meet.
-    std::string target_path;
-    uint32_t target_offset = 0;
-    const slang::ast::Symbol* found = nullptr;
-    // Track the smallest containing range so an outer
-    // `MemberAccessExpression` wrapping a `NamedValueExpression`
-    // doesn't shadow the inner one when the cursor is on the inner.
-    uint32_t best_width = UINT32_MAX;
-
-    bool covers_target(slang::SourceRange r) const {
-        if (!r.start().valid() || !r.end().valid() || sm == nullptr) return false;
-        auto orig_start = sm->getFullyOriginalLoc(r.start());
-        // `getFullPath` returns the absolute filesystem path slang
-        // resolved the buffer to. `getFileName` is "proximised"
-        // (relativised against CWD), which collapses `\`include`d
-        // files to their bare filename and breaks the comparison
-        // against our absolute `target_path`.
-        auto full = sm->getFullPath(orig_start.buffer()).string();
-        if (full != target_path) return false;
-        return orig_start.offset() <= target_offset
-            && target_offset < sm->getFullyOriginalLoc(r.end()).offset();
-    }
-
-    void record(slang::SourceRange r, const slang::ast::Symbol& sym) {
-        auto width = static_cast<uint32_t>(r.end().offset() - r.start().offset());
-        if (width <= best_width) {
-            best_width = width;
-            found = &sym;
-        }
-    }
-
-    void handle(const slang::ast::NamedValueExpression& e) {
-        if (covers_target(e.sourceRange)) record(e.sourceRange, e.symbol);
-        visitDefault(e);
-    }
-
-    void handle(const slang::ast::HierarchicalValueExpression& e) {
-        if (covers_target(e.sourceRange)) record(e.sourceRange, e.symbol);
-        visitDefault(e);
-    }
-
-    void handle(const slang::ast::MemberAccessExpression& e) {
-        // The member-access expression's `sourceRange` covers the whole
-        // `obj.member` span. Cursor on the *member* name resolves to
-        // the field; cursor on `obj` is caught by the inner
-        // NamedValueExpression visit (visitDefault below).
-        if (covers_target(e.sourceRange)) record(e.sourceRange, e.member);
-        visitDefault(e);
-    }
-
-    // `f(x)` / `obj.method()`. For user-defined subroutines we record
-    // the resolved `SubroutineSymbol`. System calls (`$display`, ...)
-    // have no user declaration to jump to and are skipped.
-    void handle(const slang::ast::CallExpression& e) {
-        if (!e.isSystemCall() && covers_target(e.sourceRange)) {
-            // The variant holds `const SubroutineSymbol*`; `get_if`
-            // returns a `const SubroutineSymbol* const*`.
-            if (auto* sub_ptr = std::get_if<const slang::ast::SubroutineSymbol*>(&e.subroutine);
-                sub_ptr != nullptr && *sub_ptr != nullptr) {
-                record(e.sourceRange, **sub_ptr);
-            }
-        }
-        visitDefault(e);
-    }
-
-    // `apb_master u_dut(...)`. Each `InstanceSymbol` corresponds to one
-    // elaborated instance; an array `m u_arr [3:0] (...)` produces four
-    // sibling `InstanceSymbol`s sharing one `HierarchyInstantiationSyntax`
-    // parent. The cursor-on-type case fires on whichever sibling we
-    // visit first; the smallest-width tie-break keeps the result stable.
-    void handle(const slang::ast::InstanceSymbol& s) {
-        if (auto* inst_syn = s.getSyntax(); inst_syn != nullptr) {
-            auto* parent = inst_syn->parent;
-            if (parent != nullptr &&
-                parent->kind == slang::syntax::SyntaxKind::HierarchyInstantiation) {
-                auto& hi =
-                    *static_cast<const slang::syntax::HierarchyInstantiationSyntax*>(parent);
-                auto type_range = hi.type.range();
-                if (covers_target(type_range)) {
-                    record(type_range, s.getDefinition());
-                }
-            }
-        }
-        visitDefault(s);
-    }
-
-    // Type references in value declarations: `my_t x;`, `my_class c;`,
-    // `parameter T p = ...`, ANSI port `input my_t a`. The variable's
-    // `DeclaredType` carries the syntax range covering the type token;
-    // when the cursor is in that range we resolve to the type symbol
-    // (typedef alias, class type, struct type, …). Built-in scalars
-    // (`logic`, `bit`) have no `Type::getSyntax()` and produce no
-    // location — `symbol_to_definition_location` already filters those.
-    //
-    // Constrained-auto template so the visitor's static dispatch picks
-    // up every concrete `ValueSymbol` subclass (VariableSymbol,
-    // ParameterSymbol, NetSymbol, FieldSymbol, FormalArgumentSymbol,
-    // PortSymbol, …) without us listing each one. The slang
-    // `visitDefault` static-asserts non-final classes, so we must
-    // accept the most-derived type, not the base.
-    void handle(std::derived_from<slang::ast::ValueSymbol> auto& v) {
-        if (auto* type_syn = v.getDeclaredType()->getTypeSyntax(); type_syn != nullptr) {
-            auto range = type_syn->sourceRange();
-            if (covers_target(range)) {
-                record(range, v.getDeclaredType()->getType());
-            }
-        }
-        visitDefault(v);
-    }
-
-    // `class apb_agent extends uvm_agent;` — cursor on the base class
-    // name in the `extends` clause. Resolves to the base `ClassType`,
-    // whose `getSyntax()` is the base class's declaration. Without
-    // this the visitor only sees the class's own decl + members and
-    // F12 on the base name returns nothing.
-    void handle(const slang::ast::ClassType& c) {
-        if (auto* syn = c.getSyntax();
-            syn != nullptr
-            && syn->kind == slang::syntax::SyntaxKind::ClassDeclaration) {
-            auto& class_syn =
-                *static_cast<const slang::syntax::ClassDeclarationSyntax*>(syn);
-            if (class_syn.extendsClause != nullptr) {
-                auto range = class_syn.extendsClause->baseName->sourceRange();
-                if (covers_target(range)) {
-                    if (auto* base = c.getBaseClass(); base != nullptr) {
-                        record(range, *base);
-                    }
-                }
-            }
-        }
-        visitDefault(c);
-    }
-};
-
-// Convert a found `Symbol`'s declaration site to a JSON
-// `DefinitionLocation`. Prefers `getSyntax()->sourceRange()` (the entire
-// declaration token, used as the highlight range) and falls back to
-// `Symbol::location` as a zero-width point when there's no syntax.
-//
-// Path resolution is two-tier:
-//   1. Reverse-search `buffers_by_path` so files the client sent in
-//      `files[]` round-trip their exact path string back. This keeps
-//      the editor's URL matching deterministic for the open buffer and
-//      any explicit filelist entry.
-//   2. Fall back to `sm.getFileName(orig_start)` for buffers slang
-//      loaded itself via `` `include `` resolution. UVM-style projects
-//      list a single top in the filelist (e.g. `apb.sv`) and pull every
-//      class through `` `include `` from the package wrapper, so this
-//      fallback is the *common* case, not an edge. The path slang
-//      returns is the absolute filesystem path it resolved through the
-//      request's `+incdir+` — directly usable by `Url::from_file_path`
-//      on the Rust side.
-//
-// Returns `nullopt` when the symbol's location can't be resolved at
-// all — built-in symbols, synthesised library cells, slang-internal
-// pseudo-buffers — so the caller turns that into an empty `locations`
-// array.
-static std::optional<json> symbol_to_definition_location(
-    const slang::SourceManager& sm,
-    const slang::ast::Symbol& sym,
-    const std::unordered_map<std::string, slang::BufferID>& buffers_by_path) {
-    using namespace slang;
-
-    SourceLocation loc_start = sym.location;
-    SourceLocation loc_end = sym.location;
-
-    if (auto* syn = sym.getSyntax(); syn != nullptr) {
-        auto r = syn->sourceRange();
-        if (r.start().valid() && r.end().valid()) {
-            loc_start = r.start();
-            loc_end = r.end();
-        }
-    }
-
-    if (!loc_start.valid()) {
-        return std::nullopt;
-    }
-
-    // Resolve the declaration's buffer back to a path the client can
-    // navigate to. First try the forward map for an exact-string
-    // round-trip; fall back to slang's own filename for `` `include ``'d
-    // buffers the client never sent.
-    auto orig_start = sm.getFullyOriginalLoc(loc_start);
-    auto target_buffer = orig_start.buffer();
-    std::string path_out;
-    for (const auto& [path, buf_id] : buffers_by_path) {
-        if (buf_id == target_buffer) {
-            path_out = path;
-            break;
-        }
-    }
-    if (path_out.empty()) {
-        // `getFullPath` returns the absolute filesystem path slang
-        // resolved the buffer to (via `+incdir+` for `` `include ``s).
-        // Prefer it over `getFileName`, which proximises to a bare
-        // filename and isn't navigable by `Url::from_file_path` on the
-        // Rust side.
-        path_out = sm.getFullPath(orig_start.buffer()).string();
-    }
-    if (path_out.empty()) {
-        // Buffer has no filename (slang-internal pseudo-buffer) — no
-        // file for the editor to open.
-        return std::nullopt;
-    }
-
-    auto start = to_lsp_pos(sm, loc_start);
-    auto end = to_lsp_pos(sm, loc_end);
-
-    json out;
-    out["path"] = std::move(path_out);
-    out["range"] = {
-        {"start", {{"line", start.line}, {"character", start.character}}},
-        {"end",   {{"line", end.line},   {"character", end.character}}},
-    };
-    return out;
+static std::string loc_to_file_path(const slang::SourceManager& sm,
+                                    slang::SourceLocation loc) {
+    if (!loc.valid()) return {};
+    auto orig = sm.getFullyOriginalLoc(loc);
+    if (!orig.valid()) return {};
+    return sm.getFullPath(orig.buffer()).string();
 }
 
-static json handle_definition(const json& params) {
-    auto built = build_compilation(params);
-    auto& sm = *built.sm;
-    auto& compilation = *built.compilation;
+// Forward declaration — symbol_to_mimir_decl and extract_members are
+// mutually recursive for nested types (class-inside-class, etc.).
+static json symbol_to_mimir_decl(const slang::SourceManager& sm,
+                                  const slang::ast::Symbol& sym,
+                                  bool recurse_members);
 
-    json result;
-    result["locations"] = json::array();
-
-    const auto target_path = params.value("target_path", std::string{});
-    auto buf_it = built.buffers_by_path.find(target_path);
-    if (buf_it == built.buffers_by_path.end()) {
-        // The cursor's file isn't part of this request. Nothing the
-        // sidecar can resolve; the server's trust-slang-on-empty rule
-        // means the editor sees no result.
-        std::cerr << "[mimir-slang-sidecar] definition: target_path not in request: "
-                  << target_path << '\n';
-        return result;
-    }
-
-    json pos = params.value("target_position", json::object());
-    uint32_t lsp_line = pos.value("line", 0u);
-    uint32_t lsp_char = pos.value("character", 0u);
-
-    auto byte_offset = lsp_position_to_byte_offset(sm, buf_it->second, lsp_line, lsp_char);
-    if (!byte_offset) {
-        return result;
-    }
-
-    // Stage 4: cursor on a macro reference (`MY_MACRO) — check trivia
-    // before running the AST visitor. Macro usages are expanded away
-    // from the AST; DefinitionFinder would find nothing (or the wrong
-    // symbol inside the expansion body).
-    auto cursor_offset = static_cast<uint32_t>(*byte_offset);
-    if (const auto* macro_def =
-            find_macro_at_cursor(compilation, sm, target_path, cursor_offset)) {
-        // Report the `define name token's range as the jump target.
-        auto name_range = macro_def->name.range();
-        auto orig_start = sm.getFullyOriginalLoc(name_range.start());
-        std::string def_path;
-        for (const auto& [path, buf_id] : built.buffers_by_path) {
-            if (buf_id == orig_start.buffer()) {
-                def_path = path;
-                break;
-            }
-        }
-        if (def_path.empty())
-            def_path = sm.getFullPath(orig_start.buffer()).string();
-        if (!def_path.empty()) {
-            auto start = to_lsp_pos(sm, name_range.start());
-            auto end   = to_lsp_pos(sm, name_range.end());
-            json loc;
-            loc["path"] = std::move(def_path);
-            loc["range"] = {
-                {"start", {{"line", start.line}, {"character", start.character}}},
-                {"end",   {{"line", end.line},   {"character", end.character}}},
-            };
-            result["locations"].push_back(std::move(loc));
-            return result;
-        }
-    }
-
-    DefinitionFinder finder;
-    finder.sm = &sm;
-    finder.target_path = target_path;
-    finder.target_offset = cursor_offset;
-    compilation.getRoot().visit(finder);
-
-    if (finder.found == nullptr) {
-        return result;
-    }
-
-    if (auto loc = symbol_to_definition_location(sm, *finder.found, built.buffers_by_path)) {
-        result["locations"].push_back(std::move(*loc));
-    }
-    return result;
-}
-
-// --- typeDefinition handler ----------------------------------------------
-//
-// Like DefinitionFinder but resolves to the *declared type* of the symbol
-// under the cursor rather than the symbol itself:
-//
-//   my_class obj;   cursor on `obj`  → class my_class
-//   obj.field       cursor on field  → field's type
-//   f(x)            cursor on f      → return type of f (void → no result)
-//
-// Handlers that produce the same result as DefinitionFinder (cursor on
-// a type token, module name, etc.) are kept intact so typeDefinition is
-// always a superset of definition for those cursor positions.
-
-struct TypeDefinitionFinder
-    : public slang::ast::ASTVisitor<TypeDefinitionFinder,
-                                    /*VisitStatements=*/true,
-                                    /*VisitExpressions=*/true> {
-    const slang::SourceManager* sm = nullptr;
-    std::string target_path;
-    uint32_t target_offset = 0;
-    const slang::ast::Symbol* found = nullptr;
-    uint32_t best_width = UINT32_MAX;
-
-    bool covers_target(slang::SourceRange r) const {
-        if (!r.start().valid() || !r.end().valid() || sm == nullptr) return false;
-        auto orig_start = sm->getFullyOriginalLoc(r.start());
-        auto full = sm->getFullPath(orig_start.buffer()).string();
-        if (full != target_path) return false;
-        return orig_start.offset() <= target_offset
-            && target_offset < sm->getFullyOriginalLoc(r.end()).offset();
-    }
-
-    void record(slang::SourceRange r, const slang::ast::Symbol& sym) {
-        auto width = static_cast<uint32_t>(r.end().offset() - r.start().offset());
-        if (width <= best_width) {
-            best_width = width;
-            found = &sym;
-        }
-    }
-
-    // Cursor on a variable / port / parameter reference → type of symbol.
-    void handle(const slang::ast::NamedValueExpression& e) {
-        if (covers_target(e.sourceRange)) {
-            if (const auto* vs = e.symbol.as_if<slang::ast::ValueSymbol>()) {
-                record(e.sourceRange, vs->getType());
-            }
-        }
-        visitDefault(e);
-    }
-
-    // Cursor on hierarchical path → type of the final symbol.
-    void handle(const slang::ast::HierarchicalValueExpression& e) {
-        if (covers_target(e.sourceRange)) {
-            if (const auto* vs = e.symbol.as_if<slang::ast::ValueSymbol>()) {
-                record(e.sourceRange, vs->getType());
-            }
-        }
-        visitDefault(e);
-    }
-
-    // Cursor on `obj.member` → type of the member.
-    void handle(const slang::ast::MemberAccessExpression& e) {
-        if (covers_target(e.sourceRange)) {
-            if (const auto* vs = e.member.as_if<slang::ast::ValueSymbol>()) {
-                record(e.sourceRange, vs->getType());
-            }
-        }
-        visitDefault(e);
-    }
-
-    // Cursor on `f(x)` / `obj.method()` → return type of the subroutine.
-    // Void returns have no syntax → symbol_to_definition_location returns
-    // nullopt → empty locations (correct: nothing to jump to).
-    void handle(const slang::ast::CallExpression& e) {
-        if (!e.isSystemCall() && covers_target(e.sourceRange)) {
-            if (auto* sub_ptr =
-                    std::get_if<const slang::ast::SubroutineSymbol*>(&e.subroutine);
-                sub_ptr != nullptr && *sub_ptr != nullptr) {
-                record(e.sourceRange, (*sub_ptr)->getReturnType());
-            }
-        }
-        visitDefault(e);
-    }
-
-    // Cursor on the type token of a value declaration (`my_t x;` → my_t).
-    // Same result as DefinitionFinder — typeDefinition on a type name is
-    // the type itself, identical to definition.
-    void handle(std::derived_from<slang::ast::ValueSymbol> auto& v) {
-        if (auto* type_syn = v.getDeclaredType()->getTypeSyntax(); type_syn != nullptr) {
-            auto range = type_syn->sourceRange();
-            if (covers_target(range)) {
-                record(range, v.getDeclaredType()->getType());
-            }
-        }
-        visitDefault(v);
-    }
-
-    // Module / interface instantiation: cursor on the type token.
-    // Same result as DefinitionFinder.
-    void handle(const slang::ast::InstanceSymbol& s) {
-        if (auto* inst_syn = s.getSyntax(); inst_syn != nullptr) {
-            auto* parent = inst_syn->parent;
-            if (parent != nullptr &&
-                parent->kind == slang::syntax::SyntaxKind::HierarchyInstantiation) {
-                auto& hi = *static_cast<const slang::syntax::HierarchyInstantiationSyntax*>(
-                    parent);
-                auto type_range = hi.type.range();
-                if (covers_target(type_range)) {
-                    record(type_range, s.getDefinition());
-                }
-            }
-        }
-        visitDefault(s);
-    }
-};
-
-static json handle_type_definition(const json& params) {
-    auto built = build_compilation(params);
-    auto& sm = *built.sm;
-    auto& compilation = *built.compilation;
-
-    json result;
-    result["locations"] = json::array();
-
-    const auto target_path = params.value("target_path", std::string{});
-    auto buf_it = built.buffers_by_path.find(target_path);
-    if (buf_it == built.buffers_by_path.end()) {
-        std::cerr << "[mimir-slang-sidecar] typeDefinition: target_path not in request: "
-                  << target_path << '\n';
-        return result;
-    }
-
-    json pos = params.value("target_position", json::object());
-    uint32_t lsp_line = pos.value("line", 0u);
-    uint32_t lsp_char = pos.value("character", 0u);
-
-    auto byte_offset = lsp_position_to_byte_offset(sm, buf_it->second, lsp_line, lsp_char);
-    if (!byte_offset) return result;
-
-    TypeDefinitionFinder finder;
-    finder.sm = &sm;
-    finder.target_path = target_path;
-    finder.target_offset = static_cast<uint32_t>(*byte_offset);
-    compilation.getRoot().visit(finder);
-
-    if (finder.found == nullptr) return result;
-
-    if (auto loc = symbol_to_definition_location(sm, *finder.found, built.buffers_by_path)) {
-        result["locations"].push_back(std::move(*loc));
-    }
-    return result;
-}
-
-// --- implementation handler ----------------------------------------------
-//
-// Two cases:
-//   1. Cursor on a virtual / pure-virtual subroutine (declaration or call
-//      site) → return all overrides in subclasses across the compilation.
-//   2. Cursor on a class name → return all directly-derived subclasses.
-//
-// Non-virtual methods and leaf classes return empty locations.
-
-// Walk the compilation scope tree and collect every ClassType (recursive).
-static void collect_class_types(
-    const slang::ast::Scope& scope,
-    std::vector<const slang::ast::ClassType*>& classes
-) {
-    using namespace slang::ast;
+static json extract_members(const slang::SourceManager& sm,
+                             const slang::ast::Scope& scope,
+                             bool recurse_members) {
+    using SK = slang::ast::SymbolKind;
+    // Slang creates both a PortSymbol and an internal Variable/Net for the
+    // same port. Collect port names first so the duplicate variable is skipped.
+    std::unordered_set<std::string> port_names;
     for (const auto& member : scope.members()) {
-        if (member.kind == SymbolKind::ClassType) {
-            auto& cls = member.as<ClassType>();
-            classes.push_back(&cls);
-            collect_class_types(cls, classes);
-        } else if (const auto* s = member.as_if<Scope>()) {
-            collect_class_types(*s, classes);
-        }
+        if (member.kind == SK::Port) port_names.insert(std::string(member.name));
     }
-}
-
-// Walk the scope tree to find a SubroutineSymbol or ClassType whose *name*
-// token covers the cursor. Used when the cursor is at a declaration site
-// rather than an expression reference.
-static const slang::ast::Symbol* find_declaration_at_cursor(
-    const slang::ast::Scope& scope,
-    const slang::SourceManager& sm,
-    const std::string& target_path,
-    uint32_t target_offset
-) {
-    using namespace slang::ast;
-    using namespace slang::syntax;
-
-    for (const auto& member : scope.members()) {
-        // --- ClassType: check the class name token ---
-        if (member.kind == SymbolKind::ClassType) {
-            auto& cls = member.as<ClassType>();
-            if (auto* syn = cls.getSyntax();
-                syn != nullptr && syn->kind == SyntaxKind::ClassDeclaration) {
-                auto& cls_syn =
-                    *static_cast<const ClassDeclarationSyntax*>(syn);
-                auto name_range = cls_syn.name.range();
-                auto orig_start = sm.getFullyOriginalLoc(name_range.start());
-                auto full = sm.getFullPath(orig_start.buffer()).string();
-                if (full == target_path) {
-                    auto start = orig_start.offset();
-                    auto end = sm.getFullyOriginalLoc(name_range.end()).offset();
-                    if (start <= target_offset && target_offset < end) {
-                        return &member;
-                    }
-                }
-            }
-            // Recurse into the class scope to find methods.
-            auto* result =
-                find_declaration_at_cursor(cls, sm, target_path, target_offset);
-            if (result) return result;
-        }
-        // --- SubroutineSymbol: check via Symbol::location + name length ---
-        else if (member.kind == SymbolKind::Subroutine) {
-            auto& sub = member.as<SubroutineSymbol>();
-            if (sub.location.valid()) {
-                auto orig = sm.getFullyOriginalLoc(sub.location);
-                auto full = sm.getFullPath(orig.buffer()).string();
-                if (full == target_path) {
-                    auto start = orig.offset();
-                    auto end = start + static_cast<uint32_t>(sub.name.length());
-                    if (start <= target_offset && target_offset < end) {
-                        return &member;
-                    }
-                }
-            }
-        }
-        // --- Recurse into any other scope ---
-        else if (const auto* s = member.as_if<Scope>()) {
-            auto* result =
-                find_declaration_at_cursor(*s, sm, target_path, target_offset);
-            if (result) return result;
-        }
-    }
-    return nullptr;
-}
-
-// Find all overrides of `method_name` in the transitive subclass tree of
-// `base_cls`. Results appended to `locations_out`.
-static void find_overrides(
-    const slang::ast::ClassType& base_cls,
-    std::string_view method_name,
-    const std::vector<const slang::ast::ClassType*>& all_classes,
-    const slang::SourceManager& sm,
-    const std::unordered_map<std::string, slang::BufferID>& buffers_by_path,
-    json& locations_out
-) {
-    using namespace slang::ast;
-    for (const auto* cls : all_classes) {
-        if (auto* base = cls->getBaseClass(); base != nullptr) {
-            auto& canon = base->getCanonicalType();
-            bool is_direct_child =
-                (&canon == static_cast<const Symbol*>(&base_cls)) ||
-                (canon.kind == SymbolKind::ClassType &&
-                 &canon.as<ClassType>() == &base_cls);
-            if (!is_direct_child) continue;
-
-            // Check this subclass for the override.
-            if (auto* sym = cls->find(method_name); sym != nullptr) {
-                if (sym->kind == SymbolKind::Subroutine) {
-                    if (auto loc =
-                            symbol_to_definition_location(sm, *sym, buffers_by_path)) {
-                        locations_out.push_back(std::move(*loc));
-                    }
-                }
-            }
-            // Recurse into subclasses of cls.
-            find_overrides(*cls, method_name, all_classes, sm, buffers_by_path,
-                           locations_out);
-        }
-    }
-}
-
-static json handle_implementation(const json& params) {
-    using namespace slang::ast;
-
-    auto built = build_compilation(params);
-    auto& sm = *built.sm;
-    auto& compilation = *built.compilation;
-
-    json result;
-    result["locations"] = json::array();
-
-    const auto target_path = params.value("target_path", std::string{});
-    auto buf_it = built.buffers_by_path.find(target_path);
-    if (buf_it == built.buffers_by_path.end()) {
-        std::cerr << "[mimir-slang-sidecar] implementation: target_path not in request: "
-                  << target_path << '\n';
-        return result;
-    }
-
-    json pos = params.value("target_position", json::object());
-    uint32_t lsp_line = pos.value("line", 0u);
-    uint32_t lsp_char = pos.value("character", 0u);
-
-    auto byte_offset = lsp_position_to_byte_offset(sm, buf_it->second, lsp_line, lsp_char);
-    if (!byte_offset) return result;
-    auto cursor_offset = static_cast<uint32_t>(*byte_offset);
-
-    // 1. Try expression-level resolution (cursor at a call / reference site).
-    DefinitionFinder def_finder;
-    def_finder.sm = &sm;
-    def_finder.target_path = target_path;
-    def_finder.target_offset = cursor_offset;
-    compilation.getRoot().visit(def_finder);
-
-    // 2. Fall back to declaration-level scope walk (cursor at a declaration).
-    const Symbol* cursor_symbol = def_finder.found;
-    if (cursor_symbol == nullptr) {
-        cursor_symbol = find_declaration_at_cursor(
-            compilation.getRoot(), sm, target_path, cursor_offset);
-    }
-
-    if (cursor_symbol == nullptr) return result;
-
-    std::vector<const ClassType*> all_classes;
-    collect_class_types(compilation.getRoot(), all_classes);
-
-    // Case A: cursor on a class → return all direct subclasses.
-    if (cursor_symbol->kind == SymbolKind::ClassType) {
-        auto& base_cls = cursor_symbol->as<ClassType>();
-        for (const auto* cls : all_classes) {
-            if (auto* base = cls->getBaseClass(); base != nullptr) {
-                auto& canon = base->getCanonicalType();
-                bool is_child =
-                    (&canon == static_cast<const Symbol*>(&base_cls)) ||
-                    (canon.kind == SymbolKind::ClassType &&
-                     &canon.as<ClassType>() == &base_cls);
-                if (is_child) {
-                    if (auto loc = symbol_to_definition_location(
-                            sm, *cls, built.buffers_by_path)) {
-                        result["locations"].push_back(std::move(*loc));
-                    }
-                }
-            }
-        }
-        return result;
-    }
-
-    // Case B: cursor on a subroutine → return overrides in subclasses.
-    if (cursor_symbol->kind == SymbolKind::Subroutine) {
-        auto& sub = cursor_symbol->as<SubroutineSymbol>();
-        bool is_virtual =
-            sub.flags.has(MethodFlags::Virtual) || sub.flags.has(MethodFlags::Pure);
-        if (!is_virtual) return result;
-
-        // Find the enclosing class.
-        const Symbol* parent_sym =
-            sub.getParentScope() ? &sub.getParentScope()->asSymbol() : nullptr;
-        if (parent_sym == nullptr || parent_sym->kind != SymbolKind::ClassType) {
-            return result;
-        }
-        auto& enclosing = parent_sym->as<ClassType>();
-        find_overrides(enclosing, sub.name, all_classes, sm, built.buffers_by_path,
-                       result["locations"]);
-        return result;
-    }
-
-    return result;
-}
-
-// --- complete handler --------------------------------------------------------
-//
-// Completion candidates keyed by `kind`:
-//   "memberAccess"  — obj.prefix: enumerate fields/methods of LHS type.
-//   "packageScope"  — pkg::prefix: enumerate members of a named package.
-//   "identifier"    — scope-aware completion: walk the enclosing scope chain
-//                     and return all visible names, inner shadows outer.
-//   "macro"         — `define completion: return all macro names from every
-//                     syntax tree in the compilation unit.
-//
-// Returns `{items: [{label, kind, ?detail}, ...]}` — same JSON shape as
-// `CompleteResult` on the Rust side.
-
-// Finds the innermost Scope whose syntax range contains the cursor.
-// Used by the "identifier" completion path to seed the outward scope walk.
-struct EnclosingScopeFinder
-    : public slang::ast::ASTVisitor<EnclosingScopeFinder,
-                                    /*VisitStatements=*/true,
-                                    /*VisitExpressions=*/false> {
-
-    const slang::SourceManager* sm = nullptr;
-    std::string target_path;
-    uint32_t target_offset = 0;
-
-    const slang::ast::Scope* found_scope = nullptr;
-    uint32_t best_width = UINT32_MAX;
-
-    bool covers_target(slang::SourceRange r) const {
-        if (!r.start().valid() || !r.end().valid() || sm == nullptr) return false;
-        auto orig_start = sm->getFullyOriginalLoc(r.start());
-        if (sm->getFullPath(orig_start.buffer()).string() != target_path) return false;
-        auto orig_end   = sm->getFullyOriginalLoc(r.end());
-        return orig_start.offset() <= target_offset
-            && target_offset <= orig_end.offset();
-    }
-
-    void try_scope(slang::SourceRange r, const slang::ast::Scope& scope) {
-        if (!covers_target(r)) return;
-        auto orig_start = sm->getFullyOriginalLoc(r.start());
-        auto orig_end   = sm->getFullyOriginalLoc(r.end());
-        if (!orig_end.valid()) return;
-        uint32_t width = orig_end.offset() - orig_start.offset();
-        if (width < best_width) {
-            best_width = width;
-            found_scope = &scope;
-        }
-    }
-
-    // function / task bodies are Scopes — local variables and parameters
-    // live here.
-    void handle(const slang::ast::SubroutineSymbol& s) {
-        if (auto* syn = s.getSyntax()) try_scope(syn->sourceRange(), s);
-        visitDefault(s);
-    }
-
-    // class body — fields and methods.
-    void handle(const slang::ast::ClassType& c) {
-        if (auto* syn = c.getSyntax()) try_scope(syn->sourceRange(), c);
-        visitDefault(c);
-    }
-
-    // module / interface / program instance body.
-    void handle(const slang::ast::InstanceBodySymbol& b) {
-        if (auto* syn = b.getSyntax()) try_scope(syn->sourceRange(), b);
-        visitDefault(b);
-    }
-
-    // begin / end blocks — locally declared variables.
-    void handle(const slang::ast::StatementBlockSymbol& b) {
-        if (auto* syn = b.getSyntax()) try_scope(syn->sourceRange(), b);
-        visitDefault(b);
-    }
-
-    // package body.
-    void handle(const slang::ast::PackageSymbol& p) {
-        if (auto* syn = p.getSyntax()) try_scope(syn->sourceRange(), p);
-        visitDefault(p);
-    }
-};
-
-// Finds the type of the expression at `target_offset` in `target_path`.
-// Operates exactly like TypeDefinitionFinder but records `found_type`
-// (a `const Type*`) instead of a declaration `Symbol`.
-struct TypeAtCursorFinder
-    : public slang::ast::ASTVisitor<TypeAtCursorFinder,
-                                    /*VisitStatements=*/true,
-                                    /*VisitExpressions=*/true> {
-    const slang::SourceManager* sm = nullptr;
-    std::string target_path;
-    uint32_t target_offset = 0;
-    const slang::ast::Type* found_type = nullptr;
-    uint32_t best_width = UINT32_MAX;
-
-    bool covers_target(slang::SourceRange r) const {
-        if (!r.start().valid() || !r.end().valid() || sm == nullptr) return false;
-        auto orig_start = sm->getFullyOriginalLoc(r.start());
-        if (sm->getFullPath(orig_start.buffer()).string() != target_path) return false;
-        return orig_start.offset() <= target_offset
-            && target_offset < sm->getFullyOriginalLoc(r.end()).offset();
-    }
-
-    void record_type(slang::SourceRange r, const slang::ast::Type& t) {
-        auto width = static_cast<uint32_t>(r.end().offset() - r.start().offset());
-        if (width <= best_width) {
-            best_width = width;
-            found_type = &t;
-        }
-    }
-
-    void handle(const slang::ast::NamedValueExpression& e) {
-        if (covers_target(e.sourceRange)) {
-            if (auto* vs = e.symbol.as_if<slang::ast::ValueSymbol>())
-                record_type(e.sourceRange, vs->getType());
-        }
-        visitDefault(e);
-    }
-
-    void handle(const slang::ast::HierarchicalValueExpression& e) {
-        if (covers_target(e.sourceRange)) {
-            if (auto* vs = e.symbol.as_if<slang::ast::ValueSymbol>())
-                record_type(e.sourceRange, vs->getType());
-        }
-        visitDefault(e);
-    }
-
-    void handle(const slang::ast::MemberAccessExpression& e) {
-        if (covers_target(e.sourceRange)) {
-            if (auto* vs = e.member.as_if<slang::ast::ValueSymbol>())
-                record_type(e.sourceRange, vs->getType());
-        }
-        visitDefault(e);
-    }
-
-    void handle(const slang::ast::CallExpression& e) {
-        if (!e.isSystemCall() && covers_target(e.sourceRange)) {
-            if (auto* sub_ptr =
-                    std::get_if<const slang::ast::SubroutineSymbol*>(&e.subroutine);
-                sub_ptr != nullptr && *sub_ptr != nullptr) {
-                record_type(e.sourceRange, (*sub_ptr)->getReturnType());
-            }
-        }
-        visitDefault(e);
-    }
-
-    void handle(std::derived_from<slang::ast::ValueSymbol> auto& v) {
-        if (auto* type_syn = v.getDeclaredType()->getTypeSyntax(); type_syn != nullptr) {
-            auto range = type_syn->sourceRange();
-            if (covers_target(range))
-                record_type(range, v.getDeclaredType()->getType());
-        }
-        visitDefault(v);
-    }
-};
-
-// Case-insensitive prefix check.
-static bool ci_starts_with(std::string_view name, std::string_view prefix) {
-    if (prefix.size() > name.size()) return false;
-    for (size_t i = 0; i < prefix.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(name[i]))
-                != std::tolower(static_cast<unsigned char>(prefix[i])))
-            return false;
-    }
-    return true;
-}
-
-// LSP CompletionItemKind codes used by the sidecar.
-// 2=Method, 5=Field, 6=Variable, 9=Module, 20=EnumMember, 21=Constant.
-static uint8_t member_kind_code(slang::ast::SymbolKind k) {
-    using K = slang::ast::SymbolKind;
-    switch (k) {
-        case K::Subroutine:    return 2;   // Method
-        case K::Field:         return 5;   // Field
-        case K::Package:       return 9;   // Module (closest LSP kind for a package)
-        case K::EnumValue:     return 20;  // EnumMember
-        case K::Parameter:
-        case K::TypeParameter: return 21;  // Constant
-        default:               return 6;   // Variable
-    }
-}
-
-// Enumerate members of `scope` whose names start with `prefix`
-// (case-insensitive) and append them to `items_out`.
-static void enumerate_scope_members(
-    const slang::ast::Scope& scope,
-    std::string_view prefix,
-    json& items_out
-) {
+    json arr = json::array();
     for (const auto& member : scope.members()) {
         if (member.name.empty()) continue;
-        if (!prefix.empty() && !ci_starts_with(member.name, prefix)) continue;
-        json item;
-        item["label"] = std::string(member.name);
-        item["kind"]  = member_kind_code(member.kind);
-        items_out.push_back(std::move(item));
+        if ((member.kind == SK::Variable || member.kind == SK::Net)
+            && port_names.count(std::string(member.name))) continue;
+        auto d = symbol_to_mimir_decl(sm, member, recurse_members);
+        if (!d.is_null()) arr.push_back(std::move(d));
     }
+    return arr;
 }
 
-static json handle_complete(const json& params) {
+static json symbol_to_mimir_decl(const slang::SourceManager& sm,
+                                  const slang::ast::Symbol& sym,
+                                  bool recurse_members) {
+    using namespace slang::ast;
+    if (sym.name.empty()) return nullptr;
+
+    const char* kind_str  = nullptr;
+    json members          = json::array();
+    json type_str_val     = nullptr;
+    json parent_class_val = nullptr;
+
+    switch (sym.kind) {
+        case SymbolKind::Package:
+            kind_str = "package";
+            if (recurse_members)
+                members = extract_members(sm, sym.as<PackageSymbol>(), true);
+            break;
+
+        case SymbolKind::ClassType: {
+            kind_str    = "class";
+            auto& cls   = sym.as<ClassType>();
+            if (recurse_members) members = extract_members(sm, cls, true);
+            if (auto* base = cls.getBaseClass())
+                parent_class_val = std::string(base->name);
+            break;
+        }
+
+        case SymbolKind::Subroutine: {
+            auto& sub = sym.as<SubroutineSymbol>();
+            kind_str  = (sub.subroutineKind == SubroutineKind::Task) ? "task" : "function";
+            // Depth-1 members for subroutines (formal ports only, no bodies).
+            members   = extract_members(sm, sub, false);
+            if (sub.subroutineKind == SubroutineKind::Function)
+                type_str_val = std::string(sub.getReturnType().toString());
+            break;
+        }
+
+        case SymbolKind::Variable:
+        case SymbolKind::Net:
+            kind_str     = "variable";
+            type_str_val = std::string(sym.as<ValueSymbol>().getType().toString());
+            break;
+
+        case SymbolKind::Field:
+            kind_str     = "field";
+            type_str_val = std::string(sym.as<ValueSymbol>().getType().toString());
+            break;
+
+        case SymbolKind::Parameter:
+        case SymbolKind::TypeParameter:
+            kind_str = "parameter";
+            if (sym.kind == SymbolKind::Parameter)
+                type_str_val = std::string(sym.as<ParameterSymbol>().getType().toString());
+            break;
+
+        case SymbolKind::Port:
+            kind_str = "port";
+            type_str_val = std::string(sym.as<PortSymbol>().getType().toString());
+            break;
+
+        case SymbolKind::EnumValue:
+            kind_str = "enumMember";
+            break;
+
+        case SymbolKind::TypeAlias:
+            kind_str = "typedef";
+            break;
+
+        default:
+            return nullptr;
+    }
+
+    json name_range, full_range;
+    if (auto* syn = sym.getSyntax(); syn != nullptr) {
+        full_range = make_mimir_range(sm, syn->sourceRange());
+        name_range = full_range;
+    } else {
+        name_range = make_mimir_point_range(sm, sym.location);
+        full_range = name_range;
+    }
+
+    json decl;
+    decl["name"]         = std::string(sym.name);
+    decl["kind"]         = kind_str;
+    decl["range"]        = std::move(name_range);
+    decl["full_range"]   = std::move(full_range);
+    decl["type_str"]     = std::move(type_str_val);
+    decl["members"]      = std::move(members);
+    decl["parent_class"] = std::move(parent_class_val);
+    decl["visibility"]   = "public";
+    decl["doc"]          = nullptr;
+    return decl;
+}
+
+// Build the MimirScope for one file by collecting top-level definitions
+// (packages + module/interface/program definitions) whose declaration site
+// lives in `file_path`.
+static json build_file_top_scope(
+    const slang::SourceManager& sm,
+    slang::ast::Compilation& compilation,
+    const std::string& file_path) {
+
     using namespace slang::ast;
 
-    auto built = build_compilation(params);
-    auto& sm   = *built.sm;
-    auto& compilation = *built.compilation;
+    json decls = json::array();
 
-    json result;
-    result["items"] = json::array();
-
-    const auto target_path = params.value("target_path", std::string{});
-    auto buf_it = built.buffers_by_path.find(target_path);
-    if (buf_it == built.buffers_by_path.end()) {
-        std::cerr << "[mimir-slang-sidecar] complete: target_path not in request: "
-                  << target_path << '\n';
-        return result;
+    // Packages declared in this file.
+    for (const auto* pkg : compilation.getPackages()) {
+        if (!pkg || pkg->name.empty()) continue;
+        if (loc_to_file_path(sm, pkg->location) != file_path) continue;
+        auto d = symbol_to_mimir_decl(sm, *pkg, /*recurse=*/true);
+        if (!d.is_null()) decls.push_back(std::move(d));
     }
 
-    json pos_json = params.value("target_position", json::object());
-    uint32_t lsp_line = pos_json.value("line", 0u);
-    uint32_t lsp_char = pos_json.value("character", 0u);
+    // Top-level module/interface/program definitions. The root holds one
+    // InstanceSymbol per top-level instantiation; we deduplicate via a
+    // position key so that a module instantiated several times appears only
+    // once.
+    std::unordered_set<std::string> seen_defs;
+    for (const auto& member : compilation.getRoot().members()) {
+        if (member.kind != SymbolKind::Instance) continue;
+        auto& inst = member.as<InstanceSymbol>();
+        auto& def  = inst.getDefinition();
+        if (def.name.empty()) continue;
+        if (loc_to_file_path(sm, def.location) != file_path) continue;
 
-    auto cursor_opt = lsp_position_to_byte_offset(sm, buf_it->second, lsp_line, lsp_char);
-    if (!cursor_opt) return result;
-    uint32_t cursor = static_cast<uint32_t>(*cursor_opt);
+        // Dedup key: line:character of the definition name token.
+        auto p = to_lsp_pos(sm, def.location);
+        std::string key = std::to_string(p.line) + ":" + std::to_string(p.character);
+        if (!seen_defs.insert(key).second) continue;
 
-    auto text = sm.getSourceText(buf_it->second);
-    std::string kind_str = params.value("kind", std::string{"memberAccess"});
-    std::string prefix   = params.value("prefix", std::string{});
-
-    auto is_ident = [](char c) {
-        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
-    };
-
-    // --- Member access (obj.prefix) ---
-    if (kind_str == "memberAccess") {
-        // Walk backwards past identifier chars (the partial member prefix).
-        uint32_t p = cursor;
-        while (p > 0 && is_ident(text[p - 1])) --p;
-
-        // `text[p-1]` must be '.'; if not, bail.
-        if (p == 0 || text[p - 1] != '.') return result;
-        uint32_t dot_offset = p - 1;
-        if (dot_offset == 0) return result;
-
-        // Fast path: ask the bound AST what's just before the '.'. This
-        // succeeds when the enclosing statement bound cleanly (e.g.
-        // `obj.method().|` inside a valid assignment).
-        const Type* lhs_type = nullptr;
-        {
-            TypeAtCursorFinder finder;
-            finder.sm            = &sm;
-            finder.target_path   = target_path;
-            finder.target_offset = dot_offset - 1;
-            compilation.getRoot().visit(finder);
-            lhs_type = finder.found_type;
+        // Determine the module kind from the syntax node kind.
+        const char* kind_str = "module";
+        if (auto* syn = def.getSyntax(); syn != nullptr) {
+            using SK = slang::syntax::SyntaxKind;
+            if (syn->kind == SK::InterfaceDeclaration) kind_str = "interface";
+            else if (syn->kind == SK::ProgramDeclaration) kind_str = "program";
         }
 
-        // Fallback: when the surrounding statement failed to bind (which
-        // collapses `ProceduralBlockSymbol::getBody()` to an
-        // InvalidStatement, hiding the bound LHS expression from the
-        // visitor), recover by extracting the LHS identifier name from
-        // the buffer text and looking it up by name in the lexical scope
-        // at the cursor. Handles the common `a.|` case where `a` is a
-        // local variable, field, or class property visible from the
-        // enclosing scope chain.
-        if (lhs_type == nullptr) {
-            uint32_t lhs_end = dot_offset;
-            uint32_t lhs_start = lhs_end;
-            while (lhs_start > 0 && is_ident(text[lhs_start - 1])) --lhs_start;
-            if (lhs_start < lhs_end) {
-                std::string_view lhs_name = text.substr(lhs_start, lhs_end - lhs_start);
-                EnclosingScopeFinder scope_finder;
-                scope_finder.sm            = &sm;
-                scope_finder.target_path   = target_path;
-                scope_finder.target_offset = dot_offset - 1;
-                compilation.getRoot().visit(scope_finder);
+        // Body members: ports, local vars, functions, nested classes.
+        json members = extract_members(sm, inst.body, /*recurse=*/true);
 
-                if (scope_finder.found_scope != nullptr) {
-                    if (const auto* sym = slang::ast::Lookup::unqualified(
-                            *scope_finder.found_scope, lhs_name)) {
-                        if (const auto* vs = sym->as_if<slang::ast::ValueSymbol>())
-                            lhs_type = &vs->getType();
-                    }
+        json name_range, full_range;
+        if (auto* syn = def.getSyntax(); syn != nullptr) {
+            full_range = make_mimir_range(sm, syn->sourceRange());
+            name_range = full_range;
+        } else {
+            name_range = make_mimir_point_range(sm, def.location);
+            full_range = name_range;
+        }
+
+        json decl;
+        decl["name"]         = std::string(def.name);
+        decl["kind"]         = kind_str;
+        decl["range"]        = std::move(name_range);
+        decl["full_range"]   = std::move(full_range);
+        decl["type_str"]     = nullptr;
+        decl["members"]      = std::move(members);
+        decl["parent_class"] = nullptr;
+        decl["visibility"]   = "public";
+        decl["doc"]          = nullptr;
+        decls.push_back(std::move(decl));
+    }
+
+    json scope;
+    scope["range"]             = {{"start", {{"line", 0}, {"character", 0}}},
+                                  {"end",   {{"line", 999999}, {"character", 0}}}};
+    scope["declarations"]      = std::move(decls);
+    scope["children"]          = json::array();
+    scope["imported_packages"] = json::array();
+    return scope;
+}
+
+static json handle_compile(const json& params) {
+    auto built      = build_compilation(params);
+    auto& sm        = *built.sm;
+    auto& comp      = *built.compilation;
+
+    json all_diags = diagnostics_for_compilation(sm, comp);
+
+    // Group diagnostics by file path for per-file attachment.
+    std::unordered_map<std::string, json> diags_by_file;
+    for (const auto& d : all_diags) {
+        diags_by_file[d.value("path", std::string{})].push_back(d);
+    }
+
+    json files = json::array();
+    if (params.contains("files") && params["files"].is_array()) {
+        for (const auto& f : params["files"]) {
+            std::string path = f.value("path", std::string{});
+            json file_json;
+            file_json["uri"] = path;
+
+            // Per-file diagnostics — strip the "path" key since it's already
+            // present in file_json["uri"].
+            json file_diags = json::array();
+            if (auto it = diags_by_file.find(path); it != diags_by_file.end()) {
+                for (auto d : it->second) {
+                    d.erase("path");
+                    file_diags.push_back(std::move(d));
                 }
             }
+            file_json["diagnostics"] = std::move(file_diags);
+            file_json["top_scope"]   = build_file_top_scope(sm, comp, path);
+            files.push_back(std::move(file_json));
         }
-
-        if (lhs_type == nullptr) return result;
-
-        auto& canonical = lhs_type->getCanonicalType();
-        if (auto* scope = canonical.as_if<Scope>()) {
-            enumerate_scope_members(*scope, prefix, result["items"]);
-        }
-        return result;
     }
 
-    // --- Package scope (pkg::prefix) ---
-    if (kind_str == "packageScope") {
-        // Walk backwards past identifier chars (the partial member prefix).
-        uint32_t p = cursor;
-        while (p > 0 && is_ident(text[p - 1])) --p;
+    json ast;
+    ast["files"] = std::move(files);
 
-        // Must have '::' immediately before.
-        if (p < 2 || text[p - 1] != ':' || text[p - 2] != ':') return result;
-        uint32_t scope_end = p - 2;
-
-        // Walk backwards to extract the LHS name (package or class name).
-        uint32_t name_start = scope_end;
-        auto is_ident_no_dollar = [](char c) {
-            return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-        };
-        while (name_start > 0 && is_ident_no_dollar(text[name_start - 1])) --name_start;
-        if (name_start >= scope_end) return result;  // empty name
-
-        std::string_view lhs_name = text.substr(name_start, scope_end - name_start);
-
-        // Try by package name first — packages live in the compilation's package
-        // map, not as direct root scope members, so iterating getRoot().members()
-        // alone misses them (they're nested inside CompilationUnitSymbol children).
-        if (const auto* pkg = compilation.getPackage(lhs_name)) {
-            enumerate_scope_members(*pkg, prefix, result["items"]);
-            return result;
-        }
-
-        // Fall back to root direct members for anything else (e.g. top-level
-        // class types accessed via ClassName::).
-        for (const auto& member : compilation.getRoot().members()) {
-            if (member.name != lhs_name) continue;
-            if (auto* scope = member.as_if<Scope>()) {
-                enumerate_scope_members(*scope, prefix, result["items"]);
-                break;
-            }
-        }
-        return result;
-    }
-
-    // --- Scope-aware identifier completion -----------------------------------
-    //
-    // Walk to the innermost Scope enclosing the cursor, then walk outward
-    // through the parent scope chain, emitting all visible members. Inner
-    // scopes shadow outer ones: the first definition of a name wins.
-    if (kind_str == "identifier") {
-        EnclosingScopeFinder scope_finder;
-        scope_finder.sm            = &sm;
-        scope_finder.target_path   = target_path;
-        scope_finder.target_offset = cursor;
-        compilation.getRoot().visit(scope_finder);
-
-        constexpr size_t IDENT_CAP = 500;
-        std::unordered_set<std::string> seen;
-        const slang::ast::Scope* scope = scope_finder.found_scope
-                                             ? scope_finder.found_scope
-                                             : &compilation.getRoot();
-
-        while (scope && result["items"].size() < IDENT_CAP) {
-            for (const auto& member : scope->members()) {
-                if (result["items"].size() >= IDENT_CAP) break;
-                if (member.name.empty()) continue;
-                if (!prefix.empty() && !ci_starts_with(member.name, prefix)) continue;
-                auto name = std::string(member.name);
-                if (!seen.insert(name).second) continue;  // inner scope already emitted
-                json item;
-                item["label"] = name;
-                item["kind"]  = member_kind_code(member.kind);
-                result["items"].push_back(std::move(item));
-            }
-            const slang::ast::Symbol& sym = scope->asSymbol();
-            scope = sym.getParentScope();
-        }
-
-        // Packages are globally visible but live in CompilationUnitSymbol children,
-        // not in the syntactic scope chain. Emit them separately so the user can
-        // type a package prefix (e.g. "uvm_pk") and have "uvm_pkg" appear.
-        for (const auto* pkg : compilation.getPackages()) {
-            if (result["items"].size() >= IDENT_CAP) break;
-            if (!pkg || pkg->name.empty()) continue;
-            if (!prefix.empty() && !ci_starts_with(pkg->name, prefix)) continue;
-            auto name = std::string(pkg->name);
-            if (!seen.insert(name).second) continue;
-            json item;
-            item["label"] = name;
-            item["kind"]  = 9;  // Module (closest LSP kind for a package)
-            result["items"].push_back(std::move(item));
-        }
-        return result;
-    }
-
-    // --- Macro name completion -----------------------------------------------
-    //
-    // Return all `\`define` names visible in the compilation unit. The sidecar
-    // iterates every syntax tree's `getDefinedMacros()` list, which covers
-    // macros defined in the project's source files as well as any headers
-    // pulled in via `\`include`.
-    if (kind_str == "macro") {
-        for (const auto& tree : compilation.getSyntaxTrees()) {
-            for (const auto* def : tree->getDefinedMacros()) {
-                if (!def) continue;
-                auto name = std::string(def->name.valueText());
-                if (name.empty()) continue;
-                if (!prefix.empty() && !ci_starts_with(name, prefix)) continue;
-                json item;
-                item["label"]  = name;
-                item["kind"]   = 21;    // Constant (LSP CompletionItemKind)
-                item["detail"] = "`define";
-                result["items"].push_back(std::move(item));
-            }
-        }
-        return result;
-    }
-
+    json result;
+    result["ast"]         = std::move(ast);
+    result["diagnostics"] = std::move(all_diags);
     return result;
 }
 
@@ -1624,21 +617,8 @@ int main() {
 
         const auto method = req.value("method", std::string{});
         try {
-            if (method == "elaborate") {
-                resp["result"] = handle_elaborate(req.value("params", json::object()));
-            } else if (method == "definition") {
-                resp["result"] = handle_definition(req.value("params", json::object()));
-            } else if (method == "typeDefinition") {
-                resp["result"] = handle_type_definition(req.value("params", json::object()));
-            } else if (method == "implementation") {
-                resp["result"] = handle_implementation(req.value("params", json::object()));
-            } else if (method == "complete") {
-                resp["result"] = handle_complete(req.value("params", json::object()));
-            } else if (method == "signatureHelp") {
-                // Stub: full slang-backed implementation is a future slice.
-                // Returning an empty signatures array causes the server to fall
-                // back to the tree-sitter syntax index.
-                resp["result"] = {{"signatures", json::array()}};
+            if (method == "compile") {
+                resp["result"] = handle_compile(req.value("params", json::object()));
             } else if (method == "shutdown") {
                 // Acknowledge, flush, exit. Keeps the client from seeing
                 // a "Closed" before its shutdown response lands.

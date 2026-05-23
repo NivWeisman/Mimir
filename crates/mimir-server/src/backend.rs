@@ -41,7 +41,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mimir_core::{Position as MPosition, Range as MRange, TextDocument};
-use mimir_slang::Diagnostic as SlangDiagnostic;
 use mimir_syntax::{
     calls::{active_arg_index, call_site_at, call_sites_in, CallKind},
     inlay::hints_for,
@@ -57,17 +56,14 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::ast_features;
 use crate::completion_score;
-use crate::elaborate_service::{ElaborateService, slang_to_lsp_diagnostic};
+use crate::elaborate_service::ElaborateService;
 use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
 use crate::parse_provider::TreeSitterProvider;
 use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
-use crate::slang_service::{
-    SlangService, SlangDefinitionOutcome, DefinitionRoute, route_definition,
-    TypeDefinitionRoute, route_type_definition,
-    ImplementationRoute, route_implementation,
-    detect_member_access, detect_macro_trigger, m_range_to_lsp,
-};
+use crate::slang_adapter::SlangAdapter;
+use crate::slang_service::{SlangService, detect_member_access, detect_macro_trigger, m_range_to_lsp};
 use crate::syntax_service::{SyntaxCandidates, SyntaxService};
 use crate::workspace_index::{self, WorkspaceIndex, WorkspaceState};
 
@@ -128,6 +124,11 @@ pub(crate) struct Backend {
     /// assembly helper.
     slang: Arc<SlangService>,
 
+    /// Drives the `compile` RPC and caches the resulting [`MimirAst`].
+    /// LSP feature handlers read `adapter.cached_ast()` to answer queries
+    /// without waiting for the next background compile cycle.
+    adapter: Arc<SlangAdapter>,
+
     /// Document store + parser + workspace-index Arcs, packaged as a service
     /// so feature handlers can call `cached_tree` / `cached_tree_and_index`
     /// through a named interface rather than reaching into the raw fields.
@@ -135,7 +136,7 @@ pub(crate) struct Backend {
     /// through `self.documents` etc. are immediately visible here.
     syntax: SyntaxService,
 
-    /// Debounce + dedup + diagnostic-publish lifecycle for slang elaboration.
+    /// Debounce + dedup + diagnostic-publish lifecycle for slang compile.
     /// All elaborate state (pending handles, last hash, published URLs) lives
     /// here; handlers call `self.elaborate.schedule(uri)` and return.
     elaborate: ElaborateService,
@@ -158,14 +159,16 @@ impl Backend {
         let workspace: Arc<RwLock<WorkspaceState>> =
             Arc::new(RwLock::new(WorkspaceState::default()));
         let slang = Arc::new(SlangService::new(documents.clone(), slang));
+        let adapter = Arc::new(SlangAdapter::new(slang.clone()));
         Self {
             syntax: SyntaxService::new(
                 documents.clone(),
                 ts.clone(),
                 workspace.clone(),
             ),
-            elaborate: ElaborateService::new(slang.clone(), client.clone()),
+            elaborate: ElaborateService::new(adapter.clone(), client.clone()),
             slang,
+            adapter,
             client,
             documents,
             ts,
@@ -272,7 +275,7 @@ impl Backend {
         // feedback (~ms after a keystroke). The deeper slang elaborate
         // is scheduled separately on a debounce timer; when it lands it
         // *overwrites* this publish for files in its compilation unit.
-        let lsp_diags = merge_diagnostics(diags, Vec::new(), /* slang_active */ false);
+        let lsp_diags = merge_diagnostics(diags);
 
         debug!(
             count = lsp_diags.len(),
@@ -1264,21 +1267,24 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
+        let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
-        // Slang first when configured + project loaded. Trust slang on
-        // empty (the user opted into the semantic resolver; an
-        // authoritative "no" is more accurate than syntactic guesses).
-        // Transport errors fall through to the syntax path.
-        let outcome = Box::pin(self.slang.definition(&uri, target)).await;
-        match route_definition(outcome) {
-            DefinitionRoute::UseSlangResult(locs) => {
-                debug!(count = locs.len(), "slang definition resolved");
-                Ok(slang_locations_to_response(locs))
-            }
-            DefinitionRoute::UseSyntaxFallback => {
-                Ok(Box::pin(self.syntax_definition(&uri, target)).await)
+        // AST path: MimirAst from the last successful compile.
+        if let Some(ast) = self.adapter.cached_ast().await {
+            let rope = {
+                let docs = self.documents.read().await;
+                docs.get(&uri).map(|s| Rope::from_str(&s.document.text()))
+            };
+            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            if let (Some(rope), Some(path)) = (rope, file_path) {
+                if let Some(resp) = ast_features::definition(&ast, &path, mimir_pos, &rope) {
+                    return Ok(Some(resp));
+                }
             }
         }
+
+        // Fall through to tree-sitter workspace index.
+        Ok(Box::pin(self.syntax_definition(&uri, target)).await)
     }
 
     #[instrument(
@@ -1293,26 +1299,24 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
+        let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
-        // Slang's `definition` RPC resolves to declaration sites (the
-        // identifier token where a symbol is declared, not a body start).
-        // Reuse it here — no dedicated `declaration` RPC exists in the
-        // sidecar protocol. Transport errors fall through to the tree-sitter
-        // workspace index, same as `goto_definition`.
-        //
-        // v2 deferral: prototype-vs-body distinction for `extern function` /
-        // `pure virtual` requires either a dedicated slang RPC or
-        // `is_prototype` tracking in the symbol index.
-        let outcome = Box::pin(self.slang.definition(&uri, target)).await;
-        match route_definition(outcome) {
-            DefinitionRoute::UseSlangResult(locs) => {
-                debug!(count = locs.len(), "slang declaration resolved");
-                Ok(slang_locations_to_response(locs))
-            }
-            DefinitionRoute::UseSyntaxFallback => {
-                Ok(Box::pin(self.syntax_definition(&uri, target)).await)
+        // AST path: same as definition — MimirDecl.range points to the name token.
+        if let Some(ast) = self.adapter.cached_ast().await {
+            let rope = {
+                let docs = self.documents.read().await;
+                docs.get(&uri).map(|s| Rope::from_str(&s.document.text()))
+            };
+            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            if let (Some(rope), Some(path)) = (rope, file_path) {
+                if let Some(resp) = ast_features::definition(&ast, &path, mimir_pos, &rope) {
+                    return Ok(Some(resp));
+                }
             }
         }
+
+        // Fall through to tree-sitter workspace index.
+        Ok(Box::pin(self.syntax_definition(&uri, target)).await)
     }
 
     #[instrument(
@@ -1326,43 +1330,32 @@ impl LanguageServer for Backend {
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let target = MPosition::new(pos.line, pos.character);
+        let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
-        // Slang-only: no tree-sitter fallback for type resolution.
-        // None (slang not configured / transport error) → returns None to editor.
-        let outcome = Box::pin(self.slang.type_definition(&uri, target)).await;
-        match route_type_definition(outcome) {
-            TypeDefinitionRoute::UseSlangResult(locs) => {
-                debug!(count = locs.len(), "slang type_definition resolved");
-                Ok(slang_locations_to_response(locs))
+        // AST path: find the type of the symbol and jump to its declaration.
+        if let Some(ast) = self.adapter.cached_ast().await {
+            let rope = {
+                let docs = self.documents.read().await;
+                docs.get(&uri).map(|s| Rope::from_str(&s.document.text()))
+            };
+            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            if let (Some(rope), Some(path)) = (rope, file_path) {
+                if let Some(resp) = ast_features::type_definition(&ast, &path, mimir_pos, &rope) {
+                    return Ok(Some(resp));
+                }
             }
-            TypeDefinitionRoute::UseEmpty => Ok(None),
         }
+
+        Ok(None)
     }
 
-    #[instrument(
-        level = "debug",
-        skip_all,
-        fields(uri = %params.text_document_position_params.text_document.uri),
-    )]
+    #[instrument(level = "debug", skip_all)]
     async fn goto_implementation(
         &self,
-        params: GotoDefinitionParams,
+        _params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let pos = params.text_document_position_params.position;
-        let target = MPosition::new(pos.line, pos.character);
-
-        // Slang-only: implementation queries need full semantic analysis.
-        // None (slang not configured / transport error) → returns None to editor.
-        let outcome = Box::pin(self.slang.implementation(&uri, target)).await;
-        match route_implementation(outcome) {
-            ImplementationRoute::UseSlangResult(locs) => {
-                debug!(count = locs.len(), "slang implementation resolved");
-                Ok(slang_locations_to_response(locs))
-            }
-            ImplementationRoute::UseEmpty => Ok(None),
-        }
+        // Implementation lookup is not yet available in the AST-based path.
+        Ok(None)
     }
 
     /// Highlight every occurrence of the identifier under the cursor in
@@ -1686,6 +1679,7 @@ impl LanguageServer for Backend {
             .clone();
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
+        let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
         let Some((tree, index)) = self.cached_tree_and_index(&uri).await else {
             debug!("hover: no cached parse for this URI");
@@ -1702,45 +1696,12 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Slang-first lookup: ask slang where the symbol is declared, then
-        // enrich via workspace index (multi-line hover) or declaration block.
-        if let Some(SlangDefinitionOutcome::Resolved(locs)) = Box::pin(self.slang.definition(&uri, target)).await {
-            if let Some(loc) = locs.into_iter().next() {
-                let dest_uri = loc.uri;
-                let line_no = loc.range.start.line;
-
-                let workspace_match: Option<(Url, Symbol)> = {
-                    let ws = self.workspace.read().await;
-                    ws.index
-                        .lookup_by_location(&dest_uri, line_no)
-                        .map(|e| (e.url.clone(), e.symbol.clone()))
-                };
-                if let Some((sym_url, sym)) = workspace_match {
-                    let docs = self.documents.read().await;
-                    if let Some(h) = hover_for_symbol(&sym, &sym_url, &docs) {
-                        return Ok(Some(h));
-                    }
-                }
-
-                let block: Option<String> = {
-                    let docs = self.documents.read().await;
-                    docs.get(&dest_uri).and_then(|state| {
-                        let r = Rope::from_str(&state.document.text());
-                        read_declaration_block(&r, line_no)
-                    })
-                }
-                .or_else(|| {
-                    if dest_uri == uri {
-                        read_declaration_block(&rope, line_no)
-                    } else {
-                        dest_uri.to_file_path().ok()
-                            .and_then(|p| std::fs::read_to_string(&p).ok())
-                            .and_then(|t| read_declaration_block(&Rope::from_str(&t), line_no))
-                    }
-                });
-
-                if let Some(block) = block {
-                    return Ok(Some(hover_markdown(&block)));
+        // AST path: use cached MimirAst for type info and docs.
+        if let Some(ast) = self.adapter.cached_ast().await {
+            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            if let Some(path) = file_path {
+                if let Some(hover) = ast_features::hover(&ast, &path, mimir_pos, &rope) {
+                    return Ok(Some(hover));
                 }
             }
         }
@@ -1943,11 +1904,20 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
+        let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
-        // --- slang path ---
-        if let Some(sigs) = Box::pin(self.slang.signature_help(&uri, target)).await {
-            let result = slang_signatures_to_lsp(sigs, 0);
-            return Ok(Some(result));
+        // --- AST path ---
+        if let Some(ast) = self.adapter.cached_ast().await {
+            let rope = {
+                let docs = self.documents.read().await;
+                docs.get(&uri).map(|s| Rope::from_str(&s.document.text()))
+            };
+            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            if let (Some(rope), Some(path)) = (rope, file_path) {
+                if let Some(sig) = ast_features::signature_help(&ast, &path, mimir_pos, &rope) {
+                    return Ok(Some(sig));
+                }
+            }
         }
 
         // --- tree-sitter fallback ---
@@ -2154,8 +2124,9 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
+        let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
-        // Read the document text once; used by both trigger-detection paths below.
+        // Read the document text once; used by all paths below.
         let text = {
             let docs = self.documents.read().await;
             docs.get(&uri).map(|s| s.document.text())
@@ -2165,45 +2136,40 @@ impl LanguageServer for Backend {
         // Route 1: `` ` `` trigger — macro-name completion.
         if let Some(rope) = &rope {
             if let Some(macro_prefix) = detect_macro_trigger(rope, target) {
-                if let Some(resp) =
-                    Box::pin(self.slang.macro_completion(&uri, target, &macro_prefix)).await
-                {
-                    return Ok(Some(resp));
-                }
-                // Syntax fallback: `define symbols from the index.
                 return Ok(Box::pin(self.syntax_macro_completion(&uri, &macro_prefix)).await);
             }
         }
 
         // Route 2: `.` or `::` trigger — member / package-scope completion.
-        // Slang is the primary source (full semantics). When slang is
-        // unavailable or busy, fall back to the cached AST for receivers
-        // whose type is syntactically known (`super`, `this`, typed locals).
-        // For any other receiver (undeclared variable, chained call, `::`)
-        // we still return empty to avoid the workspace-dump anti-pattern.
         let member_trigger = rope
             .as_ref()
             .and_then(|r| detect_member_access(r, target));
         let has_member_trigger = member_trigger.is_some();
 
-        if let Some(resp) = Box::pin(self.slang.member_completion(&uri, target)).await {
-            return Ok(Some(resp));
-        }
         if has_member_trigger {
-            // Slang unavailable/busy — try AST fallback for known-type receivers.
-            // Skip for `::` (package scope): member_trigger is Some((true, _)).
-            let is_dot_trigger = member_trigger.as_ref().map_or(false, |(is_pkg, _)| !is_pkg);
+            // AST path: use MimirAst member/package completion.
+            if let (Some(ast), Some(_rope), Some((is_pkg, receiver))) = (
+                self.adapter.cached_ast().await,
+                rope.as_ref(),
+                member_trigger.as_ref().cloned(),
+            ) {
+                let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+                if let Some(path) = file_path {
+                    if let Some(resp) = ast_features::member_completion(
+                        &ast, &path, mimir_pos, &receiver, is_pkg,
+                    ) {
+                        return Ok(Some(resp));
+                    }
+                }
+            }
+
+            // Tree-sitter fallback for `.` (not `::`).
+            let is_dot_trigger = member_trigger.as_ref().is_some_and(|(is_pkg, _)| !is_pkg);
             if is_dot_trigger {
-                if let (Some(tree), Some(r)) =
-                    (self.cached_tree(&uri).await, rope.as_ref())
-                {
-                    let prefix = member_trigger
-                        .map(|(_, p)| p)
-                        .unwrap_or_default();
+                if let (Some(tree), Some(r)) = (self.cached_tree(&uri).await, rope.as_ref()) {
+                    let prefix = member_trigger.map(|(_, p)| p).unwrap_or_default();
                     let ws = self.workspace.read().await;
-                    if let Some(resp) =
-                        syntax_member_completion(&ws.index, &tree, r, target, &prefix)
-                    {
+                    if let Some(resp) = syntax_member_completion(&ws.index, &tree, r, target, &prefix) {
                         return Ok(Some(resp));
                     }
                 }
@@ -2212,10 +2178,17 @@ impl LanguageServer for Backend {
         }
 
         // Route 3: plain identifier — scope-aware completion.
-        // Slang first (scope-correct); falls back to syntax+workspace+keywords.
-        if let Some(resp) = Box::pin(self.slang.identifier_completion(&uri, target)).await {
-            return Ok(Some(resp));
+        // AST path first (scope-correct from cached symbol table).
+        if let Some(ast) = self.adapter.cached_ast().await {
+            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            if let Some(path) = file_path {
+                let items = ast_features::identifier_completion(&ast, &path, mimir_pos);
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
         }
+
         Ok(Box::pin(self.syntax_completion(&uri, target)).await)
     }
 
@@ -3104,20 +3077,6 @@ fn hover_from_markdown(markdown: String) -> Hover {
     }
 }
 
-/// Wrap a list of locations into a `GotoDefinitionResponse`, treating
-/// the empty list as "no declaration found" (`None`).
-///
-/// This is the trust-slang-on-empty contract: an authoritative empty
-/// result from slang short-circuits to `None` rather than triggering a
-/// syntax fallback. The fallback is reserved for transport errors.
-fn slang_locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResponse> {
-    if locs.is_empty() {
-        None
-    } else {
-        Some(GotoDefinitionResponse::Array(locs))
-    }
-}
-
 /// Resolve a name to its declaration sites, same-file first, workspace
 /// second.
 ///
@@ -3560,105 +3519,6 @@ fn read_line_trimmed(rope: &Rope, line: u32) -> Option<String> {
     Some(raw.trim_end_matches(['\r', '\n']).trim().to_owned())
 }
 
-/// Read a declaration that may span multiple lines, starting from
-/// `start_line` and continuing until we hit what looks like the end of
-/// the declaration. Used by the slang hover fallback so multi-line
-/// function/task/macro declarations don't get truncated to their first
-/// source line.
-///
-/// "End of declaration" is intentionally simple — we stop *after* the
-/// first line that:
-///
-/// * Ends in `;` not preceded by a `\` (so a single-line declaration
-///   reads cleanly and a multi-line C-style `\`-continued macro keeps
-///   going).
-/// * Is exactly empty (after trimming) — a blank line terminates a
-///   `\`-continued macro definition.
-/// * Starts an `endfunction` / `endtask` / `endmodule` / `endclass` /
-///   `end` block (the declaration has flowed into its body).
-///
-/// We cap at 16 lines so a runaway shape never produces a giant hover
-/// popup.
-fn read_declaration_block(rope: &Rope, start_line: u32) -> Option<String> {
-    const MAX_LINES: usize = 16;
-    let total = rope.len_lines();
-    let start = start_line as usize;
-    if start >= total {
-        return None;
-    }
-    let mut collected = Vec::with_capacity(4);
-    let mut prev_ends_with_backslash = false;
-    for offset in 0..MAX_LINES {
-        let idx = start + offset;
-        if idx >= total {
-            break;
-        }
-        let raw: String = rope.line(idx).chars().collect();
-        let line = raw.trim_end_matches(['\r', '\n']);
-        let trimmed = line.trim();
-
-        // Stop *before* an empty line that follows a non-continuation —
-        // an empty separator between two top-level decls.
-        if offset > 0 && trimmed.is_empty() && !prev_ends_with_backslash {
-            break;
-        }
-        // Stop *before* an `end*` keyword (we've fallen into the body).
-        if offset > 0
-            && (trimmed.starts_with("endfunction")
-                || trimmed.starts_with("endtask")
-                || trimmed.starts_with("endmodule")
-                || trimmed.starts_with("endclass")
-                || trimmed.starts_with("endpackage")
-                || trimmed.starts_with("endinterface"))
-        {
-            break;
-        }
-
-        collected.push(line.to_owned());
-        let ends_with_backslash = line.trim_end().ends_with('\\');
-        let ends_with_semicolon = line.trim_end().ends_with(';');
-
-        // A semicolon terminates a normal declaration *unless* it's
-        // inside a `\`-continued macro body.
-        if ends_with_semicolon && !prev_ends_with_backslash && !ends_with_backslash {
-            break;
-        }
-        // A line that doesn't continue and isn't part of a continuation
-        // group — single-line declaration, we're done.
-        if !ends_with_backslash && !prev_ends_with_backslash && offset == 0 {
-            // Single-line case: we already pushed it, decide based on
-            // the line's own terminator.
-            if ends_with_semicolon || trimmed.is_empty() {
-                break;
-            }
-        }
-        prev_ends_with_backslash = ends_with_backslash;
-    }
-    if collected.is_empty() {
-        return None;
-    }
-    // Strip leading whitespace consistently across all lines so the
-    // markdown block doesn't show jagged indentation. Use the minimum
-    // leading-whitespace count of the non-empty lines.
-    let common: usize = collected
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.bytes().take_while(|b| *b == b' ' || *b == b'\t').count())
-        .min()
-        .unwrap_or(0);
-    let dedented: Vec<String> = collected
-        .iter()
-        .map(|l| {
-            if l.len() >= common {
-                l[common..].to_owned()
-            } else {
-                l.clone()
-            }
-        })
-        .collect();
-    Some(dedented.join("\n"))
-}
-
 /// Build a `CompletionItem` for a SystemVerilog keyword.
 ///
 /// When the keyword has a registered snippet body in
@@ -3681,47 +3541,6 @@ fn keyword_completion_item(kw: &'static str) -> CompletionItem {
             kind: Some(CompletionItemKind::KEYWORD),
             ..Default::default()
         },
-    }
-}
-
-/// Convert a list of slang `SignatureItem`s into LSP's `SignatureHelp`.
-///
-/// `active_sig` is the index of the currently active overload (0 for the
-/// first — we don't yet do overload resolution so it's always 0).
-fn slang_signatures_to_lsp(
-    sigs: Vec<mimir_slang::SignatureItem>,
-    active_sig: u32,
-) -> SignatureHelp {
-    let lsp_sigs: Vec<SignatureInformation> = sigs
-        .into_iter()
-        .map(|s| {
-            let lsp_params: Vec<ParameterInformation> = s
-                .params
-                .into_iter()
-                .map(|p| {
-                    let label_text = if let Some(ty) = p.ty {
-                        format!("{ty} {}", p.name)
-                    } else {
-                        p.name
-                    };
-                    ParameterInformation {
-                        label: ParameterLabel::Simple(label_text),
-                        documentation: None,
-                    }
-                })
-                .collect();
-            SignatureInformation {
-                label: s.label,
-                documentation: None,
-                parameters: Some(lsp_params),
-                active_parameter: None,
-            }
-        })
-        .collect();
-    SignatureHelp {
-        signatures: lsp_sigs,
-        active_signature: Some(active_sig),
-        active_parameter: None,
     }
 }
 
@@ -3844,16 +3663,8 @@ fn syntax_to_lsp_diagnostic(d: MDiagnostic) -> Diagnostic {
 /// Today this is always called with `slang_active = false` because the
 /// sidecar binary doesn't exist yet (Stage 1). The function lives now so
 /// Stage 3 only flips the flag.
-fn merge_diagnostics(
-    syntax: Vec<MDiagnostic>,
-    slang: Vec<SlangDiagnostic>,
-    slang_active: bool,
-) -> Vec<Diagnostic> {
-    if slang_active {
-        slang.into_iter().map(slang_to_lsp_diagnostic).collect()
-    } else {
-        syntax.into_iter().map(syntax_to_lsp_diagnostic).collect()
-    }
+fn merge_diagnostics(syntax: Vec<MDiagnostic>) -> Vec<Diagnostic> {
+    syntax.into_iter().map(syntax_to_lsp_diagnostic).collect()
 }
 
 // --------------------------------------------------------------------------
@@ -3868,7 +3679,6 @@ fn merge_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mimir_slang::Severity as SlangSeverity;
     use mimir_syntax::Diagnostic as MDiag;
 
     /// Helper: a tree-sitter diagnostic at a given severity.
@@ -3878,17 +3688,6 @@ mod tests {
             message: "syntax".to_string(),
             severity: sev,
             code: "syntax",
-        }
-    }
-
-    /// Helper: a slang diagnostic at a given severity.
-    fn slang_diag(sev: SlangSeverity, code: &str) -> SlangDiagnostic {
-        SlangDiagnostic {
-            path: "a.sv".into(),
-            range: MRange::new(MPosition::new(2, 4), MPosition::new(2, 9)),
-            severity: sev,
-            code: code.to_string(),
-            message: "slang".to_string(),
         }
     }
 
@@ -3928,16 +3727,11 @@ mod tests {
         }
     }
 
-    /// `slang_active = false` is today's behavior: tree-sitter wins, slang
-    /// vec is ignored even if non-empty (defensive — should never be passed
-    /// non-empty in this branch, but the function shouldn't lose data).
+    /// `merge_diagnostics` maps tree-sitter diagnostics to LSP and
+    /// returns them in order.
     #[test]
-    fn merge_passes_through_syntax_when_slang_inactive() {
-        let merged = merge_diagnostics(
-            vec![syntax_diag(MSeverity::Error)],
-            vec![slang_diag(SlangSeverity::Error, "UnknownModule")],
-            /* slang_active */ false,
-        );
+    fn merge_passes_through_syntax_diagnostics() {
+        let merged = merge_diagnostics(vec![syntax_diag(MSeverity::Error)]);
         assert_eq!(merged.len(), 1);
         assert_eq!(
             merged[0].code,
@@ -3945,45 +3739,10 @@ mod tests {
         );
     }
 
-    /// `slang_active = true` drops tree-sitter syntax errors and surfaces
-    /// only slang's. This is the conflict policy that makes the apb.sv
-    /// false positives disappear once Stage 3 turns the flag on.
-    #[test]
-    fn merge_drops_syntax_when_slang_active() {
-        let merged = merge_diagnostics(
-            vec![syntax_diag(MSeverity::Error), syntax_diag(MSeverity::Error)],
-            vec![slang_diag(SlangSeverity::Error, "UnknownModule")],
-            /* slang_active */ true,
-        );
-        assert_eq!(merged.len(), 1);
-        assert_eq!(
-            merged[0].code,
-            Some(NumberOrString::String("UnknownModule".into()))
-        );
-    }
-
-    /// `slang_active = true` with an empty slang vec means "slang said this
-    /// file is clean" — drop the tree-sitter syntax errors too, otherwise
-    /// the user still sees the false positives we're trying to suppress.
-    #[test]
-    fn merge_drops_syntax_when_slang_active_and_clean() {
-        let merged = merge_diagnostics(
-            vec![syntax_diag(MSeverity::Error)],
-            vec![],
-            /* slang_active */ true,
-        );
-        assert!(
-            merged.is_empty(),
-            "expected zero diagnostics, got {merged:?}"
-        );
-    }
-
-    /// Pass-through with empty inputs returns empty — the trivial case,
-    /// guarded so a future refactor can't accidentally invent diagnostics.
+    /// Empty input returns empty — guards against accidental diagnostic invention.
     #[test]
     fn merge_empty_in_empty_out() {
-        assert!(merge_diagnostics(vec![], vec![], false).is_empty());
-        assert!(merge_diagnostics(vec![], vec![], true).is_empty());
+        assert!(merge_diagnostics(vec![]).is_empty());
     }
 
     // --- Stage 2: go-to-definition resolver ---------------------------
@@ -4246,44 +4005,6 @@ mod tests {
         let cls_kids = pkg_kids[0].children.as_ref().unwrap();
         assert_eq!(cls_kids.len(), 1);
         assert_eq!(cls_kids[0].name, "f");
-    }
-
-    // --- Stage 3: slang-backed go-to-definition routing ---------------
-
-    /// A non-empty Resolved outcome becomes a `Some(Array(...))`
-    /// response — the editor sees slang's locations.
-    #[test]
-    fn slang_outcome_resolved_with_locs_returns_array() {
-        let url = Url::parse("file:///proj/a.sv").unwrap();
-        let locs = vec![Location {
-            uri: url.clone(),
-            range: Range {
-                start: Position {
-                    line: 3,
-                    character: 7,
-                },
-                end: Position {
-                    line: 3,
-                    character: 13,
-                },
-            },
-        }];
-        let resp = slang_locations_to_response(locs);
-        match resp {
-            Some(GotoDefinitionResponse::Array(arr)) => {
-                assert_eq!(arr.len(), 1);
-                assert_eq!(arr[0].uri, url);
-            }
-            other => panic!("expected Array, got {other:?}"),
-        }
-    }
-
-    /// An empty Resolved outcome short-circuits to `None`. This is the
-    /// trust-slang-on-empty contract: do **not** fall back to the syntax
-    /// index when slang authoritatively says "no declaration found."
-    #[test]
-    fn slang_outcome_resolved_empty_returns_none() {
-        assert!(slang_locations_to_response(Vec::new()).is_none());
     }
 
     /// `CompletionOptions` can be constructed with the trigger characters
@@ -5068,48 +4789,6 @@ mod tests {
         let legend = semantic_tokens_legend();
         assert_eq!(legend.token_types.len(), TokenType::legend().len());
         assert_eq!(legend.token_modifiers.len(), TokenModifier::legend_names().len());
-    }
-
-    /// Single-line function declaration: only one source line lands in
-    /// the block.
-    #[test]
-    fn read_declaration_block_single_line() {
-        let rope = ropey::Rope::from_str("function void foo();\n  int x;\nendfunction\n");
-        let block = read_declaration_block(&rope, 0).expect("block");
-        assert_eq!(block, "function void foo();");
-    }
-
-    /// Multi-line `function` declaration whose parameters wrap across
-    /// four source lines: every line must land in the block.
-    #[test]
-    fn read_declaration_block_multi_line_function() {
-        let text = "static function bit get(uvm_component cntxt,\n\
-                    \t\t\t\tstring inst_name,\n\
-                    \t\t\t\tstring field_name,\n\
-                    \t\t\t\tinout T value);\n\
-                    \tint x;\n\
-                    endfunction\n";
-        let rope = ropey::Rope::from_str(text);
-        let block = read_declaration_block(&rope, 0).expect("block");
-        assert!(block.contains("cntxt"), "{block:?}");
-        assert!(block.contains("inst_name"), "{block:?}");
-        assert!(block.contains("field_name"), "{block:?}");
-        assert!(block.contains("inout T value"), "{block:?}");
-        // The body line (`int x;`) and `endfunction` must NOT leak in.
-        assert!(!block.contains("int x"), "{block:?}");
-        assert!(!block.contains("endfunction"), "{block:?}");
-    }
-
-    /// `\\`-continued macro definition: every continuation line lands
-    /// in the block until the first non-continued line.
-    #[test]
-    fn read_declaration_block_multi_line_macro() {
-        let text = "`define UVM_THING(X) \\\n  do_a(X); \\\n  do_b(X); \\\n  do_c(X)\n";
-        let rope = ropey::Rope::from_str(text);
-        let block = read_declaration_block(&rope, 0).expect("block");
-        assert!(block.contains("do_a(X)"));
-        assert!(block.contains("do_b(X)"));
-        assert!(block.contains("do_c(X)"));
     }
 
     /// `read_macro_body` strips the `\`define NAME(args)` header.

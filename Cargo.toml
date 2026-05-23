@@ -7,6 +7,7 @@
 ##   * `mimir-core`    — pure-data types: text documents, positions, logging.
 ##   * `mimir-syntax`  — tree-sitter wrapper, parse-error diagnostics.
 ##   * `mimir-slang`   — async client for the C++ slang sidecar (preprocessor + elaborator).
+##   * `mimir-ast`     — backend-agnostic AST types shared by server and adapters.
 ##   * `mimir-server`  — tower-lsp `Backend` impl plus the `mimir-server` binary.
 ##
 ## Workspace-level dependency versions are declared once under
@@ -19,11 +20,12 @@ members = [
     "crates/mimir-core",
     "crates/mimir-syntax",
     "crates/mimir-slang",
+    "crates/mimir-ast",
     "crates/mimir-server",
 ]
 
 [workspace.package]
-version      = "0.6.45"
+version      = "0.7.0"
 edition      = "2021"
 rust-version = "1.75"
 license      = "MIT OR Apache-2.0"
@@ -72,9 +74,10 @@ toml        = "0.8"
 nucleo-matcher = "0.3"
 
 # --- Internal crates (used by other workspace members) --------------------
-mimir-core   = { path = "crates/mimir-core",   version = "0.6.7" }
-mimir-syntax = { path = "crates/mimir-syntax", version = "0.6.7" }
-mimir-slang  = { path = "crates/mimir-slang",  version = "0.6.7" }
+mimir-core   = { path = "crates/mimir-core",   version = "0.7.0" }
+mimir-syntax = { path = "crates/mimir-syntax", version = "0.7.0" }
+mimir-slang  = { path = "crates/mimir-slang",  version = "0.7.0" }
+mimir-ast    = { path = "crates/mimir-ast",    version = "0.7.0" }
 
 [profile.release]
 # LTO + a single codegen unit shrinks the LSP binary and squeezes a bit more

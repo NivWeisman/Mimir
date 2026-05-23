@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use tower_lsp::{LspService, Server};
 
+mod ast_features;
 mod backend;
 mod completion_score;
 mod elaborate_service;
@@ -26,6 +27,7 @@ mod format;
 mod includes;
 mod parse_provider;
 mod project;
+mod slang_adapter;
 mod slang_service;
 mod syntax_service;
 mod workspace_index;
