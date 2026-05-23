@@ -54,7 +54,7 @@ pub mod semantic_tokens;
 pub mod signature;
 pub mod symbols;
 
-pub use calls::{ArgSpan, CallKind, CallSite};
+pub use calls::{ArgSpan, CallKind, CallSite, EnclosingCallable};
 pub use diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use folding::FoldRange;
 pub use inlay::InlayLabel;

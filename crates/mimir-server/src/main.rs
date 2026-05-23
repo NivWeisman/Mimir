@@ -24,6 +24,7 @@ mod completion_score;
 mod elaborate_service;
 mod filelist;
 mod format;
+mod hierarchy_features;
 mod includes;
 mod parse_provider;
 mod project;

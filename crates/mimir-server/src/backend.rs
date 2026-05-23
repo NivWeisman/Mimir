@@ -58,6 +58,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::ast_features;
 use crate::completion_score;
+use crate::hierarchy_features;
 use crate::elaborate_service::ElaborateService;
 use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
 use crate::parse_provider::TreeSitterProvider;
@@ -1010,9 +1011,20 @@ impl LanguageServer for Backend {
                 // suppress these capabilities. See `docs/formatter.md`.
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
+                // Call hierarchy: three-step protocol (prepareCallHierarchy +
+                // incomingCalls + outgoingCalls). Tree-sitter only — slang
+                // doesn't emit call-edge information in MimirAst today.
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 // We publish diagnostics as a *push* (via the `Client`) on
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
+                //
+                // typeHierarchyProvider: lsp-types 0.95.1 omits this field (LSP
+                // 3.17 gap). Placed in `experimental` as a workaround; VS Code
+                // reads `typeHierarchyProvider` from the top-level capabilities
+                // object and will not see the value here until lsp-types gains
+                // the typed field — move it out of experimental at that point.
+                experimental: Some(serde_json::json!({"typeHierarchyProvider": true})),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -1356,6 +1368,227 @@ impl LanguageServer for Backend {
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         // Implementation lookup is not yet available in the AST-based path.
         Ok(None)
+    }
+
+    // ------------------------------------------------------------------
+    // callHierarchy/*
+    // ------------------------------------------------------------------
+
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document_position_params.text_document.uri))]
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> LspResult<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let mpos = MPosition::new(pos.line, pos.character);
+
+        let Some(tree) = self.syntax.cached_tree(&uri).await else {
+            return Ok(None);
+        };
+        let rope = Rope::from_str(tree.source());
+        let Some(name) = mimir_syntax::symbols::identifier_at(&tree, &rope, mpos) else {
+            return Ok(None);
+        };
+        let name = name.to_owned();
+
+        // Look up the identifier in the per-file index, then the workspace.
+        let item = {
+            let docs = self.documents.read().await;
+            let per_file_hit = docs.get(&uri).and_then(|s| {
+                s.index
+                    .iter()
+                    .find(|sym| {
+                        sym.name == name
+                            && matches!(
+                                sym.kind,
+                                MSymbolKind::Function | MSymbolKind::Task | MSymbolKind::Method
+                            )
+                    })
+                    .map(|sym| {
+                        hierarchy_features::call_hierarchy_item(
+                            &sym.name, sym.kind, sym.name_range, sym.full_range, &uri,
+                        )
+                    })
+            });
+            drop(docs);
+            if let Some(item) = per_file_hit {
+                Some(item)
+            } else {
+                let ws = self.workspace.read().await;
+                ws.index
+                    .lookup(&name)
+                    .iter()
+                    .find(|e| {
+                        matches!(
+                            e.symbol.kind,
+                            MSymbolKind::Function | MSymbolKind::Task | MSymbolKind::Method
+                        )
+                    })
+                    .map(|e| {
+                        hierarchy_features::call_hierarchy_item(
+                            &e.symbol.name,
+                            e.symbol.kind,
+                            e.symbol.name_range,
+                            e.symbol.full_range,
+                            &e.url,
+                        )
+                    })
+            }
+        };
+        debug!(name = %name, found = item.is_some(), "prepare_call_hierarchy");
+        Ok(item.map(|i| vec![i]))
+    }
+
+    #[instrument(level = "debug", skip_all, fields(item = %params.item.name))]
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> LspResult<Option<Vec<CallHierarchyIncomingCall>>> {
+        let callee_name = params.item.name.clone();
+
+        // Snapshot open-doc trees (excluding the callee's own file where it's
+        // declared — but we DO want to scan it for call sites, so include all).
+        let open_trees: Vec<(Url, SyntaxTree)> = {
+            let docs = self.documents.read().await;
+            docs.iter()
+                .filter_map(|(u, s)| s.tree.as_ref().map(|t| (u.clone(), t.clone())))
+                .collect()
+        };
+        let open_urls: std::collections::HashSet<Url> =
+            open_trees.iter().map(|(u, _)| u.clone()).collect();
+
+        // Closed-file trees from the workspace, pre-filtered by presence.
+        let closed_trees: Vec<(Url, SyntaxTree)> = {
+            let ws = self.workspace.read().await;
+            let candidates = ws.files_containing(&callee_name);
+            ws.trees
+                .iter()
+                .filter(|(url, _)| !open_urls.contains(url))
+                .filter(|(url, _)| candidates.is_some_and(|s| s.contains(url)))
+                .map(|(url, tree)| (url.clone(), tree.clone()))
+                .collect()
+        };
+
+        let all_trees: Vec<(Url, SyntaxTree)> =
+            open_trees.into_iter().chain(closed_trees).collect();
+
+        let results = {
+            let ws = self.workspace.read().await;
+            hierarchy_features::collect_incoming_calls(&callee_name, &all_trees, &ws.index)
+        };
+        debug!(count = results.len(), callee = %callee_name, "incoming_calls");
+        Ok(Some(results))
+    }
+
+    #[instrument(level = "debug", skip_all, fields(item = %params.item.name))]
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> LspResult<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let item = &params.item;
+        let uri = &item.uri;
+
+        let Some(tree) = self.syntax.cached_tree(uri).await else {
+            return Ok(Some(vec![]));
+        };
+
+        let results = {
+            let ws = self.workspace.read().await;
+            hierarchy_features::collect_outgoing_calls(item.range, &tree, &ws.index)
+        };
+        debug!(count = results.len(), caller = %item.name, "outgoing_calls");
+        Ok(Some(results))
+    }
+
+    // ------------------------------------------------------------------
+    // typeHierarchy/*
+    // ------------------------------------------------------------------
+
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document_position_params.text_document.uri))]
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> LspResult<Option<Vec<TypeHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let mpos = MPosition::new(pos.line, pos.character);
+
+        let Some(tree) = self.syntax.cached_tree(&uri).await else {
+            return Ok(None);
+        };
+        let rope = Rope::from_str(tree.source());
+        let Some(name) = mimir_syntax::symbols::identifier_at(&tree, &rope, mpos) else {
+            return Ok(None);
+        };
+        let name = name.to_owned();
+
+        let item = {
+            let docs = self.documents.read().await;
+            let per_file_hit = docs.get(&uri).and_then(|s| {
+                s.index
+                    .iter()
+                    .find(|sym| sym.name == name && sym.kind == MSymbolKind::Class)
+                    .map(|sym| {
+                        hierarchy_features::type_hierarchy_item(
+                            &sym.name, sym.name_range, sym.full_range, &uri,
+                        )
+                    })
+            });
+            drop(docs);
+            if let Some(item) = per_file_hit {
+                Some(item)
+            } else {
+                let ws = self.workspace.read().await;
+                ws.index
+                    .lookup(&name)
+                    .iter()
+                    .find(|e| e.symbol.kind == MSymbolKind::Class)
+                    .map(|e| {
+                        hierarchy_features::type_hierarchy_item(
+                            &e.symbol.name,
+                            e.symbol.name_range,
+                            e.symbol.full_range,
+                            &e.url,
+                        )
+                    })
+            }
+        };
+        debug!(name = %name, found = item.is_some(), "prepare_type_hierarchy");
+        Ok(item.map(|i| vec![i]))
+    }
+
+    #[instrument(level = "debug", skip_all, fields(item = %params.item.name))]
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> LspResult<Option<Vec<TypeHierarchyItem>>> {
+        let class_name = params.item.name.clone();
+        let ast = self.adapter.cached_ast().await;
+        let results = {
+            let ws = self.workspace.read().await;
+            hierarchy_features::collect_supertypes(
+                &class_name,
+                &ws.index,
+                ast.as_deref(),
+            )
+        };
+        debug!(count = results.len(), class = %class_name, "supertypes");
+        Ok(Some(results))
+    }
+
+    #[instrument(level = "debug", skip_all, fields(item = %params.item.name))]
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> LspResult<Option<Vec<TypeHierarchyItem>>> {
+        let class_name = params.item.name.clone();
+        let results = {
+            let ws = self.workspace.read().await;
+            hierarchy_features::collect_subtypes(&class_name, &ws.index)
+        };
+        debug!(count = results.len(), class = %class_name, "subtypes");
+        Ok(Some(results))
     }
 
     /// Highlight every occurrence of the identifier under the cursor in

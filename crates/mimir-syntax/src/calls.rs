@@ -1,12 +1,15 @@
 //! Call-site identification in the SystemVerilog syntax tree.
 //!
-//! Powers two LSP features:
+//! Powers three LSP features:
 //!
 //! * `textDocument/signatureHelp` — given the cursor position inside a
 //!   function call's argument list, identify *which* call the cursor is in and
 //!   *which argument index* is active.
 //! * `textDocument/inlayHint` — find all call sites in a viewport range so
 //!   the server can place inline `param: type` labels before each argument.
+//! * `callHierarchy/*` — [`find_enclosing_callable`] locates the function or
+//!   task that lexically contains a given position; used to build the "from"
+//!   item in incoming-call results.
 //!
 //! This module is deliberately pure: no async, no `lsp_types`, no `tokio`.
 //! The server crate converts the internal [`CallSite`] / [`ArgSpan`] shapes
@@ -34,7 +37,7 @@ use ropey::Rope;
 use tracing::debug;
 use tree_sitter::Node;
 
-use crate::symbols::node_range;
+use crate::symbols::{node_range, SymbolKind};
 use crate::SyntaxTree;
 
 // --------------------------------------------------------------------------
@@ -638,6 +641,81 @@ fn find_anon_paren_after(parent_node: Node<'_>, ref_byte: usize, source: &str) -
 }
 
 // --------------------------------------------------------------------------
+// Call hierarchy helpers
+// --------------------------------------------------------------------------
+
+/// The function, task, or constructor that lexically contains a source position.
+///
+/// Returned by [`find_enclosing_callable`]; used as the "from" item when
+/// building `callHierarchy/incomingCalls` responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnclosingCallable {
+    /// Declared name of the callable (`"new"` for constructors).
+    pub name: String,
+    /// Whether this is a function, task, or constructor.
+    pub kind: SymbolKind,
+    /// Range of the name token only (where selection should land).
+    pub name_range: Range,
+    /// Range of the entire declaration (header + body).
+    pub full_range: Range,
+}
+
+/// Walk the parse tree upward from `pos` and return the innermost enclosing
+/// `function_body_declaration`, `task_body_declaration`, or
+/// `class_constructor_declaration`.
+///
+/// Returns `None` when the position is at file scope or inside a construct
+/// that is not a callable (e.g., a `module` body or a `begin/end` block that
+/// is not inside a function).
+#[must_use]
+pub fn find_enclosing_callable(
+    tree: &SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+) -> Option<EnclosingCallable> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte)?;
+
+    let mut cur = Some(leaf);
+    while let Some(node) = cur {
+        match node.kind() {
+            "function_body_declaration" | "function_prototype" => {
+                let name_node = node.child_by_field_name("name")?;
+                return Some(EnclosingCallable {
+                    name: name_node.utf8_text(tree.source().as_bytes()).ok()?.to_string(),
+                    kind: SymbolKind::Function,
+                    name_range: node_range(name_node, rope),
+                    full_range: node_range(node, rope),
+                });
+            }
+            "task_body_declaration" | "task_prototype" => {
+                let name_node = node.child_by_field_name("name")?;
+                return Some(EnclosingCallable {
+                    name: name_node.utf8_text(tree.source().as_bytes()).ok()?.to_string(),
+                    kind: SymbolKind::Task,
+                    name_range: node_range(name_node, rope),
+                    full_range: node_range(node, rope),
+                });
+            }
+            "class_constructor_declaration" => {
+                let mut c = node.walk();
+                let new_kw = node.children(&mut c).find(|ch| ch.kind() == "new")?;
+                return Some(EnclosingCallable {
+                    name: "new".to_string(),
+                    kind: SymbolKind::Function,
+                    name_range: node_range(new_kw, rope),
+                    full_range: node_range(node, rope),
+                });
+            }
+            _ => {}
+        }
+        cur = node.parent();
+    }
+    None
+}
+
+// --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------
 
@@ -812,5 +890,82 @@ endclass
             let idx = active_arg_index(site, &rope, Position::new(2, 13));
             assert_eq!(idx, 1, "cursor after first comma should be arg 1");
         }
+    }
+
+    #[test]
+    fn enclosing_callable_finds_function() {
+        init_for_tests();
+        // Line 1: "  function void my_fn(int x);"
+        // Line 2: "    int y = x + 1;"  ← cursor here
+        let src = "\
+class c;
+  function void my_fn(int x);
+    int y = x + 1;
+  endfunction
+endclass
+";
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let rope = Rope::from_str(src);
+        // Cursor inside the function body on line 2
+        let enc = find_enclosing_callable(&tree, &rope, Position::new(2, 4));
+        let enc = enc.expect("should find enclosing function");
+        assert_eq!(enc.name, "my_fn");
+        assert_eq!(enc.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn enclosing_callable_finds_task() {
+        init_for_tests();
+        let src = "\
+class c;
+  task run_phase(int phase);
+    #10;
+  endtask
+endclass
+";
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let rope = Rope::from_str(src);
+        let enc = find_enclosing_callable(&tree, &rope, Position::new(2, 4));
+        let enc = enc.expect("should find enclosing task");
+        assert_eq!(enc.name, "run_phase");
+        assert_eq!(enc.kind, SymbolKind::Task);
+    }
+
+    #[test]
+    fn enclosing_callable_finds_constructor() {
+        init_for_tests();
+        let src = "\
+class c;
+  function new(string name);
+    super.new(name);
+  endfunction
+endclass
+";
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let rope = Rope::from_str(src);
+        // Cursor on line 2 inside constructor body
+        let enc = find_enclosing_callable(&tree, &rope, Position::new(2, 4));
+        let enc = enc.expect("should find enclosing constructor");
+        assert_eq!(enc.name, "new");
+        assert_eq!(enc.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn enclosing_callable_none_at_module_scope() {
+        init_for_tests();
+        let src = "\
+module m;
+  logic x;
+endmodule
+";
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let rope = Rope::from_str(src);
+        // Cursor inside module body, not inside any function/task
+        let enc = find_enclosing_callable(&tree, &rope, Position::new(1, 2));
+        assert!(enc.is_none(), "should return None at module scope");
     }
 }
