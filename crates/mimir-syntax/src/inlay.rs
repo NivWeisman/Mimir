@@ -20,6 +20,24 @@ use crate::calls::{CallKind, CallSite};
 use crate::symbols::Symbol;
 use mimir_core::Position;
 
+/// Controls the label format for method / function / task call inlay hints.
+///
+/// Macro hints always use the parameter name only, regardless of mode.
+/// The default (`Name`) matches macro behavior so projects that haven't
+/// set `[inlay_hints] method_hint` in `.mimir.toml` get the least-noisy output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MethodHintMode {
+    /// Show only the parameter name: `"a"`. Default.
+    #[default]
+    Name,
+    /// Show only the parameter type: `"int"`. Falls back to the name when the
+    /// type is not known.
+    Type,
+    /// Show name and type together: `"a: int"`. Falls back to name-only when
+    /// the type is not known.
+    NameAndType,
+}
+
 /// One inlay-hint label anchored before a call argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlayLabel {
@@ -39,11 +57,14 @@ pub struct InlayLabel {
 /// caller passes a method's symbol we trust it and emit hints — there is
 /// no defensive skip here.
 ///
+/// `mode` controls the label text for non-macro calls (macros always use
+/// name-only regardless of `mode`). See [`MethodHintMode`].
+///
 /// Returns an empty vector when:
 /// * `sym.params` is `None` (the symbol is not callable).
 /// * `call.args` is empty.
 #[must_use]
-pub fn hints_for(call: &CallSite, sym: &Symbol) -> Vec<InlayLabel> {
+pub fn hints_for(call: &CallSite, sym: &Symbol, mode: MethodHintMode) -> Vec<InlayLabel> {
     let Some(params) = &sym.params else {
         return Vec::new();
     };
@@ -66,10 +87,17 @@ pub fn hints_for(call: &CallSite, sym: &Symbol) -> Vec<InlayLabel> {
         .iter()
         .zip(params.iter())
         .map(|(arg, param)| {
-            let text = match (&call.kind, &param.ty) {
-                (CallKind::Macro, _) => param.name.clone(),
-                (_, Some(ty)) => format!("{}: {}", param.name, ty),
-                (_, None) => param.name.clone(),
+            let text = match &call.kind {
+                CallKind::Macro => param.name.clone(),
+                _ => match (mode, &param.ty) {
+                    (MethodHintMode::Name, _) => param.name.clone(),
+                    (MethodHintMode::Type, Some(ty)) => ty.clone(),
+                    (MethodHintMode::Type, None) => param.name.clone(),
+                    (MethodHintMode::NameAndType, Some(ty)) => {
+                        format!("{}: {}", param.name, ty)
+                    }
+                    (MethodHintMode::NameAndType, None) => param.name.clone(),
+                },
             };
             InlayLabel {
                 text,
@@ -118,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_hints() {
+    fn function_call_hints_name_and_type() {
         let call = make_call(
             "foo",
             CallKind::Function,
@@ -132,7 +160,7 @@ mod tests {
                 Param { name: "b".into(), ty: Some("string".into()) },
             ],
         );
-        let hints = hints_for(&call, &sym);
+        let hints = hints_for(&call, &sym, MethodHintMode::NameAndType);
         assert_eq!(hints.len(), 2);
         assert_eq!(hints[0].text, "a: int");
         assert_eq!(hints[0].position, Position::new(1, 4));
@@ -140,7 +168,49 @@ mod tests {
     }
 
     #[test]
-    fn macro_call_name_only() {
+    fn function_call_hints_name_only() {
+        let call = make_call(
+            "foo",
+            CallKind::Function,
+            vec![make_range(1, 4, 5), make_range(1, 7, 8)],
+        );
+        let sym = make_sym(
+            "foo",
+            SymbolKind::Function,
+            vec![
+                Param { name: "a".into(), ty: Some("int".into()) },
+                Param { name: "b".into(), ty: Some("string".into()) },
+            ],
+        );
+        let hints = hints_for(&call, &sym, MethodHintMode::Name);
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].text, "a");
+        assert_eq!(hints[1].text, "b");
+    }
+
+    #[test]
+    fn function_call_hints_type_only() {
+        let call = make_call(
+            "foo",
+            CallKind::Function,
+            vec![make_range(1, 4, 5), make_range(1, 7, 8)],
+        );
+        let sym = make_sym(
+            "foo",
+            SymbolKind::Function,
+            vec![
+                Param { name: "a".into(), ty: Some("int".into()) },
+                Param { name: "b".into(), ty: None }, // no type → falls back to name
+            ],
+        );
+        let hints = hints_for(&call, &sym, MethodHintMode::Type);
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].text, "int");
+        assert_eq!(hints[1].text, "b"); // fallback to name when type unknown
+    }
+
+    #[test]
+    fn macro_call_name_only_regardless_of_mode() {
         let call = make_call(
             "MY_MACRO",
             CallKind::Macro,
@@ -154,10 +224,13 @@ mod tests {
                 Param { name: "y".into(), ty: None },
             ],
         );
-        let hints = hints_for(&call, &sym);
-        assert_eq!(hints.len(), 2);
-        assert_eq!(hints[0].text, "x");
-        assert_eq!(hints[1].text, "y");
+        // Even with NameAndType mode, macros always use name-only.
+        for mode in [MethodHintMode::Name, MethodHintMode::Type, MethodHintMode::NameAndType] {
+            let hints = hints_for(&call, &sym, mode);
+            assert_eq!(hints.len(), 2, "mode {mode:?}");
+            assert_eq!(hints[0].text, "x", "mode {mode:?}");
+            assert_eq!(hints[1].text, "y", "mode {mode:?}");
+        }
     }
 
     #[test]
@@ -179,7 +252,7 @@ mod tests {
             SymbolKind::Method,
             vec![Param { name: "x".into(), ty: Some("int".into()) }],
         );
-        let hints = hints_for(&call, &sym);
+        let hints = hints_for(&call, &sym, MethodHintMode::NameAndType);
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].text, "x: int");
     }
@@ -200,7 +273,7 @@ mod tests {
             SymbolKind::Function,
             vec![Param { name: "a".into(), ty: Some("int".into()) }],
         );
-        assert!(hints_for(&call, &sym).is_empty());
+        assert!(hints_for(&call, &sym, MethodHintMode::Name).is_empty());
     }
 
     #[test]
@@ -218,6 +291,6 @@ mod tests {
             params: None, // not callable / no params info
             parent_class_name: None,
         };
-        assert!(hints_for(&call, &sym).is_empty());
+        assert!(hints_for(&call, &sym, MethodHintMode::Name).is_empty());
     }
 }

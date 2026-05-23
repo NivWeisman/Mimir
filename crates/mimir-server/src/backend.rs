@@ -2272,6 +2272,8 @@ impl LanguageServer for Backend {
             "inlay_hint trace: scanning AST for call sites in viewport",
         );
 
+        let hint_mode = self.slang.current_method_hint_mode().await;
+
         let ws = self.workspace.read().await;
         let mut hints: Vec<InlayHint> = Vec::new();
 
@@ -2297,7 +2299,7 @@ impl LanguageServer for Backend {
                 let resolved = resolve_method_symbol(call, recv, &tree, &rope, &index, &ws.index);
                 match resolved {
                     MethodResolution::Resolved(sym, source_label) => {
-                        let labels = hints_for(call, &sym);
+                        let labels = hints_for(call, &sym, hint_mode);
                         debug!(
                             name = %call.name,
                             receiver = recv,
@@ -2364,7 +2366,7 @@ impl LanguageServer for Backend {
 
             let Some(sym) = sym else { continue };
 
-            for label in hints_for(call, &sym) {
+            for label in hints_for(call, &sym, hint_mode) {
                 hints.push(InlayHint {
                     position: Position::new(label.position.line, label.position.character),
                     label: InlayHintLabel::String(label.text),
@@ -3402,10 +3404,9 @@ fn hover_for_symbol(
             };
             return Some(hover_from_markdown(value));
         }
-        return Some(hover_from_markdown(format!(
-            "```systemverilog\n{};\n```",
-            sig.label
-        )));
+        return Some(hover_from_markdown(
+            mimir_syntax::hover_format::format_sv_signature(&sig.label),
+        ));
     }
 
     // 2. Non-callables: the declaration line.
@@ -3529,8 +3530,9 @@ fn builtin_method_hover_at(tree: &SyntaxTree, rope: &Rope, target: MPosition) ->
     };
 
     Some(hover_from_markdown(format!(
-        "```systemverilog\n{}\n```\n\n{}",
-        m.signature, m.doc
+        "{}\n\n{}",
+        mimir_syntax::hover_format::format_sv_signature(m.signature),
+        m.doc
     )))
 }
 
@@ -5013,8 +5015,7 @@ mod tests {
         );
     }
 
-    /// Callable symbol (function with params) → synthesized signature,
-    /// not the source line.
+    /// Callable symbol (function with params) → formatted markdown signature.
     #[test]
     fn hover_for_function_emits_signature() {
         let url = url("file:///a.sv");
@@ -5039,10 +5040,12 @@ mod tests {
             parent_class_name: None,
         };
         let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
-        assert_eq!(
-            hover_markdown_value(&h),
-            "```systemverilog\nfunction add(int a, int b);\n```",
-        );
+        let v = hover_markdown_value(&h);
+        // Signature is now rich markdown rather than a fenced code block.
+        assert!(v.contains("**function**"), "keyword not bolded: {v:?}");
+        assert!(v.contains("`add`"), "name not inline-coded: {v:?}");
+        assert!(v.contains("*int*"), "type not italicized: {v:?}");
+        assert!(!v.contains("```"), "no code fence expected: {v:?}");
     }
 
     /// Macro → `define` header + multi-line body.

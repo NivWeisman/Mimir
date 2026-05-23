@@ -151,6 +151,16 @@ pub struct ProjectConfig {
     /// ```
     #[serde(default)]
     pub features: FeatureToggles,
+
+    /// Inlay-hint display settings. Controls how call-site argument hints are
+    /// labelled for methods, functions, and tasks.
+    ///
+    /// ```toml
+    /// [inlay_hints]
+    /// method_hint = "name+type"  # "name" (default) | "type" | "name+type"
+    /// ```
+    #[serde(default)]
+    pub inlay_hints: InlayHintsConfig,
 }
 
 /// `[features]` section of `.mimir.toml`. Each field gates one
@@ -208,6 +218,41 @@ impl Default for FeatureToggles {
             keyword_hover: true,
             formatting: true,
         }
+    }
+}
+
+/// `[inlay_hints]` section of `.mimir.toml`. Controls what information is
+/// displayed in call-site inlay hints for methods, functions, and tasks.
+///
+/// ```toml
+/// [inlay_hints]
+/// method_hint = "name+type"  # "name" (default) | "type" | "name+type"
+/// ```
+///
+/// Macro call hints always show the parameter name only, regardless of this
+/// setting — macros are a preprocessor construct and their parameter types
+/// are always `text`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InlayHintsConfig {
+    /// Label format for method / function / task call inlay hints.
+    ///
+    /// | Value | Label example |
+    /// |-------|---------------|
+    /// | `"name"` (default) | `a ` |
+    /// | `"type"` | `int ` |
+    /// | `"name+type"` | `a: int ` |
+    #[serde(default = "default_method_hint")]
+    pub method_hint: String,
+}
+
+fn default_method_hint() -> String {
+    "name".to_owned()
+}
+
+impl Default for InlayHintsConfig {
+    fn default() -> Self {
+        Self { method_hint: default_method_hint() }
     }
 }
 
@@ -459,6 +504,9 @@ pub struct ResolvedProject {
     /// Formatter settings (from `[formatter]` in `.mimir.toml`).
     /// Passed through verbatim to [`crate::format`] at request time.
     pub formatter: FormatterConfig,
+    /// Inlay-hint label mode for method / function / task calls. Parsed from
+    /// `[inlay_hints] method_hint` in `.mimir.toml`; defaults to `Name`.
+    pub method_hint_mode: mimir_syntax::MethodHintMode,
 }
 
 impl ResolvedProject {
@@ -564,6 +612,12 @@ impl ResolvedProject {
             "resolved project config",
         );
 
+        let method_hint_mode = match cfg.inlay_hints.method_hint.as_str() {
+            "type" => mimir_syntax::MethodHintMode::Type,
+            "name+type" => mimir_syntax::MethodHintMode::NameAndType,
+            _ => mimir_syntax::MethodHintMode::Name,
+        };
+
         Ok(Self {
             root,
             files,
@@ -574,6 +628,7 @@ impl ResolvedProject {
             env,
             features: cfg.features,
             formatter: cfg.formatter,
+            method_hint_mode,
         })
     }
 }

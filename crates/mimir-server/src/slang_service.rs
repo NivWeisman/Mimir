@@ -159,6 +159,20 @@ impl SlangService {
             .unwrap_or_default()
     }
 
+    /// Return the current [`mimir_syntax::MethodHintMode`] from the resolved
+    /// project config.
+    ///
+    /// Falls back to [`mimir_syntax::MethodHintMode::default`] (`Name`) when
+    /// no project config is loaded.
+    pub(crate) async fn current_method_hint_mode(&self) -> mimir_syntax::MethodHintMode {
+        self.project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.method_hint_mode)
+            .unwrap_or_default()
+    }
+
     /// Return the current debounce duration, or `None` when either slang
     /// isn't configured or no project is loaded (both are required before
     /// elaboration is meaningful).
@@ -504,6 +518,7 @@ mod tests {
             env: HashMap::new(),
             features: crate::project::FeatureToggles::default(),
             formatter: crate::project::FormatterConfig::default(),
+            method_hint_mode: mimir_syntax::MethodHintMode::default(),
         }
     }
 

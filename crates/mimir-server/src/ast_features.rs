@@ -318,7 +318,7 @@ pub(crate) fn hover(
             })
             .collect();
         let sig = format!("{kind_label} {name}({})", params.join(", "));
-        parts.push(format!("```systemverilog\n{sig}\n```"));
+        parts.push(mimir_syntax::hover_format::format_sv_signature(&sig));
     } else {
         parts.push(format!("```systemverilog\n{type_part}\n```"));
     }
