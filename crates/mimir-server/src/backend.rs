@@ -1945,6 +1945,14 @@ impl LanguageServer for Backend {
             return Ok(Some(hover));
         }
 
+        // Built-in SV method fallback: cursor on a method defined by the LRM
+        // (e.g. `push_back`, `rand_mode`, `len`) that the workspace index will
+        // never contain. Runs after the workspace lookup so user-defined methods
+        // with the same name always win.
+        if let Some(hover) = builtin_method_hover_at(&tree, &rope, target) {
+            return Ok(Some(hover));
+        }
+
         // Final fallback: cursor on a reserved keyword or `$system_task`
         // for which we have a static one-line LRM-grounded description
         // (e.g. `always_ff`, `$display`). Runs after slang and the
@@ -2176,6 +2184,13 @@ impl LanguageServer for Backend {
                 found
             }
         };
+
+        // Built-in method fallback: `push_back`, `rand_mode`, `len`, etc.
+        // are LRM-defined and will never appear in the workspace index.
+        let sym = sym.or_else(|| {
+            mimir_syntax::builtin_methods::find_method_by_name(&call.name)
+                .map(|m| builtin_to_symbol(m, call.name_range))
+        });
 
         let Some(sym) = sym else {
             debug!(name = %call.name, "signature_help: symbol not found in index");
@@ -2842,10 +2857,48 @@ fn resolve_method_symbol(
             };
             find_method_in_class(wi, &cls, &call.name)
                 .map(|s| MethodResolution::Resolved(s, "obj.method/AST-typed"))
+                .or_else(|| {
+                    // Built-in method for the resolved type (e.g. string.len()),
+                    // or a universal method (rand_mode, constraint_mode) on any class.
+                    mimir_syntax::builtin_methods::find_method(&cls, &call.name)
+                        .or_else(|| mimir_syntax::builtin_methods::find_universal(&call.name))
+                        .map(|m| MethodResolution::Resolved(
+                            builtin_to_symbol(m, call.name_range),
+                            "obj.method/builtin",
+                        ))
+                })
                 .unwrap_or(MethodResolution::NotResolved(
                     "method not found in resolved receiver class",
                 ))
         }
+    }
+}
+
+/// Synthesise a [`Symbol`] from a [`mimir_syntax::builtin_methods::BuiltinMethod`]
+/// so it can be passed to [`hints_for`] and [`signature_for`].
+///
+/// The `name_range` is taken from the call site so the symbol has a
+/// plausible source location; `full_range` matches it (we have no
+/// declaration site for built-ins).
+fn builtin_to_symbol(
+    m: &mimir_syntax::builtin_methods::BuiltinMethod,
+    range: mimir_core::Range,
+) -> Symbol {
+    Symbol {
+        name: m.name.to_owned(),
+        kind: mimir_syntax::SymbolKind::Method,
+        name_range: range,
+        full_range: range,
+        params: Some(
+            m.params
+                .iter()
+                .map(|p| mimir_syntax::symbols::Param {
+                    name: p.name.to_owned(),
+                    ty: p.ty.map(str::to_owned),
+                })
+                .collect(),
+        ),
+        parent_class_name: None,
     }
 }
 
@@ -3126,13 +3179,14 @@ fn syntax_member_completion(
         }
     };
 
-    let members = collect_class_members(wi, &class_name);
-    if members.is_empty() {
+    let workspace_members = collect_class_members(wi, &class_name);
+    let builtins = mimir_syntax::builtin_methods::methods_for_type(&class_name);
+    if workspace_members.is_empty() && builtins.is_empty() {
         return None;
     }
 
     let prefix_lower = prefix.to_ascii_lowercase();
-    let items: Vec<CompletionItem> = members
+    let mut items: Vec<CompletionItem> = workspace_members
         .into_iter()
         .filter(|(s, _)| {
             prefix_lower.is_empty() || s.name.to_ascii_lowercase().starts_with(&prefix_lower)
@@ -3152,10 +3206,31 @@ fn syntax_member_completion(
         })
         .collect();
 
+    // Append built-in methods for the resolved type (e.g. string methods).
+    // Workspace-defined methods with the same name shadow the built-in entry.
+    for m in builtins {
+        if !prefix_lower.is_empty()
+            && !m.name.to_ascii_lowercase().starts_with(&prefix_lower)
+        {
+            continue;
+        }
+        if items.iter().any(|i| i.label == m.name) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: m.name.to_owned(),
+            kind: Some(CompletionItemKind::METHOD),
+            detail: Some("built-in".to_owned()),
+            documentation: Some(Documentation::String(m.doc.to_owned())),
+            ..Default::default()
+        });
+    }
+
     debug!(
         class = %class_name,
         receiver = %receiver,
         count = items.len(),
+        builtin_methods = builtins.len(),
         "member completion: syntax fallback",
     );
     Some(CompletionResponse::Array(items))
@@ -3285,6 +3360,50 @@ fn hover_markdown(line: &str) -> Hover {
 /// markdown popup. Returns `None` for unknown words, whitespace, or
 /// punctuation — the caller treats that as "no hover".
 ///
+/// Hover for IEEE 1800-2017 built-in methods (`push_back`, `rand_mode`,
+/// `len`, `toupper`, `exists`, …).
+///
+/// Runs after [`hover_via_tree_sitter`] returns `None` so any user-defined
+/// method with the same name shadows the built-in entry. The fallback chain:
+///
+/// * `this` / `super` receiver → universal methods only.
+/// * `obj.method` → type-aware lookup for the receiver's declared type
+///   (accurate for `string`), then universal table (accurate for
+///   `rand_mode` / `constraint_mode` on any class).  When the type cannot
+///   be resolved, falls to name-only.
+/// * No receiver → name-only scan across all tables (hover is UX, not
+///   correctness — better to show something than nothing).
+fn builtin_method_hover_at(tree: &SyntaxTree, rope: &Rope, target: MPosition) -> Option<Hover> {
+    use mimir_syntax::symbols::{
+        find_variable_type_at, hover_receiver_at, identifier_at, normalize_type_name, HoverReceiver,
+    };
+
+    let name = identifier_at(tree, rope, target)?;
+    let receiver = hover_receiver_at(tree, rope, target);
+
+    let m: &mimir_syntax::builtin_methods::BuiltinMethod = match &receiver {
+        Some(HoverReceiver::This) | Some(HoverReceiver::Super) => {
+            mimir_syntax::builtin_methods::find_universal(name)?
+        }
+        Some(HoverReceiver::Object(recv)) => {
+            let ty = find_variable_type_at(tree, rope, target, recv);
+            let cls = ty.as_deref().and_then(normalize_type_name);
+            if let Some(cls) = cls {
+                mimir_syntax::builtin_methods::find_method(&cls, name)
+                    .or_else(|| mimir_syntax::builtin_methods::find_universal(name))?
+            } else {
+                mimir_syntax::builtin_methods::find_method_by_name(name)?
+            }
+        }
+        None => mimir_syntax::builtin_methods::find_method_by_name(name)?,
+    };
+
+    Some(hover_from_markdown(format!(
+        "```systemverilog\n{}\n```\n\n{}",
+        m.signature, m.doc
+    )))
+}
+
 /// The popup format mirrors [`hover_for_symbol`] so keyword help looks
 /// the same as symbol help: the word itself in a `systemverilog`
 /// fenced block, then the one-line description as a separate markdown

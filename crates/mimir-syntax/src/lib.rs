@@ -44,6 +44,7 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod builtin_methods;
 pub mod calls;
 pub mod diagnostics;
 pub mod folding;
