@@ -83,6 +83,10 @@ pub struct WorkspaceState {
     pub index: WorkspaceIndex,
     /// Parse tree cache — maps URLs to their most recent successful tree.
     pub trees: HashMap<Url, SyntaxTree>,
+    /// Workspace root directory as resolved during `initialize`. Used by
+    /// `did_change_configuration` to re-discover the project without a
+    /// `.mimir.toml` path in hand.
+    pub root: Option<std::path::PathBuf>,
     /// Presence index: identifier token → set of URLs that contain it.
     /// Built by byte-scanning the source text; much cheaper than full
     /// tree-sitter traversal and sufficient for a pre-filter.

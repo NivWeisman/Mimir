@@ -62,4 +62,4 @@ pub use folding::FoldRange;
 pub use inlay::{InlayLabel, MethodHintMode};
 pub use parser::{SyntaxParser, SyntaxParserError, SyntaxTree};
 pub use signature::{ParamInfo, SignatureInfo};
-pub use symbols::{ChainSegment, MemberChain, Param, Symbol, SymbolKind};
+pub use symbols::{ChainSegment, MemberChain, Param, Symbol, SymbolKind, TypeInfo};

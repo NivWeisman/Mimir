@@ -1161,35 +1161,109 @@ pub fn enclosing_class_info_at(
 }
 
 // --------------------------------------------------------------------------
+// extract_typedef_base — hover expansion for Typedef symbols
+// --------------------------------------------------------------------------
+
+/// Extract the base type text from a `typedef` declaration.
+///
+/// For `typedef logic [31:0] addr_t;` returns `"logic [31:0]"`.
+/// For `typedef enum { A, B } e_t;` returns `"enum { A, B }"`.
+/// For `typedef struct { int x; } s_t;` returns `"struct { int x; }"`.
+/// For `typedef class Foo;` (forward declaration) returns `None`.
+///
+/// The text is sliced from source between `typedef` keyword and the alias
+/// name, trimmed. Returns `None` when the declaration line can't be
+/// located or when the base type is empty.
+#[must_use]
+pub fn extract_typedef_base(tree: &SyntaxTree, rope: &Rope, sym: &Symbol) -> Option<String> {
+    // Find the `type_declaration` node that spans sym.full_range.
+    let source = tree.source();
+    let start_byte = sym.full_range.start.to_byte_offset(rope).ok()?;
+    let end_byte = sym.full_range.end.to_byte_offset(rope).ok()?;
+    let node = tree
+        .tree
+        .root_node()
+        .descendant_for_byte_range(start_byte, start_byte)?;
+
+    // Walk up to the enclosing `type_declaration`.
+    let mut cur = node;
+    let td = loop {
+        if cur.kind() == "type_declaration" {
+            break cur;
+        }
+        cur = cur.parent()?;
+        if cur.byte_range().end < start_byte || cur.byte_range().start > end_byte {
+            return None;
+        }
+    };
+
+    let td_text = td.utf8_text(source.as_bytes()).ok()?;
+
+    // `type_declaration` text is `typedef <base> <alias>;`
+    // Strip the leading "typedef" keyword and trailing ";<alias>" to isolate
+    // the base type. The alias is the last simple_identifier before `;`.
+    let after_typedef = td_text.strip_prefix("typedef")?.trim_start();
+
+    // Find the alias name (sym.name) to know where the base type ends.
+    // Search from the right so we don't confuse a type that contains the
+    // same text as the alias (unlikely but possible in struct field names).
+    let alias = &sym.name;
+    let alias_pos = after_typedef.rfind(alias.as_str())?;
+    let base = after_typedef[..alias_pos].trim_end();
+
+    // Reject forward declarations: `typedef class Foo;` or `typedef Foo;`
+    // — the "base" would be "class" or empty, neither is useful to show.
+    if base.is_empty() || base == "class" {
+        return None;
+    }
+
+    // Trim trailing semicolons that sometimes land in the slice.
+    let base = base.trim_end_matches(';').trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+// --------------------------------------------------------------------------
 // find_variable_type_at — for `obj.method` / `ap = new(...)` resolution
 // --------------------------------------------------------------------------
 
-/// Find the declared type of a variable named `name` visible at `pos`.
+/// Declared type of a variable, split into base type and optional
+/// array/queue/associative dimension suffix.
 ///
-/// Walks the AST from `pos` outward, scanning each ancestor scope for a
-/// declaration matching `name`. The first match wins (innermost scope).
-/// Pruning at nested scope boundaries (functions, classes, modules) keeps
-/// us from finding declarations in unrelated sibling scopes during the
-/// upward walk.
+/// `base` is the element type (`"int"`, `"apb_rw"`, `"string"`, …).
+/// `suffix` is the dimension text when present:
+/// - `Some("[$]")` or `Some("[$:N]")` — queue
+/// - `Some("[]")` — dynamic array
+/// - `Some("[string]")`, `Some("[int]")`, etc. — associative array
+/// - `None` — plain variable (no dimension suffix)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeInfo {
+    /// Element / base type text.
+    pub base: String,
+    /// Dimension suffix, if any.
+    pub suffix: Option<String>,
+}
+
+/// Extended variant of [`find_variable_type_at`] that also captures the
+/// dimension suffix of queues, dynamic arrays, and associative arrays.
 ///
-/// Returns the raw type text from source — e.g. `"uvm_analysis_port#(apb_rw)"`
-/// or `"virtual apb_if.passive"`. Use [`normalize_type_name`] to extract
-/// the base class identifier for workspace-index lookup.
-///
-/// Returns `None` when no declaration of `name` is in scope.
+/// Returns `None` when `name` is not in scope. Use [`find_variable_type_at`]
+/// when you only need the base type — it is a thin wrapper over this.
 #[must_use]
-pub fn find_variable_type_at(
+pub fn find_variable_type_info_at(
     tree: &SyntaxTree,
     rope: &Rope,
     pos: Position,
     name: &str,
-) -> Option<String> {
+) -> Option<TypeInfo> {
     let byte = pos.to_byte_offset(rope).ok()?;
     let mut scope = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
     let source = tree.source();
     loop {
-        if let Some(ty) = search_scope_for_var(scope, name, source, true) {
-            return Some(ty);
+        if let Some(info) = search_scope_for_var_info(scope, name, source, true) {
+            return Some(info);
         }
         match scope.parent() {
             Some(p) => scope = p,
@@ -1198,26 +1272,50 @@ pub fn find_variable_type_at(
     }
 }
 
+/// Find the declared type of a variable named `name` visible at `pos`.
+///
+/// Thin wrapper over [`find_variable_type_info_at`] — returns only the base
+/// type text. Use [`find_variable_type_info_at`] when you also need the
+/// dimension suffix (queues, dynamic arrays, associative arrays).
+#[must_use]
+pub fn find_variable_type_at(
+    tree: &SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+    name: &str,
+) -> Option<String> {
+    find_variable_type_info_at(tree, rope, pos, name).map(|i| i.base)
+}
+
 /// Recursively scan `node`'s descendants for a variable declaration named
-/// `name`. When `is_root` is `false` and we hit another scope boundary
-/// (nested function/class/etc.) we stop descending — those have their own
-/// local declarations that aren't in our scope.
+/// `name` — returns only the base type string. When `is_root` is `false`
+/// and we hit a scope boundary we stop descending.
 fn search_scope_for_var(
     node: Node<'_>,
     name: &str,
     source: &str,
     is_root: bool,
 ) -> Option<String> {
+    search_scope_for_var_info(node, name, source, is_root).map(|i| i.base)
+}
+
+/// [`TypeInfo`]-returning counterpart of [`search_scope_for_var`].
+fn search_scope_for_var_info(
+    node: Node<'_>,
+    name: &str,
+    source: &str,
+    is_root: bool,
+) -> Option<TypeInfo> {
     if !is_root && is_scope_boundary(node.kind()) {
         return None;
     }
-    if let Some(ty) = extract_var_type_if_match(node, name, source) {
-        return Some(ty);
+    if let Some(info) = extract_var_type_info_if_match(node, name, source) {
+        return Some(info);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if let Some(ty) = search_scope_for_var(child, name, source, false) {
-            return Some(ty);
+        if let Some(info) = search_scope_for_var_info(child, name, source, false) {
+            return Some(info);
         }
     }
     None
@@ -1244,11 +1342,15 @@ fn is_scope_boundary(kind: &str) -> bool {
 
 /// If `node` is a variable declaration of `name`, return its type text.
 fn extract_var_type_if_match(node: Node<'_>, name: &str, source: &str) -> Option<String> {
+    extract_var_type_info_if_match(node, name, source).map(|i| i.base)
+}
+
+/// [`TypeInfo`]-returning variant of [`extract_var_type_if_match`].
+/// Captures the dimension suffix (`[$]`, `[]`, `[K]`) from the
+/// `variable_decl_assignment` node alongside the base type.
+fn extract_var_type_info_if_match(node: Node<'_>, name: &str, source: &str) -> Option<TypeInfo> {
     match node.kind() {
-        // `data_declaration` lives both at class scope (`uvm_analysis_port ap;`)
-        // and at block scope (locals via `block_item_declaration`); same shape.
-        "data_declaration" => extract_from_data_declaration(node, name, source),
-        // `tf_port_item` is a formal arg of a function/task or a constructor.
+        "data_declaration" => extract_type_info_from_data_declaration(node, name, source),
         "tf_port_item" | "tf_port_item1" => {
             let name_node = node.child_by_field_name("name")?;
             if name_node.utf8_text(source.as_bytes()).ok()? != name {
@@ -1258,38 +1360,63 @@ fn extract_var_type_if_match(node: Node<'_>, name: &str, source: &str) -> Option
                 node,
                 &["data_type_or_implicit", "data_type"],
             )?;
-            Some(dt.utf8_text(source.as_bytes()).ok()?.trim().to_string())
+            Some(TypeInfo {
+                base: dt.utf8_text(source.as_bytes()).ok()?.trim().to_string(),
+                suffix: None,
+            })
         }
         _ => None,
     }
 }
 
-/// Pull `(name, type)` from a `data_declaration` and return the type if
-/// any of the declared names matches.
-fn extract_from_data_declaration(
+/// Pull `TypeInfo` from a `data_declaration`. Finds the matching name in
+/// `list_of_variable_decl_assignments` and also captures any dimension
+/// suffix node on the matching `variable_decl_assignment`.
+fn extract_type_info_from_data_declaration(
     dd: Node<'_>,
     name: &str,
     source: &str,
-) -> Option<String> {
-    // Find the list_of_variable_decl_assignments and check each entry's name.
+) -> Option<TypeInfo> {
     let list = first_named_child_of_kind(dd, "list_of_variable_decl_assignments")?;
     let mut cursor = list.walk();
-    let has_name = list.named_children(&mut cursor).any(|vda| {
+    // Find the matching variable_decl_assignment to capture its dimension.
+    let matching_vda = list.named_children(&mut cursor).find(|vda| {
         if vda.kind() != "variable_decl_assignment" {
             return false;
         }
         vda.child_by_field_name("name")
             .and_then(|n| n.utf8_text(source.as_bytes()).ok())
             == Some(name)
-    });
-    if !has_name {
-        return None;
-    }
+    })?;
     let dt = first_named_child_of_kinds(
         dd,
         &["data_type_or_implicit", "data_type"],
     )?;
-    Some(dt.utf8_text(source.as_bytes()).ok()?.trim().to_string())
+    let base = dt.utf8_text(source.as_bytes()).ok()?.trim().to_string();
+    let suffix = extract_dimension_suffix(matching_vda, source);
+    Some(TypeInfo { base, suffix })
+}
+
+/// Extract the first dimension-kind child of a `variable_decl_assignment`.
+/// Returns the text of whichever dimension node is present, or `None`.
+fn extract_dimension_suffix(vda: Node<'_>, source: &str) -> Option<String> {
+    let mut c = vda.walk();
+    for child in vda.named_children(&mut c) {
+        match child.kind() {
+            "queue_dimension"
+            | "unsized_dimension"
+            | "associative_dimension"
+            | "unpacked_dimension"
+            | "variable_dimension" => {
+                return child
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|s| s.trim().to_string());
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // --------------------------------------------------------------------------
@@ -2585,6 +2712,52 @@ endclass
         let (tree, rope) = parse_tree_and_rope(src);
         let ty = find_variable_type_at(&tree, &rope, Position::new(2, 4), "nope");
         assert_eq!(ty, None);
+    }
+
+    // TypeInfo / find_variable_type_info_at — dimension suffix capture
+
+    #[test]
+    fn type_info_plain_var_has_no_suffix() {
+        let src = "class c;\n  apb_rw tr;\n  function void f(); tr.bar(); endfunction\nendclass\n";
+        let (tree, rope) = parse_tree_and_rope(src);
+        let info = find_variable_type_info_at(&tree, &rope, Position::new(2, 21), "tr");
+        assert_eq!(
+            info,
+            Some(TypeInfo { base: "apb_rw".to_string(), suffix: None })
+        );
+    }
+
+    #[test]
+    fn type_info_queue_captures_dollar_suffix() {
+        let src = "class c;\n  int q[$];\n  function void f(); q.push_back(1); endfunction\nendclass\n";
+        let (tree, rope) = parse_tree_and_rope(src);
+        let info = find_variable_type_info_at(&tree, &rope, Position::new(2, 21), "q");
+        assert_eq!(
+            info,
+            Some(TypeInfo { base: "int".to_string(), suffix: Some("[$]".to_string()) })
+        );
+    }
+
+    #[test]
+    fn type_info_dynamic_array_captures_empty_brackets() {
+        let src = "class c;\n  int arr[];\n  function void f(); arr.size(); endfunction\nendclass\n";
+        let (tree, rope) = parse_tree_and_rope(src);
+        let info = find_variable_type_info_at(&tree, &rope, Position::new(2, 21), "arr");
+        assert_eq!(
+            info,
+            Some(TypeInfo { base: "int".to_string(), suffix: Some("[]".to_string()) })
+        );
+    }
+
+    #[test]
+    fn type_info_assoc_array_captures_key_type() {
+        let src = "class c;\n  int aa[string];\n  function void f(); aa.num(); endfunction\nendclass\n";
+        let (tree, rope) = parse_tree_and_rope(src);
+        let info = find_variable_type_info_at(&tree, &rope, Position::new(2, 21), "aa");
+        assert_eq!(
+            info,
+            Some(TypeInfo { base: "int".to_string(), suffix: Some("[string]".to_string()) })
+        );
     }
 
     #[test]

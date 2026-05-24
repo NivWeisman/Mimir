@@ -337,6 +337,24 @@ static QUEUE_METHODS: &[BuiltinMethod] = &[
     },
 ];
 
+// ─── dynamic array ───────────────────────────────────────────────────────────
+// IEEE 1800-2017 §7.5 — dynamic array built-in methods.
+
+static DYNAMIC_ARRAY_METHODS: &[BuiltinMethod] = &[
+    BuiltinMethod {
+        name: "size",
+        signature: "function int size()",
+        doc: "Return the number of elements. IEEE 1800-2017 §7.5.1.",
+        params: &[],
+    },
+    BuiltinMethod {
+        name: "delete",
+        signature: "function void delete()",
+        doc: "Release all elements and set the array size to zero. IEEE 1800-2017 §7.5.1.",
+        params: &[],
+    },
+];
+
 // ─── associative array ───────────────────────────────────────────────────────
 // IEEE 1800-2017 §7.8 — associative array built-in methods.
 
@@ -456,6 +474,43 @@ pub fn find_universal(method_name: &str) -> Option<&'static BuiltinMethod> {
     UNIVERSAL_METHODS.iter().find(|m| m.name == method_name)
 }
 
+/// Return all universal methods (valid on any class instance).
+///
+/// Used by completion to unconditionally append `rand_mode`,
+/// `constraint_mode`, and `randomize` after workspace-member candidates.
+#[must_use]
+pub fn universal_methods() -> &'static [BuiltinMethod] {
+    UNIVERSAL_METHODS
+}
+
+/// Return built-in methods for a dimension suffix from a variable declaration.
+///
+/// Maps the raw dimension text captured by
+/// [`mimir_syntax::symbols::find_variable_type_info_at`] to the appropriate
+/// built-in method table:
+///
+/// | Suffix pattern | Table |
+/// |---|---|
+/// | `[$]`, `[$:N]` | [`QUEUE_METHODS`] |
+/// | `[]` | [`DYNAMIC_ARRAY_METHODS`] |
+/// | `[T]` (non-empty key type) | [`ASSOC_ARRAY_METHODS`] |
+/// | anything else | empty |
+#[must_use]
+pub fn methods_for_suffix(suffix: &str) -> &'static [BuiltinMethod] {
+    let s = suffix.trim();
+    if s.starts_with("[$") {
+        QUEUE_METHODS
+    } else if s == "[]" {
+        DYNAMIC_ARRAY_METHODS
+    } else if s.starts_with('[') && s.ends_with(']') && s.len() > 2 && !s.contains(':') {
+        // Non-empty bracketed key without `:`: associative array.
+        // `[3:0]` (packed dimension) contains `:` and is excluded.
+        ASSOC_ARRAY_METHODS
+    } else {
+        &[]
+    }
+}
+
 /// Name-only fallback: search all tables and return the first match.
 ///
 /// Used when the receiver type cannot be inferred from syntax alone
@@ -570,5 +625,49 @@ mod tests {
             let _ = m.params.len();
             let _ = m.signature;
         }
+    }
+
+    // methods_for_suffix
+
+    #[test]
+    fn suffix_queue_returns_queue_methods() {
+        let table = methods_for_suffix("[$]");
+        let names: Vec<&str> = table.iter().map(|m| m.name).collect();
+        assert!(names.contains(&"push_back"), "push_back in queue table");
+        assert!(names.contains(&"pop_front"), "pop_front in queue table");
+        assert!(names.contains(&"size"), "size in queue table");
+    }
+
+    #[test]
+    fn suffix_queue_bounded_returns_queue_methods() {
+        // `[$:N]` is also a queue dimension.
+        let table = methods_for_suffix("[$:5]");
+        assert!(!table.is_empty());
+        assert!(table.iter().any(|m| m.name == "push_back"));
+    }
+
+    #[test]
+    fn suffix_dynamic_array_returns_size_and_delete() {
+        let table = methods_for_suffix("[]");
+        let names: Vec<&str> = table.iter().map(|m| m.name).collect();
+        assert!(names.contains(&"size"), "size in dynamic array table");
+        assert!(names.contains(&"delete"), "delete in dynamic array table");
+        assert!(!names.contains(&"push_back"), "push_back NOT in dynamic array table");
+    }
+
+    #[test]
+    fn suffix_assoc_array_returns_assoc_methods() {
+        let table = methods_for_suffix("[string]");
+        let names: Vec<&str> = table.iter().map(|m| m.name).collect();
+        assert!(names.contains(&"exists"), "exists in assoc table");
+        assert!(names.contains(&"num"), "num in assoc table");
+        assert!(!names.contains(&"push_back"), "push_back NOT in assoc table");
+    }
+
+    #[test]
+    fn suffix_plain_returns_empty() {
+        assert!(methods_for_suffix("").is_empty());
+        assert!(methods_for_suffix("int").is_empty());
+        assert!(methods_for_suffix("[3:0]").is_empty()); // packed dimension, not a collection
     }
 }

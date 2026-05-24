@@ -308,27 +308,21 @@ impl Backend {
     }
 
 
-    /// Re-discover and re-load the project rooted at the directory
-    /// containing `mimir_toml_path`, then re-hydrate the workspace
-    /// symbol index from the resulting filelist. Called when the
-    /// `.mimir.toml` itself changes on disk.
+    /// Re-discover the project from `dir` and re-hydrate the workspace symbol
+    /// index from the resulting filelist.
     ///
-    /// Fire-and-forget: the workspace index update happens on the
-    /// spawned task, mirroring the initialize-time hydration path so
-    /// the watcher event returns promptly. A failed re-discover
-    /// (deleted / malformed config) logs at warn and leaves the
-    /// previous project config in place.
-    async fn rehydrate_project_from(&self, mimir_toml_path: &Path) {
-        let Some(start) = mimir_toml_path.parent() else {
-            warn!(path = %mimir_toml_path.display(), "rehydrate: .mimir.toml has no parent dir");
-            return;
-        };
-        match ResolvedProject::discover(start) {
+    /// Fire-and-forget: the workspace index update happens on a spawned task,
+    /// mirroring the initialize-time hydration path so the caller returns
+    /// promptly. A failed re-discover logs at warn and leaves the previous
+    /// project config in place.
+    async fn reload_project_from_dir(&self, dir: &Path) {
+        match ResolvedProject::discover(dir) {
             Ok(Some(resolved)) => {
                 info!(
+                    dir = %dir.display(),
                     files = resolved.files.len(),
                     include_dirs = resolved.include_dirs.len(),
-                    "rehydrated project from .mimir.toml change",
+                    "project reloaded",
                 );
                 let paths = resolved.files.clone();
                 let include_dirs = resolved.include_dirs.clone();
@@ -341,18 +335,29 @@ impl Backend {
             }
             Ok(None) => {
                 warn!(
-                    path = %mimir_toml_path.display(),
-                    "rehydrate: .mimir.toml event fired but discover returned None; leaving prior project in place",
+                    dir = %dir.display(),
+                    "project reload: no .mimir.toml found; leaving prior config in place",
                 );
             }
             Err(e) => {
                 warn!(
-                    path = %mimir_toml_path.display(),
+                    dir = %dir.display(),
                     error = %e,
-                    "rehydrate: failed to reload .mimir.toml; leaving prior project in place",
+                    "project reload: discovery failed; leaving prior config in place",
                 );
             }
         }
+    }
+
+    /// Re-discover and re-load the project rooted at the directory
+    /// containing `mimir_toml_path`. Called when the `.mimir.toml`
+    /// itself changes on disk via `workspace/didChangeWatchedFiles`.
+    async fn rehydrate_project_from(&self, mimir_toml_path: &Path) {
+        let Some(start) = mimir_toml_path.parent() else {
+            warn!(path = %mimir_toml_path.display(), "rehydrate: .mimir.toml has no parent dir");
+            return;
+        };
+        self.reload_project_from_dir(start).await;
     }
 
     /// Re-parse `path` from disk and replace its entry in the
@@ -827,6 +832,12 @@ impl LanguageServer for Backend {
         // missing/unreadable config logs at warn but never fails the
         // initialise — slang is optional, syntax diagnostics still work.
         if let Some(start) = workspace_root_path(&params) {
+            // Store the root so `did_change_configuration` can re-discover
+            // the project without a `.mimir.toml` path in hand.
+            {
+                let mut ws = self.workspace.write().await;
+                ws.root = Some(start.clone());
+            }
             match ResolvedProject::discover(&start) {
                 Ok(Some(resolved)) => {
                     // If slang wasn't configured via process env at startup,
@@ -1110,6 +1121,23 @@ impl LanguageServer for Backend {
     async fn shutdown(&self) -> LspResult<()> {
         info!("shutdown requested");
         Ok(())
+    }
+
+    async fn did_change_configuration(&self, _params: DidChangeConfigurationParams) {
+        // mimir's runtime configuration lives in `.mimir.toml`, not in
+        // editor settings. Re-discover the project from the stored workspace
+        // root so any `.mimir.toml` changes the editor hasn't already
+        // surfaced via `didChangeWatchedFiles` are picked up.
+        let root = {
+            let ws = self.workspace.read().await;
+            ws.root.clone()
+        };
+        if let Some(dir) = root {
+            info!(dir = %dir.display(), "did_change_configuration: re-discovering project");
+            self.reload_project_from_dir(&dir).await;
+        } else {
+            debug!("did_change_configuration: no workspace root stored; skipping");
+        }
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -3263,6 +3291,11 @@ fn syntax_member_completion(
 ) -> Option<CompletionResponse> {
     let segments = receiver_chain_before_dot(rope, pos)?;
 
+    // `dim_suffix` carries `"[$]"`, `"[]"`, or `"[K]"` when the receiver is a
+    // queue / dynamic array / associative array so we can append the right
+    // built-in table after workspace members.
+    let mut dim_suffix: Option<String> = None;
+
     let class_name: String = if segments.len() == 1 {
         match segments[0].as_str() {
             "super" => {
@@ -3274,8 +3307,10 @@ fn syntax_member_completion(
                 info.class_name
             }
             ident => {
-                let raw = mimir_syntax::symbols::find_variable_type_at(tree, rope, pos, ident)?;
-                mimir_syntax::symbols::normalize_type_name(&raw)?
+                let type_info =
+                    mimir_syntax::symbols::find_variable_type_info_at(tree, rope, pos, ident)?;
+                dim_suffix = type_info.suffix.clone();
+                mimir_syntax::symbols::normalize_type_name(&type_info.base)?
             }
         }
     } else {
@@ -3304,7 +3339,11 @@ fn syntax_member_completion(
 
     let workspace_members = collect_class_members(wi, &class_name);
     let builtins = mimir_syntax::builtin_methods::methods_for_type(&class_name);
-    if workspace_members.is_empty() && builtins.is_empty() {
+    let universals = mimir_syntax::builtin_methods::universal_methods();
+    // Only return None when there is truly nothing to offer — workspace
+    // members, type-specific builtins, AND universal methods are all empty.
+    // (universals is never empty in practice, but guard explicitly.)
+    if workspace_members.is_empty() && builtins.is_empty() && universals.is_empty() {
         return None;
     }
 
@@ -3329,31 +3368,46 @@ fn syntax_member_completion(
         })
         .collect();
 
-    // Append built-in methods for the resolved type (e.g. string methods).
-    // Workspace-defined methods with the same name shadow the built-in entry.
-    for m in builtins {
-        if !prefix_lower.is_empty()
-            && !m.name.to_ascii_lowercase().starts_with(&prefix_lower)
-        {
-            continue;
+    // Helper: append a builtin slice, deduplicating against existing items.
+    let append_builtins = |items: &mut Vec<CompletionItem>,
+                           table: &'static [mimir_syntax::builtin_methods::BuiltinMethod],
+                           prefix_lower: &str| {
+        for m in table {
+            if !prefix_lower.is_empty()
+                && !m.name.to_ascii_lowercase().starts_with(prefix_lower)
+            {
+                continue;
+            }
+            if items.iter().any(|i| i.label == m.name) {
+                continue;
+            }
+            items.push(CompletionItem {
+                label: m.name.to_owned(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: Some("built-in".to_owned()),
+                documentation: Some(Documentation::String(m.doc.to_owned())),
+                ..Default::default()
+            });
         }
-        if items.iter().any(|i| i.label == m.name) {
-            continue;
-        }
-        items.push(CompletionItem {
-            label: m.name.to_owned(),
-            kind: Some(CompletionItemKind::METHOD),
-            detail: Some("built-in".to_owned()),
-            documentation: Some(Documentation::String(m.doc.to_owned())),
-            ..Default::default()
-        });
+    };
+
+    // Type-specific built-ins (e.g. string methods). Workspace wins on collision.
+    append_builtins(&mut items, builtins, &prefix_lower);
+    // Dimension-based built-ins: queue / dynamic-array / associative-array methods.
+    if let Some(sfx) = dim_suffix.as_deref() {
+        append_builtins(
+            &mut items,
+            mimir_syntax::builtin_methods::methods_for_suffix(sfx),
+            &prefix_lower,
+        );
     }
+    // Universal methods (rand_mode, constraint_mode, randomize) on any class.
+    append_builtins(&mut items, universals, &prefix_lower);
 
     debug!(
         class = %class_name,
         receiver = ?segments,
         count = items.len(),
-        builtin_methods = builtins.len(),
         "member completion: syntax fallback",
     );
     Some(CompletionResponse::Array(items))
@@ -3412,7 +3466,37 @@ fn hover_for_symbol(
                 .and_then(|p| std::fs::read_to_string(&p).ok())
                 .and_then(|t| read_line_trimmed(&Rope::from_str(&t), line_no))
         })?;
+
+    // 2a. For typedefs, append the expanded base type after the declaration.
+    if sym.kind == MSymbolKind::Typedef {
+        if let Some(base) = typedef_base_from_line(&line, &sym.name) {
+            let md = format!(
+                "```systemverilog\n{}\n```\n\n**Expands to:** `{}`",
+                line, base
+            );
+            return Some(hover_from_markdown(md));
+        }
+    }
+
     Some(hover_markdown(&line))
+}
+
+/// Extract the base type from a typedef declaration line.
+///
+/// Given `"typedef logic [31:0] addr_t;"` and alias `"addr_t"`, returns
+/// `Some("logic [31:0]")`. Returns `None` for forward declarations
+/// (`typedef class Foo;`) or malformed input.
+fn typedef_base_from_line(line: &str, alias: &str) -> Option<String> {
+    // Strip leading whitespace and "typedef" keyword.
+    let after = line.trim().strip_prefix("typedef")?.trim_start();
+    // Find the alias name from the right so struct/enum field names don't confuse us.
+    let alias_pos = after.rfind(alias)?;
+    let base = after[..alias_pos].trim_end().trim_end_matches(';').trim();
+    // Reject forward declarations: base would be "class" or empty.
+    if base.is_empty() || base == "class" {
+        return None;
+    }
+    Some(base.to_string())
 }
 
 /// Read the source slice covering `sym.full_range` from the open-doc
@@ -3497,7 +3581,8 @@ fn hover_markdown(line: &str) -> Hover {
 ///   correctness — better to show something than nothing).
 fn builtin_method_hover_at(tree: &SyntaxTree, rope: &Rope, target: MPosition) -> Option<Hover> {
     use mimir_syntax::symbols::{
-        find_variable_type_at, hover_receiver_at, identifier_at, normalize_type_name, HoverReceiver,
+        find_variable_type_info_at, hover_receiver_at, identifier_at, normalize_type_name,
+        HoverReceiver,
     };
 
     let name = identifier_at(tree, rope, target)?;
@@ -3508,11 +3593,30 @@ fn builtin_method_hover_at(tree: &SyntaxTree, rope: &Rope, target: MPosition) ->
             mimir_syntax::builtin_methods::find_universal(name)?
         }
         Some(HoverReceiver::Object(recv)) => {
-            let ty = find_variable_type_at(tree, rope, target, recv);
-            let cls = ty.as_deref().and_then(normalize_type_name);
+            let type_info = find_variable_type_info_at(tree, rope, target, recv);
+            let cls = type_info.as_ref().and_then(|t| normalize_type_name(&t.base));
             if let Some(cls) = cls {
+                // Try type-specific then universal (class receiver).
                 mimir_syntax::builtin_methods::find_method(&cls, name)
-                    .or_else(|| mimir_syntax::builtin_methods::find_universal(name))?
+                    .or_else(|| mimir_syntax::builtin_methods::find_universal(name))
+                    .or_else(|| {
+                        // Class lookup missed — fall back to dimension-suffix
+                        // table (e.g. `int q[$]` → QUEUE_METHODS).
+                        type_info
+                            .as_ref()
+                            .and_then(|t| t.suffix.as_deref())
+                            .and_then(|sfx| {
+                                mimir_syntax::builtin_methods::methods_for_suffix(sfx)
+                                    .iter()
+                                    .find(|m| m.name == name)
+                            })
+                    })?
+            } else if let Some(sfx) = type_info.as_ref().and_then(|t| t.suffix.as_deref()) {
+                // No class name at all (e.g. bare `int q[$]`) — go straight
+                // to the dimension-suffix table.
+                mimir_syntax::builtin_methods::methods_for_suffix(sfx)
+                    .iter()
+                    .find(|m| m.name == name)?
             } else {
                 mimir_syntax::builtin_methods::find_method_by_name(name)?
             }
@@ -5724,6 +5828,40 @@ endclass
         }
     }
 
+    /// `syntax_member_completion` always offers universal methods (rand_mode,
+    /// constraint_mode, randomize) on any class receiver, even when the
+    /// class has no workspace-indexed members.
+    #[test]
+    fn syntax_member_completion_universal_methods_on_any_class() {
+        // Index has MyClass but no members — universal methods must still appear.
+        let url = Url::parse("file:///test/my.sv").unwrap();
+        let mut wi = WorkspaceIndex::default();
+        wi.update(url, &[Symbol {
+            name: "MyClass".to_string(),
+            kind: MSymbolKind::Class,
+            name_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, 7)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(5, 0)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        }]);
+
+        let src = "class wrapper;\n  MyClass obj;\n  function void run();\n    obj.\n  endfunction\nendclass\n";
+        let tree = parse_tree(src);
+        let rope = Rope::from_str(src);
+        // Line 3 (0-indexed): "    obj." — cursor after the dot.
+        let pos = MPosition::new(3, 8);
+        let resp = syntax_member_completion(&wi, &tree, &rope, pos, "");
+        assert!(resp.is_some(), "universal methods should make Some");
+        if let Some(CompletionResponse::Array(items)) = resp {
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(labels.contains(&"rand_mode"), "rand_mode should appear");
+            assert!(labels.contains(&"constraint_mode"), "constraint_mode should appear");
+            assert!(labels.contains(&"randomize"), "randomize should appear");
+        }
+    }
+
     /// `syntax_member_completion` returns `None` for an unknown receiver
     /// (undeclared variable) — no workspace dump.
     #[test]
@@ -5736,6 +5874,48 @@ endclass
         assert!(
             syntax_member_completion(&wi, &tree, &rope, pos, "").is_none(),
             "undeclared variable should return None"
+        );
+    }
+
+    // typedef_base_from_line
+
+    #[test]
+    fn typedef_base_logic_vector() {
+        assert_eq!(
+            typedef_base_from_line("typedef logic [31:0] addr_t;", "addr_t"),
+            Some("logic [31:0]".to_string())
+        );
+    }
+
+    #[test]
+    fn typedef_base_enum() {
+        assert_eq!(
+            typedef_base_from_line("typedef enum logic { A, B } my_e;", "my_e"),
+            Some("enum logic { A, B }".to_string())
+        );
+    }
+
+    #[test]
+    fn typedef_base_struct() {
+        assert_eq!(
+            typedef_base_from_line("typedef struct { int x; int y; } point_t;", "point_t"),
+            Some("struct { int x; int y; }".to_string())
+        );
+    }
+
+    #[test]
+    fn typedef_base_forward_class_returns_none() {
+        assert_eq!(
+            typedef_base_from_line("typedef class MyClass;", "MyClass"),
+            None
+        );
+    }
+
+    #[test]
+    fn typedef_base_simple_alias() {
+        assert_eq!(
+            typedef_base_from_line("typedef int my_int_t;", "my_int_t"),
+            Some("int".to_string())
         );
     }
 }
