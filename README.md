@@ -537,6 +537,25 @@ When VS Code launches the server, set the env var in your settings:
 }
 ```
 
+### Slang backend errors
+
+Every failure from the Slang sidecar is tagged `[SlangError]` in the log so
+it is easy to grep:
+
+| Situation | Log level | Tag |
+|-----------|-----------|-----|
+| Sidecar binary not found / cannot spawn | `WARN` | `[SlangError]` |
+| Compile RPC fails (crash, I/O, timeout) | `ERROR` | `[SlangError]` |
+| Slang reports an error-severity diagnostic | `ERROR` | `[SlangError] compile diagnostic` |
+| Slang reports a warning-severity diagnostic | `WARN` | `[SlangError] compile warning` |
+
+Each diagnostic entry carries structured fields: `file`, `line`, `code`, and
+`message`.  Filter them directly:
+
+```bash
+RUST_LOG=mimir=warn mimir-server 2>&1 | grep '\[SlangError\]'
+```
+
 ### Crash diagnostics
 
 Panics are routed through `tracing` before the process exits, so the full
