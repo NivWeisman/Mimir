@@ -874,8 +874,8 @@ impl LanguageServer for Backend {
                                     warn!(
                                         path = %abs_path.display(),
                                         error = %e,
-                                        "could not spawn slang sidecar from .mimir.toml [env]; \
-                                         continuing without",
+                                        "[SlangError] could not spawn slang sidecar from \
+                                         .mimir.toml [env]; continuing without",
                                     );
                                 }
                             }

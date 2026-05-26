@@ -18,7 +18,7 @@ use mimir_ast::{DiagSeverity, MimirAst, MimirDiag, MimirPos, MimirRange};
 use mimir_slang::{Diagnostic as SlangDiag, ElaborateParams, Severity as SlangSeverity};
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::Url;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::slang_service::SlangService;
 
@@ -111,6 +111,31 @@ impl SlangAdapter {
         match self.slang.compile(params).await {
             Ok(result) => {
                 *self.cached_ast.write().await = Some(Arc::new(result.ast));
+
+                for d in &result.diagnostics {
+                    match d.severity {
+                        SlangSeverity::Error => {
+                            error!(
+                                file = %d.path,
+                                line = d.range.start.line,
+                                code = %d.code,
+                                message = %d.message,
+                                "[SlangError] compile diagnostic",
+                            );
+                        }
+                        SlangSeverity::Warning => {
+                            warn!(
+                                file = %d.path,
+                                line = d.range.start.line,
+                                code = %d.code,
+                                message = %d.message,
+                                "[SlangError] compile warning",
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+
                 debug!(
                     files = params.files.len(),
                     "compile RPC succeeded; MimirAst cached"
@@ -125,7 +150,7 @@ impl SlangAdapter {
                 None
             }
             Err(e) => {
-                error!(error = %e, "slang compile RPC failed");
+                error!(error = %e, "[SlangError] compile RPC failed");
                 None
             }
         }

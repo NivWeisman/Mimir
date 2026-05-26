@@ -1288,18 +1288,8 @@ pub fn find_variable_type_at(
 }
 
 /// Recursively scan `node`'s descendants for a variable declaration named
-/// `name` — returns only the base type string. When `is_root` is `false`
-/// and we hit a scope boundary we stop descending.
-fn search_scope_for_var(
-    node: Node<'_>,
-    name: &str,
-    source: &str,
-    is_root: bool,
-) -> Option<String> {
-    search_scope_for_var_info(node, name, source, is_root).map(|i| i.base)
-}
-
-/// [`TypeInfo`]-returning counterpart of [`search_scope_for_var`].
+/// `name`. When `is_root` is `false` and we hit a scope boundary we stop
+/// descending.
 fn search_scope_for_var_info(
     node: Node<'_>,
     name: &str,
@@ -1340,14 +1330,8 @@ fn is_scope_boundary(kind: &str) -> bool {
     )
 }
 
-/// If `node` is a variable declaration of `name`, return its type text.
-fn extract_var_type_if_match(node: Node<'_>, name: &str, source: &str) -> Option<String> {
-    extract_var_type_info_if_match(node, name, source).map(|i| i.base)
-}
-
-/// [`TypeInfo`]-returning variant of [`extract_var_type_if_match`].
-/// Captures the dimension suffix (`[$]`, `[]`, `[K]`) from the
-/// `variable_decl_assignment` node alongside the base type.
+/// If `node` is a variable declaration of `name`, return its full [`TypeInfo`]
+/// including dimension suffix (`[$]`, `[]`, `[K]`) from `variable_decl_assignment`.
 fn extract_var_type_info_if_match(node: Node<'_>, name: &str, source: &str) -> Option<TypeInfo> {
     match node.kind() {
         "data_declaration" => extract_type_info_from_data_declaration(node, name, source),
