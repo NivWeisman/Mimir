@@ -40,6 +40,8 @@ use tracing::{debug, info, warn};
 use crate::diagnostics::mimir_diag_to_lsp;
 use crate::slang_adapter::SlangAdapter;
 use crate::slang_service::{path_to_url, SlangService};
+use crate::workspace_index::WorkspaceState;
+use mimir_syntax::SymbolKind;
 
 // --------------------------------------------------------------------------
 // Internal types
@@ -81,12 +83,19 @@ pub(crate) struct ElaborateService {
     /// Latched `true` after the first successful compile logs its per-file
     /// "indexed by startup slang elaborate" messages.
     startup_logged: Arc<AtomicBool>,
+    /// Shared workspace index — read at publish time to suppress
+    /// `UnknownDirective` diagnostics for macros the tree-sitter scan found.
+    workspace: Arc<RwLock<WorkspaceState>>,
 }
 
 impl ElaborateService {
-    /// Construct the service from a shared `SlangAdapter` and a `Client`
-    /// clone. Both are cheap (reference-counted); no data is copied.
-    pub(crate) fn new(adapter: Arc<SlangAdapter>, client: Client) -> Self {
+    /// Construct the service from a shared `SlangAdapter`, a `Client` clone,
+    /// and the workspace state. All three are cheap (reference-counted).
+    pub(crate) fn new(
+        adapter: Arc<SlangAdapter>,
+        client: Client,
+        workspace: Arc<RwLock<WorkspaceState>>,
+    ) -> Self {
         Self {
             adapter,
             client,
@@ -94,6 +103,7 @@ impl ElaborateService {
             last_hash: Arc::new(RwLock::new(None)),
             published: Arc::new(RwLock::new(HashSet::new())),
             startup_logged: Arc::new(AtomicBool::new(false)),
+            workspace,
         }
     }
 
@@ -129,6 +139,7 @@ impl ElaborateService {
         let last_hash = self.last_hash.clone();
         let startup_logged = self.startup_logged.clone();
         let lsp_client = self.client.clone();
+        let workspace = self.workspace.clone();
         let trigger_for_task = trigger_uri.clone();
 
         let handle = tokio::spawn(async move {
@@ -159,8 +170,22 @@ impl ElaborateService {
                 "sending compile request",
             );
             if let Some(outcome) = adapter.compile(&params, files_in_request).await {
-                publish_slang_result(&lsp_client, &outcome.files_in_request, outcome.diagnostics, &published)
-                    .await;
+                let known_macros: HashSet<String> = {
+                    let ws = workspace.read().await;
+                    ws.index
+                        .entries()
+                        .filter(|e| e.symbol.kind == SymbolKind::Macro)
+                        .map(|e| e.symbol.name.clone())
+                        .collect()
+                };
+                publish_slang_result(
+                    &lsp_client,
+                    &outcome.files_in_request,
+                    outcome.diagnostics,
+                    &published,
+                    &known_macros,
+                )
+                .await;
                 *last_hash.write().await = Some(input_hash);
 
                 if startup_logged
@@ -212,9 +237,10 @@ async fn publish_slang_result(
     files_in_request: &[Url],
     diagnostics: Vec<(String, MimirDiag)>,
     slang_published: &Arc<RwLock<HashSet<Url>>>,
+    known_macros: &HashSet<String>,
 ) {
     let prev_snapshot = slang_published.read().await.clone();
-    let plan = plan_slang_publishes(files_in_request, diagnostics, &prev_snapshot);
+    let plan = plan_slang_publishes(files_in_request, diagnostics, &prev_snapshot, known_macros);
 
     for (url, diags) in &plan.publishes {
         lsp_client
@@ -251,9 +277,13 @@ fn plan_slang_publishes(
     files_in_request: &[Url],
     diagnostics: Vec<(String, MimirDiag)>,
     previous_published: &HashSet<Url>,
+    known_macros: &HashSet<String>,
 ) -> SlangPublishPlan {
     let mut by_url: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
     for (path, d) in diagnostics {
+        if suppressed_unknown_directive(&d, known_macros) {
+            continue;
+        }
         let Some(url) = path_to_url(&path) else {
             warn!(path = %path, "could not map slang path back to a URL; dropping");
             continue;
@@ -307,6 +337,38 @@ fn plan_slang_publishes(
 }
 
 // --------------------------------------------------------------------------
+// Diagnostic suppression helpers
+// --------------------------------------------------------------------------
+
+/// Extract the bare macro name from a slang `UnknownDirective` message.
+///
+/// Slang formats this as `"unknown macro or compiler directive '`name'"`.
+/// Returns the name without the leading backtick, or `None` if the message
+/// doesn't match that format.
+fn extract_macro_name(message: &str) -> Option<&str> {
+    let end = message.rfind('\'')?;
+    let before_end = &message[..end];
+    let start = before_end.rfind('\'')? + 1;
+    let raw = &message[start..end];
+    Some(raw.strip_prefix('`').unwrap_or(raw))
+}
+
+/// Returns `true` when `diag` is an `UnknownDirective` for a macro that the
+/// tree-sitter workspace index already knows about.
+///
+/// Slang emits `UnknownDirective` for every backtick macro it hasn't seen
+/// a `define for. When the workspace index found the macro via `include
+/// scanning (hover already works), showing the error alongside correct hover
+/// info is contradictory. Suppress it to avoid false-positive red squiggles
+/// on UVM macros that slang just wasn't given the include path for.
+fn suppressed_unknown_directive(diag: &MimirDiag, known_macros: &HashSet<String>) -> bool {
+    if diag.code != "UnknownDirective" {
+        return false;
+    }
+    extract_macro_name(&diag.message).is_some_and(|name| known_macros.contains(name))
+}
+
+// --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------
 
@@ -338,7 +400,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let url_b = Url::parse("file:///proj/b.sv").unwrap();
         let diags = vec![mimir_diag_at("/proj/a.sv", "X")];
-        let plan = plan_slang_publishes(&[url_a.clone(), url_b.clone()], diags, &HashSet::new());
+        let plan = plan_slang_publishes(&[url_a.clone(), url_b.clone()], diags, &HashSet::new(), &HashSet::new());
 
         assert_eq!(plan.publishes.len(), 2);
         let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
@@ -357,7 +419,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let prev = HashSet::from([url_dropped.clone()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev);
+        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev, &HashSet::new());
 
         assert_eq!(plan.publishes.len(), 2);
         assert!(plan
@@ -378,7 +440,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let prev = HashSet::from([url_a.clone()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev);
+        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev, &HashSet::new());
 
         assert_eq!(plan.publishes.len(), 1);
         assert!(plan.publishes[0].1.is_empty());
@@ -391,7 +453,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let diags = vec![mimir_diag_at("/proj/inc/uvm.svh", "X")];
 
-        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new());
+        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &HashSet::new());
 
         assert_eq!(plan.publishes.len(), 2);
         let inc_url = Url::parse("file:///proj/inc/uvm.svh").unwrap();
@@ -400,5 +462,62 @@ mod tests {
             .iter()
             .any(|(u, d)| u == &inc_url && d.len() == 1));
         assert!(plan.new_published.contains(&inc_url));
+    }
+
+    fn unknown_directive_diag(path: &str, directive: &str) -> (String, MimirDiag) {
+        (
+            path.into(),
+            MimirDiag {
+                range: MimirRange {
+                    start: MimirPos { line: 0, character: 0 },
+                    end:   MimirPos { line: 0, character: 1 },
+                },
+                severity: DiagSeverity::Error,
+                code:    "UnknownDirective".into(),
+                message: format!("unknown macro or compiler directive '`{directive}'"),
+            },
+        )
+    }
+
+    /// `UnknownDirective` for a macro in `known_macros` is suppressed.
+    #[test]
+    fn unknown_directive_suppressed_when_macro_known() {
+        let url_a = Url::parse("file:///proj/a.sv").unwrap();
+        let diags = vec![unknown_directive_diag("/proj/a.sv", "uvm_field_utils_begin")];
+        let known = HashSet::from(["uvm_field_utils_begin".to_string()]);
+
+        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &known);
+
+        let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
+        assert!(a_pub.1.is_empty(), "diagnostic should be suppressed");
+        assert!(plan.new_published.is_empty());
+    }
+
+    /// `UnknownDirective` for a macro NOT in `known_macros` is kept.
+    #[test]
+    fn unknown_directive_kept_when_macro_unknown() {
+        let url_a = Url::parse("file:///proj/a.sv").unwrap();
+        let diags = vec![unknown_directive_diag("/proj/a.sv", "truly_undefined_macro")];
+        let known = HashSet::from(["uvm_field_utils_begin".to_string()]);
+
+        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &known);
+
+        let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
+        assert_eq!(a_pub.1.len(), 1, "unrecognized macro diagnostic should pass through");
+    }
+
+    /// `extract_macro_name` correctly strips the backtick prefix.
+    #[test]
+    fn extract_macro_name_strips_backtick() {
+        assert_eq!(
+            extract_macro_name("unknown macro or compiler directive '`uvm_field_utils_begin'"),
+            Some("uvm_field_utils_begin"),
+        );
+    }
+
+    /// `extract_macro_name` returns `None` for unrecognised message formats.
+    #[test]
+    fn extract_macro_name_none_on_bad_format() {
+        assert_eq!(extract_macro_name("some other error"), None);
     }
 }

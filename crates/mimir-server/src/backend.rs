@@ -168,7 +168,7 @@ impl Backend {
                 ts.clone(),
                 workspace.clone(),
             ),
-            elaborate: ElaborateService::new(adapter.clone(), client.clone()),
+            elaborate: ElaborateService::new(adapter.clone(), client.clone(), workspace.clone()),
             slang,
             adapter,
             client,
