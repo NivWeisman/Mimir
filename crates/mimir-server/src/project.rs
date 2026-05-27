@@ -307,6 +307,16 @@ pub struct SlangConfig {
     /// user stops editing. Read by Stage 3.
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+
+    /// Raw flags forwarded verbatim to the sidecar on every compile request.
+    /// Use for libslang options that have no dedicated TOML key:
+    ///
+    /// ```toml
+    /// [slang]
+    /// extra_args = ["--timescale", "1ns/1ps"]
+    /// ```
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 fn default_debounce_ms() -> u64 {
@@ -322,6 +332,7 @@ impl Default for SlangConfig {
             defines: Vec::new(),
             top: None,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
+            extra_args: Vec::new(),
         }
     }
 }
@@ -507,6 +518,9 @@ pub struct ResolvedProject {
     /// Inlay-hint label mode for method / function / task calls. Parsed from
     /// `[inlay_hints] method_hint` in `.mimir.toml`; defaults to `Name`.
     pub method_hint_mode: mimir_syntax::MethodHintMode,
+    /// Raw flags forwarded to [`ElaborateParams::extra_args`] on each compile.
+    /// Set from `[slang] extra_args` in `.mimir.toml`.
+    pub slang_extra_args: Vec<String>,
 }
 
 impl ResolvedProject {
@@ -609,6 +623,7 @@ impl ResolvedProject {
             env_vars = env.len(),
             top = ?cfg.slang.top,
             debounce_ms = cfg.slang.debounce_ms,
+            extra_args = cfg.slang.extra_args.len(),
             "resolved project config",
         );
 
@@ -629,6 +644,7 @@ impl ResolvedProject {
             features: cfg.features,
             formatter: cfg.formatter,
             method_hint_mode,
+            slang_extra_args: cfg.slang.extra_args,
         })
     }
 }
@@ -887,6 +903,23 @@ mod tests {
     fn formatter_config_rejects_unknown_keys() {
         let bad = "[formatter]\ncolum_limit = 80\n";
         assert!(toml::from_str::<ProjectConfig>(bad).is_err());
+    }
+
+    /// `[slang] extra_args` round-trips through TOML parsing.
+    #[test]
+    fn slang_extra_args_round_trips() {
+        let cfg: ProjectConfig = toml::from_str(r#"
+            [slang]
+            extra_args = ["--timescale", "1ns/1ps"]
+        "#).unwrap();
+        assert_eq!(cfg.slang.extra_args, ["--timescale", "1ns/1ps"]);
+    }
+
+    /// Omitting `[slang] extra_args` defaults to an empty vec.
+    #[test]
+    fn slang_extra_args_defaults_empty() {
+        let cfg: ProjectConfig = toml::from_str("").unwrap();
+        assert!(cfg.slang.extra_args.is_empty());
     }
 
     /// `[slang] files` entries are prepended before filelist entries.

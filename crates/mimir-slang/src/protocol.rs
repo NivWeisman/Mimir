@@ -122,6 +122,15 @@ pub struct ElaborateParams {
     /// "diagnostics across the whole compilation unit" mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top: Option<String>,
+
+    /// Raw flags forwarded verbatim to the sidecar's libslang compile call.
+    /// Use for options that have no dedicated field — e.g.
+    /// `["--timescale", "1ns/1ps"]` or `["--allow-use-before-declare"]`.
+    ///
+    /// Omitted from the wire when empty (`skip_serializing_if`) so existing
+    /// sidecar versions that do not recognise the field are unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
 }
 
 /// One file in [`ElaborateParams::files`].

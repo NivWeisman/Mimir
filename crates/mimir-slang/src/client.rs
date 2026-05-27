@@ -497,6 +497,7 @@ mod tests {
             include_dirs: vec![],
             defines: vec![],
             top: None,
+            extra_args: vec![],
         };
         let result = conn.compile(&params).await.expect("compile ok");
         sidecar.await.unwrap();
@@ -534,6 +535,7 @@ mod tests {
             include_dirs: vec![],
             defines: vec![],
             top: None,
+            extra_args: vec![],
         };
         let err = conn.compile(&params).await.unwrap_err();
         sidecar.await.unwrap();
@@ -566,6 +568,7 @@ mod tests {
             include_dirs: vec![],
             defines: vec![],
             top: None,
+            extra_args: vec![],
         };
         let err = conn.compile(&params).await.unwrap_err();
         sidecar.await.unwrap();
@@ -601,6 +604,7 @@ mod tests {
                 include_dirs: vec![],
                 defines: vec![],
                 top: None,
+                extra_args: vec![],
             })
             .await
             .unwrap_err();
@@ -658,6 +662,7 @@ mod tests {
                 include_dirs: vec![],
                 defines: vec![],
                 top: None,
+                extra_args: vec![],
             })
             .await;
         sidecar.await.unwrap();
@@ -693,6 +698,7 @@ mod tests {
             include_dirs: vec![],
             defines: vec![],
             top: None,
+            extra_args: vec![],
         };
         let _ = conn.compile(&p).await.unwrap();
         let _ = conn.compile(&p).await.unwrap();

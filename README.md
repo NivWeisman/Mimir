@@ -295,6 +295,10 @@ top          = "tb_top"
 # Quiet time (ms) before re-elaborating after the user stops typing.
 debounce_ms  = 350
 
+# Raw flags forwarded verbatim to the sidecar on every compile request.
+# Use for libslang options that have no dedicated TOML key, e.g.:
+extra_args   = ["--timescale", "1ns/1ps"]
+
 [inlay_hints]
 # Label format for method / function / task call inlay hints.
 # "name"      — parameter name only:        a  (default, same as macros)

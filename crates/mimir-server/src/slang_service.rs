@@ -259,6 +259,9 @@ impl SlangService {
             d.value.hash(&mut h);
         }
         params.top.hash(&mut h);
+        for arg in &params.extra_args {
+            arg.hash(&mut h);
+        }
         h.finish()
     }
 
@@ -482,6 +485,7 @@ pub(crate) fn assemble_elaborate_params(
         include_dirs,
         defines: project.defines.clone(),
         top: project.top.clone(),
+        extra_args: project.slang_extra_args.clone(),
     };
     (params, files_in_request)
 }
@@ -519,6 +523,7 @@ mod tests {
             features: crate::project::FeatureToggles::default(),
             formatter: crate::project::FormatterConfig::default(),
             method_hint_mode: mimir_syntax::MethodHintMode::default(),
+            slang_extra_args: vec![],
         }
     }
 
@@ -808,5 +813,37 @@ mod tests {
         let rope = rope_from("`M");
         let pos = MPosition::new(99, 0);
         assert!(detect_macro_trigger(&rope, pos).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // hash_inputs
+    // ------------------------------------------------------------------
+
+    fn minimal_params() -> ElaborateParams {
+        ElaborateParams {
+            files: vec![],
+            include_dirs: vec![],
+            defines: vec![],
+            top: None,
+            extra_args: vec![],
+        }
+    }
+
+    /// Different `extra_args` produce a different hash so a TOML change
+    /// triggers a fresh sidecar compile rather than being skipped as unchanged.
+    #[test]
+    fn hash_changes_when_extra_args_differ() {
+        let base = minimal_params();
+        let mut with_ts = base.clone();
+        with_ts.extra_args = vec!["--timescale".into(), "1ns/1ps".into()];
+        assert_ne!(SlangService::hash_inputs(&base), SlangService::hash_inputs(&with_ts));
+    }
+
+    /// Two calls with identical `extra_args` (in the same order) hash the same.
+    #[test]
+    fn hash_stable_with_same_extra_args() {
+        let mut p = minimal_params();
+        p.extra_args = vec!["--timescale".into(), "1ns/1ps".into()];
+        assert_eq!(SlangService::hash_inputs(&p), SlangService::hash_inputs(&p));
     }
 }
