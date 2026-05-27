@@ -487,6 +487,26 @@ impl Backend {
         let rope = Rope::from_str(tree.source());
         let name = mimir_syntax::symbols::identifier_at(&tree, &rope, target)?;
 
+        // For member accesses (obj.method), try type-aware chain resolution
+        // first. Without this, a raw workspace name-match would fire and return
+        // every declaration named e.g. `configure` across the whole project.
+        // Chain_resolve uses the receiver type so it can return the single
+        // correct declaration.
+        if let Some(chain) = mimir_syntax::symbols::parse_member_chain_at(&tree, &rope, target) {
+            if chain.target_idx > 0 {
+                let ws = self.workspace.read().await;
+                if let Some((url, sym)) =
+                    chain_resolve::resolve_member_chain(&chain, target, &tree, &rope, &ws.index)
+                {
+                    debug!(name, "chain definition resolved");
+                    return Some(GotoDefinitionResponse::Array(vec![Location {
+                        uri: url,
+                        range: m_range_to_lsp(sym.name_range),
+                    }]));
+                }
+            }
+        }
+
         // Workspace fallback: clone the slice for `name` under the read
         // lock (lock-then-clone) so the resolver runs without holding
         // either lock. Empty slice when there's no workspace match.
@@ -510,24 +530,6 @@ impl Backend {
                 .collect();
             debug!(name, count = locations.len(), "syntax definition resolved");
             return Some(GotoDefinitionResponse::Array(locations));
-        }
-
-        // Multi-hop member chain fallback (e.g. `a.b.c`, `this.ap.write`).
-        // `resolve_definition` handles bare names and single-hop via workspace
-        // index; deeper chains need the chain resolver.
-        if let Some(chain) = mimir_syntax::symbols::parse_member_chain_at(&tree, &rope, target) {
-            if chain.target_idx > 0 {
-                let ws = self.workspace.read().await;
-                if let Some((url, sym)) =
-                    chain_resolve::resolve_member_chain(&chain, target, &tree, &rope, &ws.index)
-                {
-                    debug!(name, "chain definition resolved");
-                    return Some(GotoDefinitionResponse::Array(vec![Location {
-                        uri: url,
-                        range: m_range_to_lsp(sym.name_range),
-                    }]));
-                }
-            }
         }
 
         debug!(name, "no symbol matches in same-file or workspace index");

@@ -129,7 +129,14 @@ fn visible_in_file(file: &MimirFile, pos: MimirPos) -> Vec<&MimirDecl> {
 }
 
 fn collect_scope_chain<'a>(scope: &'a MimirScope, pos: MimirPos, out: &mut Vec<&'a MimirDecl>) {
-    out.extend(scope.declarations.iter());
+    for decl in &scope.declarations {
+        out.push(decl);
+        // When the cursor is inside a declaration's body (e.g. a class body),
+        // its members (methods, fields) are visible at the call site.
+        if decl.full_range.contains(pos) {
+            out.extend(decl.members.iter());
+        }
+    }
     for child in &scope.children {
         if child.range.contains(pos) {
             collect_scope_chain(child, pos, out);
