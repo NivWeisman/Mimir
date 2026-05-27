@@ -57,7 +57,7 @@ sidecar: $(SIDECAR_BIN)
 
 $(SIDECAR_BIN):
 	cmake $(CMAKE_GENERATOR) -S slang-sidecar -B $(SIDECAR_BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
-	cmake --build $(SIDECAR_BUILD_DIR)
+	cmake --build $(SIDECAR_BUILD_DIR) --parallel
 
 # Download verible-verilog-format for local development and integration tests.
 # The binary is placed in tools/verible/bin/ which is listed in .gitignore.
