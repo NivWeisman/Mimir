@@ -493,17 +493,33 @@ impl Backend {
         // Chain_resolve uses the receiver type so it can return the single
         // correct declaration.
         if let Some(chain) = mimir_syntax::symbols::parse_member_chain_at(&tree, &rope, target) {
+            debug!(
+                name,
+                segments = chain.segments.len(),
+                target_idx = chain.target_idx,
+                chain = ?chain.segments,
+                "member chain detected at cursor",
+            );
             if chain.target_idx > 0 {
                 let ws = self.workspace.read().await;
-                if let Some((url, sym)) =
-                    chain_resolve::resolve_member_chain(&chain, target, &tree, &rope, &ws.index)
-                {
-                    debug!(name, "chain definition resolved");
-                    return Some(GotoDefinitionResponse::Array(vec![Location {
-                        uri: url,
-                        range: m_range_to_lsp(sym.name_range),
-                    }]));
+                match chain_resolve::resolve_member_chain(&chain, target, &tree, &rope, &ws.index) {
+                    Some((url, sym)) => {
+                        debug!(name, resolved_url = %url, "chain definition resolved");
+                        return Some(GotoDefinitionResponse::Array(vec![Location {
+                            uri: url,
+                            range: m_range_to_lsp(sym.name_range),
+                        }]));
+                    }
+                    None => {
+                        debug!(
+                            name,
+                            target_idx = chain.target_idx,
+                            "chain definition unresolved — falling through to workspace name lookup",
+                        );
+                    }
                 }
+            } else {
+                debug!(name, "member chain target_idx == 0 (cursor on root) — skipping chain resolver");
             }
         }
 

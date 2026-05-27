@@ -24,6 +24,7 @@ use mimir_syntax::{
 use mimir_syntax::Symbol;
 use ropey::Rope;
 use tower_lsp::lsp_types::Url;
+use tracing::{debug, trace};
 
 use crate::workspace_index::WorkspaceIndex;
 
@@ -53,17 +54,37 @@ pub(crate) fn find_method_in_class(
 ) -> Option<(Url, Symbol)> {
     let mut current = class_name.to_string();
     let mut visited = std::collections::HashSet::new();
-    for _ in 0..16 {
+    for hop in 0..16 {
         if !visited.insert(current.clone()) {
+            debug!(class = %current, hop, "find_method_in_class: inheritance cycle detected");
             return None;
         }
-        let class_entry = wi
+        let class_entry = match wi
             .lookup(&current)
             .iter()
             .find(|e| e.symbol.kind == MSymbolKind::Class)
-            .cloned()?;
-        if let Some(entry) = wi
-            .lookup(method_name)
+            .cloned()
+        {
+            Some(e) => e,
+            None => {
+                debug!(
+                    class = %current,
+                    method = %method_name,
+                    hop,
+                    "find_method_in_class: class not in workspace index",
+                );
+                return None;
+            }
+        };
+        let candidates = wi.lookup(method_name);
+        trace!(
+            class = %current,
+            method = %method_name,
+            hop,
+            candidate_count = candidates.len(),
+            "find_method_in_class: scanning method candidates",
+        );
+        if let Some(entry) = candidates
             .iter()
             .find(|e| {
                 e.url == class_entry.url
@@ -71,13 +92,38 @@ pub(crate) fn find_method_in_class(
                     && e.symbol.kind == MSymbolKind::Method
             })
         {
+            debug!(
+                class = %current,
+                method = %method_name,
+                hop,
+                url = %entry.url,
+                "find_method_in_class: hit",
+            );
             return Some((entry.url.clone(), entry.symbol.clone()));
         }
         match class_entry.symbol.parent_class_name {
-            Some(parent) => current = parent,
-            None => return None,
+            Some(parent) => {
+                trace!(
+                    from = %current,
+                    parent = %parent,
+                    method = %method_name,
+                    hop,
+                    "find_method_in_class: miss in class — ascending to parent",
+                );
+                current = parent;
+            }
+            None => {
+                debug!(
+                    class = %current,
+                    method = %method_name,
+                    hop,
+                    "find_method_in_class: no match and no parent — giving up",
+                );
+                return None;
+            }
         }
     }
+    debug!(class = %class_name, method = %method_name, "find_method_in_class: exceeded 16-hop limit");
     None
 }
 
@@ -90,15 +136,28 @@ pub(crate) fn find_field_in_class(
 ) -> Option<(Url, Symbol)> {
     let mut current = class_name.to_string();
     let mut visited = std::collections::HashSet::new();
-    for _ in 0..16 {
+    for hop in 0..16 {
         if !visited.insert(current.clone()) {
+            debug!(class = %current, hop, "find_field_in_class: inheritance cycle detected");
             return None;
         }
-        let class_entry = wi
+        let class_entry = match wi
             .lookup(&current)
             .iter()
             .find(|e| e.symbol.kind == MSymbolKind::Class)
-            .cloned()?;
+            .cloned()
+        {
+            Some(e) => e,
+            None => {
+                debug!(
+                    class = %current,
+                    field = %field_name,
+                    hop,
+                    "find_field_in_class: class not in workspace index",
+                );
+                return None;
+            }
+        };
         if let Some(entry) = wi
             .lookup(field_name)
             .iter()
@@ -111,13 +170,39 @@ pub(crate) fn find_field_in_class(
                     )
             })
         {
+            debug!(
+                class = %current,
+                field = %field_name,
+                hop,
+                url = %entry.url,
+                kind = ?entry.symbol.kind,
+                "find_field_in_class: hit",
+            );
             return Some((entry.url.clone(), entry.symbol.clone()));
         }
         match class_entry.symbol.parent_class_name {
-            Some(parent) => current = parent,
-            None => return None,
+            Some(parent) => {
+                trace!(
+                    from = %current,
+                    parent = %parent,
+                    field = %field_name,
+                    hop,
+                    "find_field_in_class: miss in class — ascending to parent",
+                );
+                current = parent;
+            }
+            None => {
+                debug!(
+                    class = %current,
+                    field = %field_name,
+                    hop,
+                    "find_field_in_class: no match and no parent — giving up",
+                );
+                return None;
+            }
         }
     }
+    debug!(class = %class_name, field = %field_name, "find_field_in_class: exceeded 16-hop limit");
     None
 }
 
@@ -162,16 +247,59 @@ pub(crate) fn resolve_member_chain(
     // ── Phase 1: resolve root type ────────────────────────────────────────
     let root_type: String = match &chain.segments[0] {
         ChainSegment::Root(name) => {
-            let raw = find_variable_type_at(tree, rope, pos, name)?;
-            normalize_type_name(&raw)?
+            let raw = match find_variable_type_at(tree, rope, pos, name) {
+                Some(t) => t,
+                None => {
+                    debug!(receiver = %name, "chain phase 1: find_variable_type_at returned None");
+                    return None;
+                }
+            };
+            match normalize_type_name(&raw) {
+                Some(t) => {
+                    debug!(receiver = %name, raw_type = %raw, normalized = %t, "chain phase 1: root resolved (Root)");
+                    t
+                }
+                None => {
+                    debug!(receiver = %name, raw_type = %raw, "chain phase 1: normalize_type_name failed");
+                    return None;
+                }
+            }
         }
         ChainSegment::This => {
-            enclosing_class_info_at(tree, rope, pos)?.class_name
+            match enclosing_class_info_at(tree, rope, pos) {
+                Some(info) => {
+                    debug!(class = %info.class_name, "chain phase 1: root resolved (This)");
+                    info.class_name
+                }
+                None => {
+                    debug!("chain phase 1: enclosing_class_info_at returned None for `this`");
+                    return None;
+                }
+            }
         }
         ChainSegment::Super => {
-            enclosing_class_info_at(tree, rope, pos)?.parent_class_name?
+            let info = match enclosing_class_info_at(tree, rope, pos) {
+                Some(i) => i,
+                None => {
+                    debug!("chain phase 1: enclosing_class_info_at returned None for `super`");
+                    return None;
+                }
+            };
+            match info.parent_class_name {
+                Some(p) => {
+                    debug!(parent = %p, "chain phase 1: root resolved (Super)");
+                    p
+                }
+                None => {
+                    debug!(class = %info.class_name, "chain phase 1: `super` used in class with no parent");
+                    return None;
+                }
+            }
         }
-        _ => return None,
+        other => {
+            debug!(segment = ?other, "chain phase 1: unexpected root segment kind");
+            return None;
+        }
     };
 
     if chain.target_idx == 0 {
@@ -183,31 +311,102 @@ pub(crate) fn resolve_member_chain(
     let intermediate = &chain.segments[1..chain.target_idx];
     for (hop, seg) in intermediate.iter().enumerate() {
         if hop >= MAX_INTERMEDIATE_HOPS {
-            tracing::debug!(
+            debug!(
                 hop,
                 segment = ?seg,
                 "chain resolver: exceeded 2-hop limit, falling back to slang"
             );
             return None;
         }
-        let name = seg.name()?;
-        let (_, sym) = find_member(wi, &current_type, name)?;
+        let name = match seg.name() {
+            Some(n) => n,
+            None => {
+                debug!(hop, segment = ?seg, "chain phase 2: hop segment has no name");
+                return None;
+            }
+        };
+        let (_, sym) = match find_member(wi, &current_type, name) {
+            Some(m) => m,
+            None => {
+                debug!(
+                    hop,
+                    class = %current_type,
+                    member = %name,
+                    "chain phase 2: find_member returned None at hop",
+                );
+                return None;
+            }
+        };
         // Advance the current type: MethodCall uses return_type, Member uses decl_type.
         // Try both to handle edge cases where the classifier is uncertain.
         let raw_type = match seg {
             ChainSegment::MethodCall(_) => {
-                sym.return_type.as_deref().or(sym.decl_type.as_deref())?
+                match sym.return_type.as_deref().or(sym.decl_type.as_deref()) {
+                    Some(t) => t,
+                    None => {
+                        debug!(
+                            hop, class = %current_type, member = %name,
+                            "chain phase 2: method hop has neither return_type nor decl_type",
+                        );
+                        return None;
+                    }
+                }
             }
             _ => {
-                sym.decl_type.as_deref().or(sym.return_type.as_deref())?
+                match sym.decl_type.as_deref().or(sym.return_type.as_deref()) {
+                    Some(t) => t,
+                    None => {
+                        debug!(
+                            hop, class = %current_type, member = %name,
+                            "chain phase 2: field hop has neither decl_type nor return_type",
+                        );
+                        return None;
+                    }
+                }
             }
         };
-        current_type = normalize_type_name(raw_type)?;
+        let normalized = match normalize_type_name(raw_type) {
+            Some(t) => t,
+            None => {
+                debug!(
+                    hop, class = %current_type, member = %name, raw_type,
+                    "chain phase 2: normalize_type_name failed for hop result",
+                );
+                return None;
+            }
+        };
+        trace!(
+            hop, from_class = %current_type, member = %name,
+            raw_type, normalized_type = %normalized,
+            "chain phase 2: hop advanced",
+        );
+        current_type = normalized;
     }
 
     // ── Phase 3: resolve target ───────────────────────────────────────────
-    let target_name = chain.segments[chain.target_idx].name()?;
-    find_member(wi, &current_type, target_name)
+    let target_name = match chain.segments[chain.target_idx].name() {
+        Some(n) => n,
+        None => {
+            debug!(target_idx = chain.target_idx, "chain phase 3: target segment has no name");
+            return None;
+        }
+    };
+    let result = find_member(wi, &current_type, target_name);
+    match &result {
+        Some((url, sym)) => debug!(
+            class = %current_type,
+            target = %target_name,
+            resolved_url = %url,
+            resolved_kind = ?sym.kind,
+            "chain phase 3: target resolved",
+        ),
+        None => debug!(
+            class = %current_type,
+            target = %target_name,
+            "chain phase 3: find_member returned None for target",
+        ),
+    }
+    result
 }
 
 // --------------------------------------------------------------------------
