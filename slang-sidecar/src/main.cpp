@@ -619,13 +619,22 @@ static slang::SourceRange narrow_call_range(
     if (expr.syntax->kind != SyntaxKind::InvocationExpression) {
         return expr.sourceRange;
     }
-    auto& inv = expr.syntax->as<InvocationExpressionSyntax>();
-    const auto* left = inv.left.get();
+    const auto* left = expr.syntax->as<InvocationExpressionSyntax>().left.get();
     if (left == nullptr) return expr.sourceRange;
-    if (left->kind == SyntaxKind::MemberAccessExpression) {
-        return left->as<MemberAccessExpressionSyntax>().name.range();
+    // The callee is a name: a free `foo`, a dotted `obj.method` (which
+    // slang parses as a ScopedName with a `.` separator, *not* a
+    // MemberAccessExpression), or a `::`-scoped `pkg::cls::method`. Narrow
+    // to the final segment's token so the use_range covers just the method
+    // name and never the receiver chain — that keeps it from overlapping
+    // the receiver's own ref.
+    switch (left->kind) {
+        case SyntaxKind::ScopedName:
+            return left->as<ScopedNameSyntax>().right->sourceRange();
+        case SyntaxKind::MemberAccessExpression:
+            return left->as<MemberAccessExpressionSyntax>().name.range();
+        default:
+            return left->sourceRange();
     }
-    return left->sourceRange();
 }
 
 struct RefCollector
@@ -651,7 +660,12 @@ struct RefCollector
         auto use_end   = sm.getFullyOriginalLoc(use_range.end());
         if (!use_start.valid()) return;
 
-        std::string use_path{sm.getFileName(use_start)};
+        // Key by the same full path `build_file_top_scope` uses for its
+        // "which file owns this" decision — `getFileName` returns a
+        // cwd-relative string that won't match the client's absolute
+        // `files[].path`, so the per-file attachment would silently drop
+        // every ref.
+        std::string use_path = loc_to_file_path(sm, use_start);
         if (use_path.empty()) return;
 
         std::string target_path = loc_to_file_path(sm, target->location);
@@ -690,10 +704,17 @@ struct RefCollector
     }
     void handle(const slang::ast::CallExpression& expr) {
         // System calls (`$display`, `$cast`, …) have no user-source target.
-        // Method calls via `obj.method(…)` are already captured by the
-        // MemberAccessExpression handler — emitting again would create a
-        // duplicate ref at the same narrowed range.
-        if (!expr.isSystemCall() && expr.thisClass() == nullptr) {
+        // Every other call — free `foo(args)` and method `obj.method(args)`
+        // alike — gets a ref at its callee/method name token. slang fuses
+        // the method name into `subroutine` and never revisits it as a
+        // MemberAccessExpression (CallExpression::visitExprs only descends
+        // into thisClass + arguments), so this is the *only* place a
+        // method-name token gets referenced. `narrow_call_range` returns
+        // the `.name` token for a member-access callee and the bare
+        // identifier for a free call, so there is no overlap with the
+        // MemberAccessExpression handler (which fires only for non-call
+        // member access like `obj.field`).
+        if (!expr.isSystemCall()) {
             const auto* sub =
                 std::get<const slang::ast::SubroutineSymbol*>(expr.subroutine);
             record(narrow_call_range(expr), sub);

@@ -2327,6 +2327,15 @@ impl LanguageServer for Backend {
         };
         let rope = Rope::from_str(tree.source());
 
+        // Slang reference map (receiver-aware method resolution). Fetched
+        // once for the whole viewport; `None` when no compile has landed or
+        // the URI isn't a real file path.
+        let cached_ast = self.adapter.cached_ast().await;
+        let file_path = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned));
+
         let call_sites = call_sites_in(&tree, &rope, vp_range);
         debug!(
             calls = call_sites.len(),
@@ -2357,6 +2366,51 @@ impl LanguageServer for Backend {
             //   * `obj.X(...)`    → resolve via the AST-declared type of `obj`
             if matches!(call.kind, CallKind::Method { .. }) {
                 let recv = receiver.unwrap_or("");
+
+                // Slang-first: the reference map resolves the method name
+                // token to its declaration regardless of where in the
+                // inheritance chain it lives (including UVM bases the
+                // tree-sitter workspace index never sees). Read its params
+                // and render hints directly, skipping the tree-sitter
+                // resolver entirely on a hit.
+                if let (Some(ast), Some(path)) = (&cached_ast, &file_path) {
+                    let name_pos = mimir_ast::MimirPos {
+                        line: call.name_range.start.line,
+                        character: call.name_range.start.character,
+                    };
+                    if let Some(params) =
+                        ast_features::method_params_at(ast, path, name_pos)
+                    {
+                        let sym = synth_method_symbol(call, params);
+                        let labels = hints_for(call, &sym, hint_mode);
+                        debug!(
+                            name = %call.name,
+                            receiver = recv,
+                            via = "slang-refmap",
+                            sym_params = sym.params.as_ref().map(|p| p.len()).unwrap_or(0),
+                            call_args = call.args.len(),
+                            labels = labels.len(),
+                            "inlay_hint trace: method resolved",
+                        );
+                        for label in labels {
+                            hints.push(InlayHint {
+                                position: Position::new(
+                                    label.position.line,
+                                    label.position.character,
+                                ),
+                                label: InlayHintLabel::String(label.text),
+                                kind: Some(InlayHintKind::PARAMETER),
+                                text_edits: None,
+                                tooltip: None,
+                                padding_left: None,
+                                padding_right: Some(true),
+                                data: None,
+                            });
+                        }
+                        continue;
+                    }
+                }
+
                 let resolved = resolve_method_symbol(call, recv, &tree, &rope, &index, &ws.index);
                 match resolved {
                     MethodResolution::Resolved(sym, source_label) => {
@@ -3093,6 +3147,30 @@ fn builtin_to_symbol(
                     name: p.name.to_owned(),
                     ty: p.ty.map(str::to_owned),
                 })
+                .collect(),
+        ),
+        parent_class_name: None,
+        return_type: None,
+        decl_type: None,
+    }
+}
+
+/// Synthesise a callable [`Symbol`] from `(name, type)` params resolved via
+/// the slang reference map, so it can feed [`hints_for`]. `hints_for` reads
+/// only `params`; the ranges are taken from the call site for plausibility.
+fn synth_method_symbol(
+    call: &mimir_syntax::calls::CallSite,
+    params: Vec<(String, Option<String>)>,
+) -> Symbol {
+    Symbol {
+        name: call.name.clone(),
+        kind: mimir_syntax::SymbolKind::Method,
+        name_range: call.name_range,
+        full_range: call.name_range,
+        params: Some(
+            params
+                .into_iter()
+                .map(|(name, ty)| mimir_syntax::symbols::Param { name, ty })
                 .collect(),
         ),
         parent_class_name: None,

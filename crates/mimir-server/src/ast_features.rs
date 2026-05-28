@@ -238,6 +238,62 @@ fn find_ref_at(file: &MimirFile, pos: MimirPos) -> Option<&MimirRef> {
     candidate.use_range.contains(pos).then_some(candidate)
 }
 
+/// Find the declaration whose name-token `range` equals `target`, searching
+/// `file`'s scope tree and descending into each decl's `members` (methods
+/// and fields live as members of their enclosing class decl, so a flat
+/// scope walk would miss them).
+fn find_decl_at(file: &MimirFile, target: MimirRange) -> Option<&MimirDecl> {
+    fn search_decls(decls: &[MimirDecl], target: MimirRange) -> Option<&MimirDecl> {
+        for d in decls {
+            if d.range == target {
+                return Some(d);
+            }
+            if let Some(found) = search_decls(&d.members, target) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    fn search_scope(scope: &MimirScope, target: MimirRange) -> Option<&MimirDecl> {
+        if let Some(found) = search_decls(&scope.declarations, target) {
+            return Some(found);
+        }
+        scope.children.iter().find_map(|c| search_scope(c, target))
+    }
+    search_scope(&file.top_scope, target)
+}
+
+/// Resolve the method call whose name token is at `pos` to its formal
+/// parameters, via the slang reference map plus the target decl's `Port`
+/// members.
+///
+/// Returns `(name, type_str)` pairs in declaration order, or `None` when
+/// `pos` isn't on a resolved function/task call or the target decl can't
+/// be located in the AST. Powers the slang-first path of `inlay_hint`,
+/// which needs the callee's parameters to label call arguments — and is
+/// receiver-aware, so it resolves methods inherited from base classes the
+/// tree-sitter workspace index never indexed (e.g. UVM bases).
+pub(crate) fn method_params_at(
+    ast: &MimirAst,
+    file_uri: &str,
+    pos: MimirPos,
+) -> Option<Vec<(String, Option<String>)>> {
+    let file = ast.find_file(file_uri)?;
+    let r = find_ref_at(file, pos)?;
+    if !matches!(r.target_kind, DeclKind::Function | DeclKind::Task) {
+        return None;
+    }
+    let target_file = ast.find_file(&r.target_path)?;
+    let decl = find_decl_at(target_file, r.target_range)?;
+    let params = decl
+        .members
+        .iter()
+        .filter(|m| m.kind == DeclKind::Port)
+        .map(|m| (m.name.clone(), m.type_str.clone()))
+        .collect();
+    Some(params)
+}
+
 // --------------------------------------------------------------------------
 // goto-definition
 // --------------------------------------------------------------------------
@@ -851,6 +907,102 @@ mod tests {
         assert!(find_ref_at(&file, make_pos(0, 0)).is_none());
         // Cursor past last ref's end returns None.
         assert!(find_ref_at(&file, make_pos(9, 0)).is_none());
+    }
+
+    /// Build a two-file AST: `call.sv` has a method-call ref at the cursor
+    /// pointing into `defs.sv`, where `base_cls` declares `configure(int a,
+    /// string b)` as a nested member. Mirrors the cross-file inherited-method
+    /// shape that breaks the tree-sitter path.
+    fn ast_with_method_ref() -> MimirAst {
+        // configure() with two Port members, nested inside base_cls.
+        let mut configure = make_decl("configure", DeclKind::Function, 5);
+        configure.members = vec![
+            {
+                let mut p = make_decl("a", DeclKind::Port, 5);
+                p.type_str = Some("int".to_owned());
+                p
+            },
+            {
+                let mut p = make_decl("b", DeclKind::Port, 5);
+                p.type_str = Some("string".to_owned());
+                p
+            },
+        ];
+        let mut base_cls = make_decl("base_cls", DeclKind::Class, 2);
+        base_cls.members = vec![configure];
+
+        MimirAst {
+            files: vec![
+                MimirFile {
+                    uri: "/tmp/call.sv".to_string(),
+                    diagnostics: vec![],
+                    top_scope: MimirScope {
+                        range: make_range(0, 0, 50, 0),
+                        declarations: vec![],
+                        children: vec![],
+                        imported_packages: vec![],
+                    },
+                    references: vec![MimirRef {
+                        use_range: make_range(30, 8, 30, 17),
+                        target_path: "/tmp/defs.sv".to_string(),
+                        // matches configure's name-token range (make_decl uses
+                        // range = line,0 .. line,name_len).
+                        target_range: make_range(5, 0, 5, "configure".len() as u32),
+                        target_kind: DeclKind::Function,
+                    }],
+                },
+                MimirFile {
+                    uri: "/tmp/defs.sv".to_string(),
+                    diagnostics: vec![],
+                    top_scope: MimirScope {
+                        range: make_range(0, 0, 50, 0),
+                        declarations: vec![base_cls],
+                        children: vec![],
+                        imported_packages: vec![],
+                    },
+                    references: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn method_params_at_resolves_cross_file_nested_method() {
+        let ast = ast_with_method_ref();
+        let params = method_params_at(&ast, "/tmp/call.sv", make_pos(30, 10))
+            .expect("ref at the call site should resolve to configure's params");
+        assert_eq!(
+            params,
+            vec![
+                ("a".to_string(), Some("int".to_string())),
+                ("b".to_string(), Some("string".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn method_params_at_returns_none_for_non_callable_target() {
+        let mut ast = ast_with_method_ref();
+        // Flip the ref's target to a variable — params lookup must decline.
+        ast.files[0].references[0].target_kind = DeclKind::Variable;
+        assert!(method_params_at(&ast, "/tmp/call.sv", make_pos(30, 10)).is_none());
+    }
+
+    #[test]
+    fn method_params_at_returns_none_when_no_ref_at_pos() {
+        let ast = ast_with_method_ref();
+        // Cursor nowhere near the single recorded use_range.
+        assert!(method_params_at(&ast, "/tmp/call.sv", make_pos(0, 0)).is_none());
+    }
+
+    #[test]
+    fn find_decl_at_locates_nested_member() {
+        let ast = ast_with_method_ref();
+        let defs = ast.find_file("/tmp/defs.sv").unwrap();
+        let decl = find_decl_at(defs, make_range(5, 0, 5, "configure".len() as u32))
+            .expect("configure is nested in base_cls.members");
+        assert_eq!(decl.name, "configure");
+        assert_eq!(decl.kind, DeclKind::Function);
     }
 
     #[test]
