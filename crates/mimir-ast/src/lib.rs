@@ -18,5 +18,5 @@ pub mod types;
 
 pub use types::{
     DeclKind, DiagSeverity, MimirAst, MimirDecl, MimirDiag, MimirFile, MimirPos, MimirRange,
-    MimirScope, Visibility,
+    MimirRef, MimirScope, Visibility,
 };

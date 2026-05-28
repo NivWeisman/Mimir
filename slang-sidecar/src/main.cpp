@@ -14,7 +14,9 @@
 // found") and the loop continues so a misbehaving client doesn't take the
 // sidecar down.
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -27,8 +29,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
 #include <slang/ast/Symbol.h>
+#include <slang/ast/expressions/CallExpression.h>
+#include <slang/ast/expressions/MiscExpressions.h>
+#include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/symbols/ClassSymbols.h>
 #include <slang/ast/symbols/InstanceSymbols.h>
 #include <slang/ast/symbols/ParameterSymbols.h>
@@ -547,6 +553,164 @@ static json build_file_top_scope(
     return scope;
 }
 
+// --- reference map -------------------------------------------------------
+//
+// Walk the elaborated AST and collect resolved (use-site → target-decl)
+// links. The Rust side consumes these via `MimirFile::references` to
+// answer goto-definition in O(log n) by use-site range, bypassing the
+// name-based lookup that can't disambiguate inherited methods named the
+// same as the receiver type's own (e.g. UVM `configure`).
+//
+// Disambiguation rule for overlapping ranges: every emitted use_range
+// must be the **name token** of the use site, not a composite
+// expression. For `obj.method(args)` we narrow:
+//   * `MemberAccessExpression` → the `name` token in the syntax
+//   * Free `CallExpression`    → the left expression's identifier
+// `NamedValueExpression`'s `sourceRange` already spans just the name, so
+// no narrowing is needed there.
+//
+// For methods accessed via `.`, the SubroutineSymbol is reachable both
+// from the `CallExpression.subroutine` and from the inner
+// `MemberAccessExpression.member`. The CallExpression handler skips
+// these to avoid emitting a duplicate ref.
+
+static const char* symbol_kind_to_decl_kind(const slang::ast::Symbol& sym) {
+    using SK = slang::ast::SymbolKind;
+    switch (sym.kind) {
+        case SK::Package:       return "package";
+        case SK::ClassType:     return "class";
+        case SK::Subroutine: {
+            auto& sub = sym.as<slang::ast::SubroutineSymbol>();
+            return (sub.subroutineKind == slang::ast::SubroutineKind::Task)
+                ? "task" : "function";
+        }
+        case SK::Variable:
+        case SK::Net:           return "variable";
+        case SK::Field:         return "field";
+        case SK::Parameter:
+        case SK::TypeParameter: return "parameter";
+        case SK::Port:          return "port";
+        case SK::EnumValue:     return "enumMember";
+        case SK::TypeAlias:     return "typedef";
+        default:                return nullptr;
+    }
+}
+
+// Pull the right-hand identifier's token range from a member-access
+// expression so we don't shadow the inner receiver's `NamedValueExpression`.
+static slang::SourceRange narrow_member_access_range(
+    const slang::ast::MemberAccessExpression& expr) {
+    using namespace slang::syntax;
+    if (expr.syntax != nullptr
+        && expr.syntax->kind == SyntaxKind::MemberAccessExpression) {
+        return expr.syntax->as<MemberAccessExpressionSyntax>().name.range();
+    }
+    return expr.sourceRange;
+}
+
+// For a free call `foo(args)`, narrow the use_range to just the callee's
+// name token. For class-method calls via `obj.method(args)` the
+// MemberAccessExpression handler already emits the right ref, so this
+// helper is only used when no thisClass is present.
+static slang::SourceRange narrow_call_range(
+    const slang::ast::CallExpression& expr) {
+    using namespace slang::syntax;
+    if (expr.syntax == nullptr) return expr.sourceRange;
+    if (expr.syntax->kind != SyntaxKind::InvocationExpression) {
+        return expr.sourceRange;
+    }
+    auto& inv = expr.syntax->as<InvocationExpressionSyntax>();
+    const auto* left = inv.left.get();
+    if (left == nullptr) return expr.sourceRange;
+    if (left->kind == SyntaxKind::MemberAccessExpression) {
+        return left->as<MemberAccessExpressionSyntax>().name.range();
+    }
+    return left->sourceRange();
+}
+
+struct RefCollector
+    : public slang::ast::ASTVisitor<RefCollector, slang::ast::VisitFlags::AllGood> {
+    const slang::SourceManager& sm;
+    // path → vector of partially-built JSON ref entries. Populated in
+    // traversal order; the caller sorts each file's vector by
+    // use_range.start before emitting.
+    std::unordered_map<std::string, std::vector<json>>& refs_by_file;
+
+    RefCollector(const slang::SourceManager& sm_,
+                 std::unordered_map<std::string, std::vector<json>>& refs_by_file_)
+        : sm(sm_), refs_by_file(refs_by_file_) {}
+
+    void record(slang::SourceRange use_range, const slang::ast::Symbol* target) {
+        if (target == nullptr) return;
+        if (target->name.empty()) return;
+        if (!use_range.start().valid() || !use_range.end().valid()) return;
+
+        // Macro-aware: the user's editor lives in the original source
+        // buffer, so map both endpoints back through any macro expansion.
+        auto use_start = sm.getFullyOriginalLoc(use_range.start());
+        auto use_end   = sm.getFullyOriginalLoc(use_range.end());
+        if (!use_start.valid()) return;
+
+        std::string use_path{sm.getFileName(use_start)};
+        if (use_path.empty()) return;
+
+        std::string target_path = loc_to_file_path(sm, target->location);
+        if (target_path.empty()) return;
+
+        const char* kind = symbol_kind_to_decl_kind(*target);
+        if (kind == nullptr) return;
+
+        json target_range_json;
+        if (auto* syn = target->getSyntax(); syn != nullptr) {
+            target_range_json = make_mimir_range(sm, syn->sourceRange());
+        } else {
+            target_range_json = make_mimir_point_range(sm, target->location);
+        }
+
+        slang::SourceRange orig_use{use_start, use_end};
+        json entry;
+        entry["use_range"]    = make_mimir_range(sm, orig_use);
+        entry["target_path"]  = std::move(target_path);
+        entry["target_range"] = std::move(target_range_json);
+        entry["target_kind"]  = kind;
+        refs_by_file[use_path].push_back(std::move(entry));
+    }
+
+    void handle(const slang::ast::NamedValueExpression& expr) {
+        record(expr.sourceRange, &expr.symbol);
+        visitDefault(expr);
+    }
+    void handle(const slang::ast::HierarchicalValueExpression& expr) {
+        record(expr.sourceRange, &expr.symbol);
+        visitDefault(expr);
+    }
+    void handle(const slang::ast::MemberAccessExpression& expr) {
+        record(narrow_member_access_range(expr), &expr.member);
+        visitDefault(expr);
+    }
+    void handle(const slang::ast::CallExpression& expr) {
+        // System calls (`$display`, `$cast`, …) have no user-source target.
+        // Method calls via `obj.method(…)` are already captured by the
+        // MemberAccessExpression handler — emitting again would create a
+        // duplicate ref at the same narrowed range.
+        if (!expr.isSystemCall() && expr.thisClass() == nullptr) {
+            const auto* sub =
+                std::get<const slang::ast::SubroutineSymbol*>(expr.subroutine);
+            record(narrow_call_range(expr), sub);
+        }
+        visitDefault(expr);
+    }
+};
+
+// Returns true unless the user explicitly disabled ref emission via
+// `MIMIR_SLANG_EMIT_REFS=0`. Read once per `handle_compile` so a flipped
+// env var on a long-lived sidecar takes effect on the next compile.
+static bool refs_emission_enabled() {
+    const char* env = std::getenv("MIMIR_SLANG_EMIT_REFS");
+    if (env == nullptr) return true;
+    return std::string_view{env} != "0";
+}
+
 static json handle_compile(const json& params) {
     auto built      = build_compilation(params);
     auto& sm        = *built.sm;
@@ -558,6 +722,28 @@ static json handle_compile(const json& params) {
     std::unordered_map<std::string, json> diags_by_file;
     for (const auto& d : all_diags) {
         diags_by_file[d.value("path", std::string{})].push_back(d);
+    }
+
+    // Walk every elaborated expression in the compilation and capture
+    // resolved name-use → declaration links. Sorted per-file by
+    // use_range.start so the Rust side can binary-search at the cursor.
+    std::unordered_map<std::string, std::vector<json>> refs_by_file;
+    if (refs_emission_enabled()) {
+        RefCollector collector{sm, refs_by_file};
+        comp.getRoot().visit(collector);
+        for (const auto* pkg : comp.getPackages()) {
+            if (pkg != nullptr) pkg->visit(collector);
+        }
+        for (auto& [_, vec] : refs_by_file) {
+            std::sort(vec.begin(), vec.end(), [](const json& a, const json& b) {
+                const auto& as = a["use_range"]["start"];
+                const auto& bs = b["use_range"]["start"];
+                auto al = as["line"].get<uint32_t>();
+                auto bl = bs["line"].get<uint32_t>();
+                if (al != bl) return al < bl;
+                return as["character"].get<uint32_t>() < bs["character"].get<uint32_t>();
+            });
+        }
     }
 
     json files = json::array();
@@ -578,6 +764,15 @@ static json handle_compile(const json& params) {
             }
             file_json["diagnostics"] = std::move(file_diags);
             file_json["top_scope"]   = build_file_top_scope(sm, comp, path);
+
+            // Attach the collected refs (empty array when the kill-switch
+            // is set or the file had no resolved uses).
+            json refs_json = json::array();
+            if (auto it = refs_by_file.find(path); it != refs_by_file.end()) {
+                for (auto& r : it->second) refs_json.push_back(std::move(r));
+            }
+            file_json["references"] = std::move(refs_json);
+
             files.push_back(std::move(file_json));
         }
     }

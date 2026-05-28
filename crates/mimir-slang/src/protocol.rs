@@ -365,6 +365,71 @@ mod tests {
         assert!(!back.is_compilation_unit);
     }
 
+    /// A `CompileResult` wire payload that carries a `references` table
+    /// on one of its files decodes intact, with the entries' fields
+    /// preserved. This locks the wire shape of the new reference map.
+    #[test]
+    fn compile_result_with_references_roundtrip() {
+        let payload = serde_json::json!({
+            "ast": {
+                "files": [{
+                    "uri": "/proj/use.sv",
+                    "diagnostics": [],
+                    "top_scope": {
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 0}},
+                        "declarations": [],
+                        "children": [],
+                        "imported_packages": []
+                    },
+                    "references": [{
+                        "use_range": {"start": {"line": 5, "character": 8}, "end": {"line": 5, "character": 17}},
+                        "target_path": "/proj/def.sv",
+                        "target_range": {"start": {"line": 42, "character": 6}, "end": {"line": 42, "character": 15}},
+                        "target_kind": "function"
+                    }]
+                }]
+            },
+            "diagnostics": []
+        });
+        let decoded: CompileResult =
+            serde_json::from_value(payload).expect("decode references payload");
+        let refs = &decoded.ast.files[0].references;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].target_path, "/proj/def.sv");
+        assert_eq!(refs[0].use_range.start.line, 5);
+        assert_eq!(refs[0].target_range.start.line, 42);
+
+        // Encode → decode again to confirm round-trip stability.
+        let encoded = serde_json::to_string(&decoded).unwrap();
+        let back: CompileResult = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(back.ast.files[0].references[0].target_path, "/proj/def.sv");
+    }
+
+    /// A sidecar that pre-dates the reference map omits `references`.
+    /// The decoder must accept the legacy payload and surface an empty
+    /// `references` vec — this is the rollout-compatibility contract.
+    #[test]
+    fn compile_result_without_references_decodes_as_empty() {
+        let legacy = serde_json::json!({
+            "ast": {
+                "files": [{
+                    "uri": "/proj/legacy.sv",
+                    "diagnostics": [],
+                    "top_scope": {
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
+                        "declarations": [],
+                        "children": [],
+                        "imported_packages": []
+                    }
+                }]
+            },
+            "diagnostics": []
+        });
+        let decoded: CompileResult =
+            serde_json::from_value(legacy).expect("legacy decode");
+        assert!(decoded.ast.files[0].references.is_empty());
+    }
+
     /// `Diagnostic` round-trips with a realistic-looking range.
     #[test]
     fn diagnostic_roundtrip() {

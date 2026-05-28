@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use mimir_ast::{DeclKind, MimirAst, MimirDecl, MimirFile, MimirPos, MimirRange, MimirScope};
+use mimir_ast::{DeclKind, MimirAst, MimirDecl, MimirFile, MimirPos, MimirRange, MimirRef, MimirScope};
 use ropey::Rope;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, GotoDefinitionResponse, Hover,
@@ -209,6 +209,36 @@ pub(crate) fn find_decl<'a>(
 }
 
 // --------------------------------------------------------------------------
+// Reference-map lookup
+// --------------------------------------------------------------------------
+
+/// Half-open `a <= b` over [`MimirPos`] (line major, then UTF-16 char).
+///
+/// `MimirPos` deliberately doesn't implement `Ord` — comparing positions
+/// only makes sense relative to a known file's line structure — so the
+/// helper lives here, scoped to the reference-map binary search.
+fn pos_le(a: MimirPos, b: MimirPos) -> bool {
+    a.line < b.line || (a.line == b.line && a.character <= b.character)
+}
+
+/// Find the [`MimirRef`] whose `use_range` contains `pos`, if any.
+///
+/// Assumes `file.references` is sorted by `use_range.start` (sidecar
+/// invariant). Use-site ranges for distinct identifier tokens do not
+/// overlap, so at most one entry can match — we binary-search to the
+/// rightmost candidate and check `contains` on it.
+fn find_ref_at(file: &MimirFile, pos: MimirPos) -> Option<&MimirRef> {
+    let idx = file
+        .references
+        .partition_point(|r| pos_le(r.use_range.start, pos));
+    if idx == 0 {
+        return None;
+    }
+    let candidate = &file.references[idx - 1];
+    candidate.use_range.contains(pos).then_some(candidate)
+}
+
+// --------------------------------------------------------------------------
 // goto-definition
 // --------------------------------------------------------------------------
 
@@ -217,18 +247,40 @@ pub(crate) fn find_decl<'a>(
 /// Returns `None` when the cursor isn't on an identifier we can find in
 /// the MimirAst; the caller should fall through to the slang IPC or
 /// tree-sitter paths.
+///
+/// Resolution order:
+///   1. **Reference map** — the sidecar's resolved-reference table for
+///      `file_uri`. This is receiver-aware (slang's name binder did the
+///      work) so it handles inherited fields, typedef chains, and
+///      package-imported symbols.
+///   2. **Name lookup fallback** — `word_at_rope` + `find_decl`, kept
+///      for sidecars that pre-date the reference map (the field
+///      decodes as empty) and for use sites the visitor doesn't yet
+///      cover (e.g. `` `define `` macros).
 pub(crate) fn definition(
     ast: &Arc<MimirAst>,
     file_uri: &str,
     pos: MimirPos,
     rope: &Rope,
 ) -> Option<GotoDefinitionResponse> {
-    let name = word_at_rope(rope, pos)?;
+    if let Some(file) = ast.find_file(file_uri) {
+        if let Some(r) = find_ref_at(file, pos) {
+            let uri = Url::parse(&format!("file://{}", r.target_path)).ok()?;
+            let location = Location { uri, range: mimir_to_lsp_range(r.target_range) };
+            debug!(
+                target_path = %r.target_path,
+                target_kind = ?r.target_kind,
+                "ast definition resolved via reference map",
+            );
+            return Some(GotoDefinitionResponse::Scalar(location));
+        }
+    }
 
+    let name = word_at_rope(rope, pos)?;
     let (decl, decl_file) = find_decl(ast, file_uri, pos, &name)?;
     let uri = Url::parse(&format!("file://{decl_file}")).ok()?;
     let location = Location { uri, range: mimir_to_lsp_range(decl.range) };
-    debug!(name, file = decl_file, "ast definition resolved");
+    debug!(name, file = decl_file, "ast definition resolved via name lookup");
     Some(GotoDefinitionResponse::Scalar(location))
 }
 
@@ -641,6 +693,7 @@ mod tests {
                     children: vec![],
                     imported_packages: vec![],
                 },
+                references: vec![],
             }],
         }
     }
@@ -666,6 +719,7 @@ mod tests {
                 children: vec![],
                 imported_packages: vec![],
             },
+            references: vec![],
         });
         let decls = visible_decls(&ast, "/tmp/a.sv", make_pos(5, 0));
         let names: Vec<&str> = decls.iter().map(|d| d.name.as_str()).collect();
@@ -697,6 +751,106 @@ mod tests {
     fn find_decl_unknown_returns_none() {
         let ast = simple_ast();
         assert!(find_decl(&ast, "/tmp/a.sv", make_pos(0, 0), "nonexistent").is_none());
+    }
+
+    #[test]
+    fn definition_via_ref_map_returns_target() {
+        // Build an AST where the cursor lands on a use_range and the ref
+        // points at a target in a *different* file with a *different* name
+        // than the use. The reference-map path must win over the name path.
+        let mut ast = simple_ast();
+        ast.files[0].references.push(MimirRef {
+            use_range: make_range(7, 4, 7, 13),
+            target_path: "/tmp/other.sv".to_string(),
+            target_range: make_range(42, 6, 42, 15),
+            target_kind: DeclKind::Function,
+        });
+        let ast = Arc::new(ast);
+
+        let rope = Rope::from_str(""); // intentionally empty: ref-map path must not consult it
+        let resp = definition(&ast, "/tmp/a.sv", make_pos(7, 6), &rope).unwrap();
+        let GotoDefinitionResponse::Scalar(loc) = resp else {
+            panic!("expected Scalar response, got {resp:?}");
+        };
+        assert!(loc.uri.as_str().ends_with("/tmp/other.sv"), "uri = {}", loc.uri);
+        assert_eq!(loc.range.start.line, 42);
+        assert_eq!(loc.range.start.character, 6);
+    }
+
+    #[test]
+    fn definition_falls_through_when_no_ref_at_pos() {
+        // Same fixture as above, but the cursor is *outside* the one
+        // ref's use_range. The reference-map lookup misses and the
+        // existing name-based path must still answer.
+        let mut ast = simple_ast();
+        ast.files[0].references.push(MimirRef {
+            use_range: make_range(7, 4, 7, 13),
+            target_path: "/tmp/other.sv".to_string(),
+            target_range: make_range(42, 6, 42, 15),
+            target_kind: DeclKind::Function,
+        });
+        let ast = Arc::new(ast);
+
+        // Cursor on line 0 — well clear of the use_range above. The rope
+        // has the `my_module` identifier so word_at_rope returns a name
+        // that find_decl can resolve to the simple_ast top-level decl.
+        let rope = Rope::from_str("my_module\n");
+        let resp = definition(&ast, "/tmp/a.sv", make_pos(0, 0), &rope).unwrap();
+        let GotoDefinitionResponse::Scalar(loc) = resp else {
+            panic!("expected Scalar response, got {resp:?}");
+        };
+        // The name-fallback resolves to the same file (where my_module is declared).
+        assert!(loc.uri.as_str().ends_with("/tmp/a.sv"), "uri = {}", loc.uri);
+    }
+
+    #[test]
+    fn find_ref_at_binary_search_picks_correct_entry() {
+        // Several refs in order; cursor falls inside the third one.
+        let file = MimirFile {
+            uri: "/tmp/a.sv".to_string(),
+            diagnostics: vec![],
+            top_scope: MimirScope {
+                range: make_range(0, 0, 100, 0),
+                declarations: vec![],
+                children: vec![],
+                imported_packages: vec![],
+            },
+            references: vec![
+                MimirRef {
+                    use_range: make_range(1, 0, 1, 5),
+                    target_path: "/x.sv".into(),
+                    target_range: make_range(0, 0, 0, 1),
+                    target_kind: DeclKind::Variable,
+                },
+                MimirRef {
+                    use_range: make_range(3, 0, 3, 5),
+                    target_path: "/y.sv".into(),
+                    target_range: make_range(0, 0, 0, 1),
+                    target_kind: DeclKind::Variable,
+                },
+                MimirRef {
+                    use_range: make_range(5, 4, 5, 12),
+                    target_path: "/target.sv".into(),
+                    target_range: make_range(20, 0, 20, 4),
+                    target_kind: DeclKind::Function,
+                },
+                MimirRef {
+                    use_range: make_range(7, 0, 7, 3),
+                    target_path: "/z.sv".into(),
+                    target_range: make_range(0, 0, 0, 1),
+                    target_kind: DeclKind::Variable,
+                },
+            ],
+        };
+        let hit = find_ref_at(&file, make_pos(5, 7)).expect("ref at (5, 7)");
+        assert_eq!(hit.target_path, "/target.sv");
+
+        // Cursor between refs returns None.
+        assert!(find_ref_at(&file, make_pos(4, 0)).is_none());
+        // Cursor before any ref returns None.
+        assert!(find_ref_at(&file, make_pos(0, 0)).is_none());
+        // Cursor past last ref's end returns None.
+        assert!(find_ref_at(&file, make_pos(9, 0)).is_none());
     }
 
     #[test]
