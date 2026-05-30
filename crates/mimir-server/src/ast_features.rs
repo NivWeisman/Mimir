@@ -319,16 +319,58 @@ pub(crate) fn definition(
     pos: MimirPos,
     rope: &Rope,
 ) -> Option<GotoDefinitionResponse> {
-    if let Some(file) = ast.find_file(file_uri) {
-        if let Some(r) = find_ref_at(file, pos) {
-            let uri = Url::parse(&format!("file://{}", r.target_path)).ok()?;
-            let location = Location { uri, range: mimir_to_lsp_range(r.target_range) };
+    match ast.find_file(file_uri) {
+        Some(file) => {
+            let refs_in_file = file.references.len();
+            match find_ref_at(file, pos) {
+                Some(r) => {
+                    let uri = Url::parse(&format!("file://{}", r.target_path)).ok()?;
+                    let location =
+                        Location { uri, range: mimir_to_lsp_range(r.target_range) };
+                    debug!(
+                        file_uri,
+                        refs_in_file,
+                        target_path = %r.target_path,
+                        target_kind = ?r.target_kind,
+                        "ast definition: gate=ref_map_hit",
+                    );
+                    return Some(GotoDefinitionResponse::Scalar(location));
+                }
+                None => {
+                    // File is in the AST but no ref covers the cursor. Most
+                    // common causes: (a) refs_in_file == 0 → slang didn't
+                    // elaborate this file (likely sent as
+                    // `is_compilation_unit: false` because it's not in the
+                    // project filelist), or (b) refs_in_file > 0 but the
+                    // visitor didn't emit one for this exact token shape.
+                    debug!(
+                        file_uri,
+                        pos_line = pos.line,
+                        pos_char = pos.character,
+                        refs_in_file,
+                        "ast definition: gate=ref_not_at_pos (falling through to name lookup)",
+                    );
+                }
+            }
+        }
+        None => {
+            // The cursor's file URI isn't in the AST at all. Usually a path
+            // mismatch (symlink resolution, `/private/var` vs `/var`,
+            // trailing slash) — slang knows the file under a different
+            // string than the LSP URI maps to. Log the first few URIs the
+            // AST does know so the user can diff.
+            let known: Vec<&str> = ast
+                .files
+                .iter()
+                .take(5)
+                .map(|f| f.uri.as_str())
+                .collect();
             debug!(
-                target_path = %r.target_path,
-                target_kind = ?r.target_kind,
-                "ast definition resolved via reference map",
+                file_uri,
+                total_files_in_ast = ast.files.len(),
+                first_known_uris = ?known,
+                "ast definition: gate=file_not_in_ast (falling through to name lookup)",
             );
-            return Some(GotoDefinitionResponse::Scalar(location));
         }
     }
 
@@ -336,7 +378,7 @@ pub(crate) fn definition(
     let (decl, decl_file) = find_decl(ast, file_uri, pos, &name)?;
     let uri = Url::parse(&format!("file://{decl_file}")).ok()?;
     let location = Location { uri, range: mimir_to_lsp_range(decl.range) };
-    debug!(name, file = decl_file, "ast definition resolved via name lookup");
+    debug!(name, file = decl_file, "ast definition: gate=name_lookup_hit");
     Some(GotoDefinitionResponse::Scalar(location))
 }
 
