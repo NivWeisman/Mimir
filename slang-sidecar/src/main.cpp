@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -620,17 +621,73 @@ static slang::SourceRange narrow_call_range(
     }
 }
 
+// Maps a slang SourceBuffer to the path the *client* sent for that file
+// (the editor's URI), with the same matching rules `handle_compile` used
+// to do post-hoc on every collected ref: direct string match against the
+// sent set, falling back to `std::filesystem::canonical` against a
+// canonical → sent index for symlink / `+incdir+`-resolution mismatch.
+//
+// Caching by `BufferID` makes the per-ref lookup O(1) after the first
+// hit — the visitor sees the same buffer many times. `std::nullopt`
+// is cached for buffers that don't map to any sent path so we don't
+// retry the canonical resolution on every expression in a UVM header.
+class ScopeAttach {
+public:
+    ScopeAttach(const slang::SourceManager& sm,
+                const std::unordered_set<std::string>& sent_paths,
+                const std::unordered_map<std::string, std::string>& canonical_to_sent)
+        : sm_(sm), sent_paths_(sent_paths), canonical_to_sent_(canonical_to_sent) {}
+
+    // Returns the sent-path string to attach a ref to, or `nullptr` if
+    // the buffer's underlying file isn't in any sent path. The returned
+    // pointer is stable for the lifetime of this ScopeAttach (string
+    // lives in the cache).
+    const std::string* lookup(slang::BufferID bid) {
+        if (auto it = cache_.find(bid); it != cache_.end()) {
+            return it->second.has_value() ? &*it->second : nullptr;
+        }
+        std::optional<std::string> result;
+        const auto& full = sm_.getFullPath(bid);
+        if (!full.empty()) {
+            std::string slang_path = full.string();
+            if (sent_paths_.count(slang_path)) {
+                result = std::move(slang_path);
+            } else {
+                try {
+                    auto c = std::filesystem::canonical(slang_path).string();
+                    if (auto it2 = canonical_to_sent_.find(c);
+                        it2 != canonical_to_sent_.end()) {
+                        result = it2->second;
+                    }
+                } catch (const std::exception&) {
+                    // Buffer's path doesn't resolve on disk — out of scope.
+                }
+            }
+        }
+        auto [it, _] = cache_.emplace(bid, std::move(result));
+        return it->second.has_value() ? &*it->second : nullptr;
+    }
+
+private:
+    const slang::SourceManager& sm_;
+    const std::unordered_set<std::string>& sent_paths_;
+    const std::unordered_map<std::string, std::string>& canonical_to_sent_;
+    std::unordered_map<slang::BufferID, std::optional<std::string>> cache_;
+};
+
 struct RefCollector
     : public slang::ast::ASTVisitor<RefCollector, slang::ast::VisitFlags::AllGood> {
     const slang::SourceManager& sm;
-    // path → vector of partially-built JSON ref entries. Populated in
-    // traversal order; the caller sorts each file's vector by
-    // use_range.start before emitting.
-    std::unordered_map<std::string, std::vector<json>>& refs_by_file;
+    ScopeAttach& scope;
+    // sent-path → vector of JSON ref entries. RefCollector writes
+    // directly under the editor's URI (resolved via the ScopeAttach
+    // cache), so the per-file emit loop is a straight hash lookup —
+    // no post-hoc remap needed.
+    std::unordered_map<std::string, std::vector<json>>& refs_by_sent;
 
-    RefCollector(const slang::SourceManager& sm_,
-                 std::unordered_map<std::string, std::vector<json>>& refs_by_file_)
-        : sm(sm_), refs_by_file(refs_by_file_) {}
+    RefCollector(const slang::SourceManager& sm_, ScopeAttach& scope_,
+                 std::unordered_map<std::string, std::vector<json>>& refs_by_sent_)
+        : sm(sm_), scope(scope_), refs_by_sent(refs_by_sent_) {}
 
     void record(slang::SourceRange use_range, const slang::ast::Symbol* target) {
         if (target == nullptr) return;
@@ -640,16 +697,16 @@ struct RefCollector
         // Macro-aware: the user's editor lives in the original source
         // buffer, so map both endpoints back through any macro expansion.
         auto use_start = sm.getFullyOriginalLoc(use_range.start());
-        auto use_end   = sm.getFullyOriginalLoc(use_range.end());
         if (!use_start.valid()) return;
 
-        // Key by the same full path `build_file_top_scope` uses for its
-        // "which file owns this" decision — `getFileName` returns a
-        // cwd-relative string that won't match the client's absolute
-        // `files[].path`, so the per-file attachment would silently drop
-        // every ref.
-        std::string use_path = loc_to_file_path(sm, use_start);
-        if (use_path.empty()) return;
+        // Early filter: if this buffer doesn't map to any path the
+        // client sent, skip the ref entirely. Drops ~76–100% of work
+        // on UVM-style projects where most elaborated expressions live
+        // in included headers the editor isn't aware of.
+        const std::string* attach = scope.lookup(use_start.buffer());
+        if (attach == nullptr) return;
+
+        auto use_end = sm.getFullyOriginalLoc(use_range.end());
 
         std::string target_path = loc_to_file_path(sm, target->location);
         if (target_path.empty()) return;
@@ -670,7 +727,7 @@ struct RefCollector
         entry["target_path"]  = std::move(target_path);
         entry["target_range"] = std::move(target_range_json);
         entry["target_kind"]  = kind;
-        refs_by_file[use_path].push_back(std::move(entry));
+        refs_by_sent[*attach].push_back(std::move(entry));
     }
 
     void handle(const slang::ast::NamedValueExpression& expr) {
@@ -803,32 +860,11 @@ static json handle_compile(const json& params) {
         diags_by_file[d.value("path", std::string{})].push_back(d);
     }
 
-    // Walk every elaborated expression in the compilation and capture
-    // resolved name-use → declaration links, keyed by whatever path
-    // string slang gave us via `loc_to_file_path` (i.e. `getFullPath`
-    // on the use site's buffer).
-    std::unordered_map<std::string, std::vector<json>> refs_by_file;
-    if (refs_emission_enabled()) {
-        RefCollector collector{sm, refs_by_file};
-        comp.getRoot().visit(collector);
-        for (const auto* pkg : comp.getPackages()) {
-            if (pkg != nullptr) pkg->visit(collector);
-        }
-    }
-    if (tm) {
-        for (auto& [_, v] : refs_by_file) n_refs_raw += v.size();
-        t_visit = sw.lap();
-    }
-
-    // Re-key refs onto the path strings the client sent. The exact string
-    // slang uses for a buffer can differ from the editor's URI when the
-    // preprocessor opens a file via `+incdir+ resolution to a different
-    // absolute form — most commonly a symlink target vs the symlink path
-    // the editor opens. Without this remap the refs land in a bucket that
-    // the per-file emit loop never consults and the file appears with 0
-    // refs even though it was elaborated. Direct string match wins (fast
-    // path); on miss, fs::canonical resolves both sides and looks up via
-    // a canonical → sent path index.
+    // Build the scope-attach index ONCE, up front, so the ref visitor
+    // can filter at record-time instead of building refs we'd throw
+    // away post-hoc. `sent_path_set` is the exact-string match;
+    // `canonical_to_sent` is the symlink / `+incdir+`-resolved
+    // fallback. Both consumed by ScopeAttach below.
     std::unordered_map<std::string, std::string> canonical_to_sent;
     std::unordered_set<std::string> sent_path_set;
     if (params.contains("files") && params["files"].is_array()) {
@@ -846,31 +882,24 @@ static json handle_compile(const json& params) {
             }
         }
     }
+    ScopeAttach scope{sm, sent_path_set, canonical_to_sent};
 
+    // Walk every elaborated expression in the compilation and emit refs
+    // **directly under sent-path keys** — the ScopeAttach buffer cache
+    // drops refs from out-of-scope buffers (UVM headers, vendor source,
+    // anything the editor didn't put in params["files"]) without paying
+    // the cost of building their JSON.
     std::unordered_map<std::string, std::vector<json>> refs_by_sent;
-    for (auto& [slang_path, refs] : refs_by_file) {
-        if (refs.empty()) continue;
-        std::string attach_to;
-        if (sent_path_set.count(slang_path)) {
-            attach_to = slang_path;
-        } else {
-            try {
-                auto c = std::filesystem::canonical(slang_path).string();
-                if (auto it = canonical_to_sent.find(c);
-                    it != canonical_to_sent.end()) {
-                    attach_to = it->second;
-                }
-            } catch (const std::exception&) {
-                // Slang path doesn't exist on disk (rare — usually means
-                // the buffer was a synthetic one with a junk path). Drop.
-            }
+    if (refs_emission_enabled()) {
+        RefCollector collector{sm, scope, refs_by_sent};
+        comp.getRoot().visit(collector);
+        for (const auto* pkg : comp.getPackages()) {
+            if (pkg != nullptr) pkg->visit(collector);
         }
-        if (!attach_to.empty()) {
-            auto& dst = refs_by_sent[attach_to];
-            dst.insert(dst.end(),
-                       std::make_move_iterator(refs.begin()),
-                       std::make_move_iterator(refs.end()));
-        }
+    }
+    if (tm) {
+        for (auto& [_, v] : refs_by_sent) n_refs_raw += v.size();
+        t_visit = sw.lap();
     }
 
     // Sort each sent-file's refs by use_range.start so the Rust side can
