@@ -486,6 +486,8 @@ pub(crate) fn assemble_elaborate_params(
         defines: project.defines.clone(),
         top: project.top.clone(),
         extra_args: project.slang_extra_args.clone(),
+        single_unit: project.single_unit,
+        timescale: project.timescale.clone(),
     };
     (params, files_in_request)
 }
@@ -524,6 +526,8 @@ mod tests {
             formatter: crate::project::FormatterConfig::default(),
             method_hint_mode: mimir_syntax::MethodHintMode::default(),
             slang_extra_args: vec![],
+            single_unit: false,
+            timescale: None,
         }
     }
 
@@ -826,6 +830,8 @@ mod tests {
             defines: vec![],
             top: None,
             extra_args: vec![],
+            single_unit: false,
+            timescale: None,
         }
     }
 

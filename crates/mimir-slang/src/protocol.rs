@@ -123,14 +123,36 @@ pub struct ElaborateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top: Option<String>,
 
-    /// Raw flags forwarded verbatim to the sidecar's libslang compile call.
-    /// Use for options that have no dedicated field — e.g.
-    /// `["--timescale", "1ns/1ps"]` or `["--allow-use-before-declare"]`.
+    /// Long-tail libslang flags parsed through `slang::driver::Driver` in
+    /// the sidecar. Use this for any option that doesn't have a dedicated
+    /// typed field — e.g. `["--allow-use-before-declare"]`,
+    /// `["--ignore-unknown-modules"]`. For `--single-unit` and
+    /// `--timescale` use the typed fields below; on conflict the typed
+    /// field wins.
     ///
     /// Omitted from the wire when empty (`skip_serializing_if`) so existing
     /// sidecar versions that do not recognise the field are unaffected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
+
+    /// When `true`, every `is_compilation_unit: true` file is parsed into a
+    /// single shared compilation unit so `` `define `` macros leak across
+    /// files in the order they were sent. Mirrors slang's `--single-unit`
+    /// CLI flag. When `false` (the default and the wire-omitted form) each
+    /// file is its own CU — slang's default behaviour.
+    ///
+    /// This is the right knob for UVM-style projects where headers like
+    /// `uvm_macros.svh` are included once and the macros are expected to
+    /// be visible to every later file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_unit: bool,
+
+    /// Default timescale applied to design elements that don't declare
+    /// their own (e.g. `"1ns/1ps"`). Parsed in the sidecar via
+    /// `slang::TimeScale::fromString`; invalid strings are logged and
+    /// dropped — never an RPC error. Wire-omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timescale: Option<String>,
 }
 
 /// One file in [`ElaborateParams::files`].
@@ -331,6 +353,56 @@ mod tests {
         // Older requests without the field decode as compilation units —
         // that's the sidecar's previous behavior, preserved.
         assert!(p.files[0].is_compilation_unit);
+        // Newer typed knobs decode as their false / None defaults so older
+        // clients (no `single_unit` / `timescale` on the wire) keep the
+        // sidecar's pre-existing per-CU + no-default-timescale behaviour.
+        assert!(!p.single_unit);
+        assert!(p.timescale.is_none());
+    }
+
+    /// `single_unit` and `timescale` round-trip through JSON, and the
+    /// wire form omits them when at their default values so older
+    /// sidecars don't see unknown fields.
+    #[test]
+    fn elaborate_params_single_unit_and_timescale_roundtrip() {
+        let p = ElaborateParams {
+            files: vec![],
+            include_dirs: vec![],
+            defines: vec![],
+            top: None,
+            extra_args: vec![],
+            single_unit: true,
+            timescale: Some("1ns/1ps".into()),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("single_unit"), "expected `single_unit` on the wire: {s}");
+        assert!(s.contains("1ns/1ps"), "expected timescale on the wire: {s}");
+        let back: ElaborateParams = serde_json::from_str(&s).unwrap();
+        assert!(back.single_unit);
+        assert_eq!(back.timescale.as_deref(), Some("1ns/1ps"));
+    }
+
+    /// Default values for the new fields are skipped from the wire so a
+    /// pre-0.7.11 sidecar with `deny_unknown_fields` (if any) keeps
+    /// accepting the payload.
+    #[test]
+    fn elaborate_params_omits_default_typed_knobs_on_serialise() {
+        let p = ElaborateParams {
+            files: vec![SourceFile {
+                path: "a.sv".into(),
+                text: "".into(),
+                is_compilation_unit: true,
+            }],
+            include_dirs: vec![],
+            defines: vec![],
+            top: None,
+            extra_args: vec![],
+            single_unit: false,
+            timescale: None,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("single_unit"), "expected default `single_unit` to be skipped: {s}");
+        assert!(!s.contains("timescale"), "expected default `timescale` to be skipped: {s}");
     }
 
     /// A `SourceFile` with the default flag round-trips and the encoded

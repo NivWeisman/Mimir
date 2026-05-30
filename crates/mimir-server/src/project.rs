@@ -308,15 +308,41 @@ pub struct SlangConfig {
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
 
-    /// Raw flags forwarded verbatim to the sidecar on every compile request.
-    /// Use for libslang options that have no dedicated TOML key:
+    /// Long-tail libslang flags parsed by the sidecar's `slang::driver::Driver`.
+    /// Use for options that don't have a dedicated TOML key —
+    /// `--allow-use-before-declare`, `--ignore-unknown-modules`, etc. For
+    /// `--single-unit` and `--timescale` use the typed fields below; on
+    /// conflict the typed field wins.
     ///
     /// ```toml
     /// [slang]
-    /// extra_args = ["--timescale", "1ns/1ps"]
+    /// extra_args = ["--allow-use-before-declare"]
     /// ```
     #[serde(default)]
     pub extra_args: Vec<String>,
+
+    /// When `true`, all `is_compilation_unit: true` files are parsed into a
+    /// single shared compilation unit so `` `define `` macros leak across
+    /// files in the order they were given. Mirrors slang's `--single-unit`
+    /// CLI flag.
+    ///
+    /// This is the right knob for UVM-style flows where headers like
+    /// `uvm_macros.svh` are included once and the macros are expected to
+    /// be visible to every later file. Without it, each file is its own
+    /// preprocessor scope and you get cascading `UnknownDirective` errors
+    /// on macros defined in an earlier file.
+    ///
+    /// Default `false` preserves slang's per-file behaviour.
+    #[serde(default)]
+    pub single_unit: bool,
+
+    /// Default timescale applied to design elements that don't declare
+    /// their own (e.g. `"1ns/1ps"`). Parsed by slang's
+    /// `TimeScale::fromString`; invalid strings are logged at the sidecar
+    /// and dropped — never a hard error. Wins over a `--timescale` entry
+    /// in `extra_args`.
+    #[serde(default)]
+    pub timescale: Option<String>,
 }
 
 fn default_debounce_ms() -> u64 {
@@ -333,6 +359,8 @@ impl Default for SlangConfig {
             top: None,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             extra_args: Vec::new(),
+            single_unit: false,
+            timescale: None,
         }
     }
 }
@@ -521,6 +549,12 @@ pub struct ResolvedProject {
     /// Raw flags forwarded to [`ElaborateParams::extra_args`] on each compile.
     /// Set from `[slang] extra_args` in `.mimir.toml`.
     pub slang_extra_args: Vec<String>,
+    /// When `true`, the sidecar parses every `is_compilation_unit: true`
+    /// file into one shared compilation unit (see [`SlangConfig::single_unit`]).
+    pub single_unit: bool,
+    /// Default timescale string forwarded to the sidecar (see
+    /// [`SlangConfig::timescale`]). `None` when the project doesn't set one.
+    pub timescale: Option<String>,
 }
 
 impl ResolvedProject {
@@ -645,6 +679,8 @@ impl ResolvedProject {
             formatter: cfg.formatter,
             method_hint_mode,
             slang_extra_args: cfg.slang.extra_args,
+            single_unit: cfg.slang.single_unit,
+            timescale: cfg.slang.timescale,
         })
     }
 }
@@ -760,6 +796,27 @@ mod tests {
         assert_eq!(cfg.slang.defines, vec!["UVM_NO_DPI", "BUS_WIDTH=32"]);
         assert_eq!(cfg.slang.top.as_deref(), Some("tb_top"));
         assert_eq!(cfg.slang.debounce_ms, 200);
+    }
+
+    /// `[slang] single_unit` and `[slang] timescale` decode as typed values
+    /// and feed straight into `ElaborateParams` (via `ResolvedProject::load`).
+    /// Omitting them keeps the existing per-CU / no-default-timescale
+    /// behaviour.
+    #[test]
+    fn project_config_single_unit_and_timescale_decode() {
+        let toml_text = r#"
+            [slang]
+            single_unit = true
+            timescale   = "1ns/1ps"
+        "#;
+        let cfg: ProjectConfig = toml::from_str(toml_text).unwrap();
+        assert!(cfg.slang.single_unit);
+        assert_eq!(cfg.slang.timescale.as_deref(), Some("1ns/1ps"));
+
+        // Omitting both yields the safe defaults.
+        let cfg2: ProjectConfig = toml::from_str("[slang]\n").unwrap();
+        assert!(!cfg2.slang.single_unit);
+        assert!(cfg2.slang.timescale.is_none());
     }
 
     /// Unknown keys in `.mimir.toml` are an error, not silently ignored —

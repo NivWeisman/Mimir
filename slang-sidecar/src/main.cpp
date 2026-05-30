@@ -44,6 +44,8 @@
 #include <slang/ast/types/Type.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/Diagnostics.h>
+#include <slang/driver/Driver.h>
+#include <slang/numeric/Time.h>
 #include <slang/parsing/Preprocessor.h>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxKind.h>
@@ -191,9 +193,38 @@ static BuildCompilationResult build_compilation(const json& params) {
 
     BuildCompilationResult out;
     out.sm = std::make_shared<SourceManager>();
-    out.compilation = std::make_unique<Compilation>();
 
+    // ── Step 1: baseline options from `extra_args` (parsed via slang's own
+    //   Driver CLI parser so we don't catalog flags ourselves) ─────────────
     PreprocessorOptions pp_opts;
+    ast::CompilationOptions comp_opts;
+    if (params.contains("extra_args") && params["extra_args"].is_array()
+        && !params["extra_args"].empty()) {
+        slang::driver::Driver driver;
+        driver.addStandardArgs();
+        std::vector<std::string> owned{"mimir-slang-sidecar"};
+        owned.reserve(owned.size() + params["extra_args"].size());
+        for (const auto& a : params["extra_args"]) {
+            if (a.is_string()) owned.push_back(a.get<std::string>());
+        }
+        std::vector<const char*> argv;
+        argv.reserve(owned.size());
+        for (const auto& s : owned) argv.push_back(s.c_str());
+        if (driver.parseCommandLine(static_cast<int>(argv.size()), argv.data())) {
+            // Pull the parsed option structs into our locals. We deliberately
+            // skip `driver.processOptions()` because it tries to load files
+            // through Driver's own SourceLoader — we manage the SourceManager
+            // ourselves and only want the parsed flag values.
+            Bag driver_bag = driver.createOptionBag();
+            if (auto* po = driver_bag.get<PreprocessorOptions>()) pp_opts = *po;
+            if (auto* co = driver_bag.get<ast::CompilationOptions>()) comp_opts = *co;
+        } else {
+            std::cerr << "[mimir-slang-sidecar] extra_args did not parse cleanly; "
+                         "applying typed fields without them\n";
+        }
+    }
+
+    // ── Step 2: typed `defines`/`include_dirs` extend whatever extra_args set ──
     if (params.contains("defines") && params["defines"].is_array()) {
         for (const auto& d : params["defines"]) {
             std::string entry = d.value("name", std::string{});
@@ -213,8 +244,21 @@ static BuildCompilationResult build_compilation(const json& params) {
         }
     }
 
+    // ── Step 3: typed `timescale` overrides any --timescale in extra_args ──
+    if (auto ts_str = params.value("timescale", std::string{}); !ts_str.empty()) {
+        if (auto parsed = TimeScale::fromString(ts_str)) {
+            comp_opts.defaultTimeScale = *parsed;
+        } else {
+            std::cerr << "[mimir-slang-sidecar] invalid timescale '" << ts_str
+                      << "'; ignoring\n";
+        }
+    }
+
+    // ── Step 4: assemble the Bag and the Compilation ─────────────────────
     Bag options;
     options.set(pp_opts);
+    options.set(comp_opts);
+    out.compilation = std::make_unique<Compilation>(comp_opts);
 
     if (params.contains("files") && params["files"].is_array()) {
         struct PendingUnit {
@@ -254,9 +298,24 @@ static BuildCompilationResult build_compilation(const json& params) {
             }
         }
 
-        for (auto& u : units) {
-            auto tree = SyntaxTree::fromBuffer(u.buffer, *out.sm, options);
-            out.compilation->addSyntaxTree(tree);
+        // `single_unit: true` parses every CU into one shared SyntaxTree so
+        // `` `define`` macros leak across files in the order they were sent —
+        // mirrors slang's `--single-unit` CLI flag. Per-file mode (the
+        // historical default) is what slang's CLI gives you without the flag.
+        bool single_unit = params.value("single_unit", false);
+        if (single_unit) {
+            std::vector<slang::SourceBuffer> cu_buffers;
+            cu_buffers.reserve(units.size());
+            for (auto& u : units) cu_buffers.push_back(u.buffer);
+            if (!cu_buffers.empty()) {
+                auto tree = SyntaxTree::fromBuffers(cu_buffers, *out.sm, options);
+                out.compilation->addSyntaxTree(tree);
+            }
+        } else {
+            for (auto& u : units) {
+                auto tree = SyntaxTree::fromBuffer(u.buffer, *out.sm, options);
+                out.compilation->addSyntaxTree(tree);
+            }
         }
     }
 

@@ -295,9 +295,26 @@ top          = "tb_top"
 # Quiet time (ms) before re-elaborating after the user stops typing.
 debounce_ms  = 350
 
-# Raw flags forwarded verbatim to the sidecar on every compile request.
-# Use for libslang options that have no dedicated TOML key, e.g.:
-extra_args   = ["--timescale", "1ns/1ps"]
+# Parse every is_compilation_unit:true file into a single shared
+# compilation unit so `define macros leak across files in the order
+# they were given (mirrors slang's --single-unit CLI flag). This is the
+# right knob for UVM-style flows where uvm_macros.svh is included once
+# and the macros are expected to be visible to every later file —
+# without it, slang treats each file as its own preprocessor scope and
+# you get cascading UnknownDirective errors. Default: false.
+single_unit  = true
+
+# Default timescale applied to design elements that don't declare their
+# own (mirrors slang's --timescale CLI flag). Parsed by slang's
+# TimeScale::fromString; invalid strings are logged and dropped.
+timescale    = "1ns/1ps"
+
+# Long-tail libslang flags parsed by the sidecar's slang::driver::Driver.
+# Use for any option that doesn't have a dedicated TOML key above —
+# --allow-use-before-declare, --ignore-unknown-modules, -Wno-..., etc.
+# When a flag is also expressible as a typed field (single_unit,
+# timescale) the typed field wins on conflict.
+extra_args   = ["--allow-use-before-declare"]
 
 [inlay_hints]
 # Label format for method / function / task call inlay hints.

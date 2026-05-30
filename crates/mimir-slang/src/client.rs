@@ -498,6 +498,8 @@ mod tests {
             defines: vec![],
             top: None,
             extra_args: vec![],
+            single_unit: false,
+            timescale: None,
         };
         let result = conn.compile(&params).await.expect("compile ok");
         sidecar.await.unwrap();
@@ -536,6 +538,8 @@ mod tests {
             defines: vec![],
             top: None,
             extra_args: vec![],
+            single_unit: false,
+            timescale: None,
         };
         let err = conn.compile(&params).await.unwrap_err();
         sidecar.await.unwrap();
@@ -569,6 +573,8 @@ mod tests {
             defines: vec![],
             top: None,
             extra_args: vec![],
+            single_unit: false,
+            timescale: None,
         };
         let err = conn.compile(&params).await.unwrap_err();
         sidecar.await.unwrap();
@@ -605,6 +611,8 @@ mod tests {
                 defines: vec![],
                 top: None,
                 extra_args: vec![],
+                single_unit: false,
+                timescale: None,
             })
             .await
             .unwrap_err();
@@ -663,6 +671,8 @@ mod tests {
                 defines: vec![],
                 top: None,
                 extra_args: vec![],
+                single_unit: false,
+                timescale: None,
             })
             .await;
         sidecar.await.unwrap();
@@ -699,6 +709,8 @@ mod tests {
             defines: vec![],
             top: None,
             extra_args: vec![],
+            single_unit: false,
+            timescale: None,
         };
         let _ = conn.compile(&p).await.unwrap();
         let _ = conn.compile(&p).await.unwrap();
