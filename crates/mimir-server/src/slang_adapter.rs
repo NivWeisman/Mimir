@@ -108,9 +108,18 @@ impl SlangAdapter {
         params: &ElaborateParams,
         files_in_request: Vec<Url>,
     ) -> Option<CompileOutcome> {
-        match self.slang.compile(params).await {
+        mimir_core::time_scope!("slang.compile.adapter_total");
+        let compile_result = {
+            mimir_core::time_scope!("slang.compile.adapter.rpc");
+            self.slang.compile(params).await
+        };
+        match compile_result {
             Ok(result) => {
-                *self.cached_ast.write().await = Some(Arc::new(result.ast));
+                {
+                    mimir_core::time_scope!("slang.compile.adapter.cache_ast_write");
+                    *self.cached_ast.write().await = Some(Arc::new(result.ast));
+                }
+                mimir_core::time_scope!("slang.compile.adapter.diag_walk");
 
                 for d in &result.diagnostics {
                     match d.severity {

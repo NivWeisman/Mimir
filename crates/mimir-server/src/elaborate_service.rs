@@ -143,7 +143,11 @@ impl ElaborateService {
         let trigger_for_task = trigger_uri.clone();
 
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(debounce).await;
+            mimir_core::time_scope!("elaborate.task_total");
+            {
+                mimir_core::time_scope!("elaborate.debounce_sleep");
+                tokio::time::sleep(debounce).await;
+            }
 
             let Some((params, files_in_request)) =
                 adapter.slang().build_elaborate_params().await
@@ -152,7 +156,10 @@ impl ElaborateService {
                 return;
             };
 
-            let input_hash = SlangService::hash_inputs(&params);
+            let input_hash = {
+                mimir_core::time_scope!("elaborate.hash_inputs");
+                SlangService::hash_inputs(&params)
+            };
             if *last_hash.read().await == Some(input_hash) {
                 debug!(
                     hash = input_hash,
@@ -171,6 +178,7 @@ impl ElaborateService {
             );
             if let Some(outcome) = adapter.compile(&params, files_in_request).await {
                 let known_macros: HashSet<String> = {
+                    mimir_core::time_scope!("elaborate.collect_known_macros");
                     let ws = workspace.read().await;
                     ws.index
                         .entries()
@@ -178,14 +186,17 @@ impl ElaborateService {
                         .map(|e| e.symbol.name.clone())
                         .collect()
                 };
-                publish_slang_result(
-                    &lsp_client,
-                    &outcome.files_in_request,
-                    outcome.diagnostics,
-                    &published,
-                    &known_macros,
-                )
-                .await;
+                {
+                    mimir_core::time_scope!("elaborate.publish_diagnostics");
+                    publish_slang_result(
+                        &lsp_client,
+                        &outcome.files_in_request,
+                        outcome.diagnostics,
+                        &published,
+                        &known_macros,
+                    )
+                    .await;
+                }
                 *last_hash.write().await = Some(input_hash);
 
                 if startup_logged

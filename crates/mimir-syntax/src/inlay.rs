@@ -86,6 +86,7 @@ pub fn hints_for(call: &CallSite, sym: &Symbol, mode: MethodHintMode) -> Vec<Inl
     call.args
         .iter()
         .zip(params.iter())
+        .filter(|(arg, _)| arg.name.is_none())
         .map(|(arg, param)| {
             let text = match &call.kind {
                 CallKind::Macro => param.name.clone(),
@@ -127,7 +128,10 @@ mod tests {
             name: name.to_string(),
             name_range: make_range(0, 0, name.len() as u32),
             kind,
-            args: args.into_iter().map(|r| ArgSpan { range: r }).collect(),
+            args: args
+                .into_iter()
+                .map(|r| ArgSpan { range: r, name: None })
+                .collect(),
             paren_open: Position::new(0, name.len() as u32),
             paren_close: Position::new(0, name.len() as u32 + 10),
         }
@@ -276,6 +280,37 @@ mod tests {
             vec![Param { name: "a".into(), ty: Some("int".into()) }],
         );
         assert!(hints_for(&call, &sym, MethodHintMode::Name).is_empty());
+    }
+
+    #[test]
+    fn named_args_are_skipped_so_positional_zip_stays_aligned() {
+        // Call: f(a, .c(1)) with params [a, b, c].
+        // The named arg's value at index 1 must NOT be labelled with "b";
+        // it carries its own name. Only the positional `a` gets a hint.
+        let call = CallSite {
+            name: "f".into(),
+            name_range: make_range(0, 0, 1),
+            kind: CallKind::Function,
+            args: vec![
+                ArgSpan { range: make_range(1, 2, 3), name: None },          // positional
+                ArgSpan { range: make_range(1, 9, 10), name: Some("c".into()) }, // named
+            ],
+            paren_open: Position::new(0, 1),
+            paren_close: Position::new(1, 11),
+        };
+        let sym = make_sym(
+            "f",
+            SymbolKind::Function,
+            vec![
+                Param { name: "a".into(), ty: Some("int".into()) },
+                Param { name: "b".into(), ty: Some("int".into()) },
+                Param { name: "c".into(), ty: Some("int".into()) },
+            ],
+        );
+        let hints = hints_for(&call, &sym, MethodHintMode::Name);
+        assert_eq!(hints.len(), 1, "named arg's value must not get a label");
+        assert_eq!(hints[0].text, "a");
+        assert_eq!(hints[0].position, Position::new(1, 2));
     }
 
     #[test]

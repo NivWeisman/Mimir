@@ -65,6 +65,11 @@ pub enum CallKind {
 pub struct ArgSpan {
     /// LSP range of the argument expression.
     pub range: Range,
+    /// Set when the user wrote a named argument like `.name(value)`. The
+    /// stored string is the formal parameter name as written. `None` for
+    /// positional arguments. Inlay-hint rendering suppresses labels for
+    /// named args (the name is already visible at the call site).
+    pub name: Option<String>,
 }
 
 /// A call site identified in the parse tree.
@@ -548,13 +553,39 @@ fn args_from_parent(
 }
 
 /// Collect all named children of `list` as [`ArgSpan`]s.
+///
+/// Handles SV named-argument syntax: `.name(value)` is exposed by the
+/// grammar as two flat named children — a `simple_identifier` (`name`)
+/// followed by an `expression` (`value`). Merge such pairs into a
+/// single [`ArgSpan`] with `name` populated so positional zip-with-params
+/// stays aligned (otherwise the value gets labelled with whichever param
+/// happens to share its positional slot).
 fn named_children_as_arg_spans(list: Node<'_>, rope: &Rope) -> Vec<ArgSpan> {
     let mut out = Vec::new();
     let mut cursor = list.walk();
-    for child in list.named_children(&mut cursor) {
-        out.push(ArgSpan {
-            range: node_range(child, rope),
-        });
+    let kids: Vec<Node<'_>> = list.named_children(&mut cursor).collect();
+    let mut i = 0;
+    while i < kids.len() {
+        let child = kids[i];
+        if child.kind() == "simple_identifier"
+            && i + 1 < kids.len()
+            && kids[i + 1].kind() == "expression"
+        {
+            let name = rope
+                .byte_slice(child.start_byte()..child.end_byte())
+                .to_string();
+            out.push(ArgSpan {
+                range: node_range(kids[i + 1], rope),
+                name: Some(name),
+            });
+            i += 2;
+        } else {
+            out.push(ArgSpan {
+                range: node_range(child, rope),
+                name: None,
+            });
+            i += 1;
+        }
     }
     out
 }
@@ -854,6 +885,34 @@ endclass
             println!("No macro call found. Tree:\n{}", tree.tree.root_node().to_sexp());
             // Not a hard failure — macro expansions may not appear in tree
         }
+    }
+
+    /// SV named-argument syntax `.name(value)` must be parsed as a single
+    /// argument with `name = Some(...)`, not two flat children. Otherwise
+    /// the inlay-hint zip-with-params labels the value with the wrong
+    /// param name (a real bug reported against v0.7.16).
+    #[test]
+    fn named_arguments_are_merged_into_one_arg_span() {
+        let src = "\
+module m;
+  initial begin
+    r = f(a, b, .name(1));
+    r2 = obj.method(.foo(value), .bar(other));
+  end
+endmodule
+";
+        let sites = all_sites(src);
+
+        let f = sites.iter().find(|s| s.name == "f").expect("f");
+        assert_eq!(f.args.len(), 3, "expected 3 args, got {:?}", f.args);
+        assert_eq!(f.args[0].name, None);
+        assert_eq!(f.args[1].name, None);
+        assert_eq!(f.args[2].name.as_deref(), Some("name"));
+
+        let m = sites.iter().find(|s| s.name == "method").expect("method");
+        assert_eq!(m.args.len(), 2, "expected 2 args, got {:?}", m.args);
+        assert_eq!(m.args[0].name.as_deref(), Some("foo"));
+        assert_eq!(m.args[1].name.as_deref(), Some("bar"));
     }
 
     #[test]

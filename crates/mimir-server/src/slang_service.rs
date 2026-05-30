@@ -220,12 +220,14 @@ impl SlangService {
     pub(crate) async fn build_elaborate_params(&self)
     -> Option<(ElaborateParams, Vec<Url>)>
     {
+        mimir_core::time_scope!("elaborate.build_params");
         if self.slang.read().await.is_none() {
             return None;
         }
         let project = self.project.read().await.clone()?;
 
         let open_text: HashMap<PathBuf, (Url, String)> = {
+            mimir_core::time_scope!("elaborate.build_params.snapshot_open_docs");
             let docs = self.documents.read().await;
             docs.iter()
                 .filter_map(|(uri, state)| {
@@ -273,6 +275,7 @@ impl SlangService {
     pub(crate) async fn compile(&self, params: &ElaborateParams)
     -> Result<CompileResult, mimir_slang::ClientError>
     {
+        mimir_core::time_scope!("slang.compile.service_total");
         let slang = self.slang.read().await.clone()
             .expect("compile called without a configured sidecar");
         slang.compile(params).await
@@ -397,27 +400,36 @@ pub(crate) async fn assemble_with_cache(
     open_text: &HashMap<PathBuf, (Url, String)>,
     closed_file_cache: &Arc<RwLock<Option<ClosedFileDiskCache>>>,
 ) -> (ElaborateParams, Vec<Url>) {
+    mimir_core::time_scope!("elaborate.assemble_with_cache");
+
     // Phase 1: snapshot existing cached texts.
-    let cached_texts: HashMap<PathBuf, String> = closed_file_cache
-        .read()
-        .await
-        .as_ref()
-        .map(|c| c.texts.clone())
-        .unwrap_or_default();
+    let cached_texts: HashMap<PathBuf, String> = {
+        mimir_core::time_scope!("elaborate.assemble.cache_snapshot");
+        closed_file_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.texts.clone())
+            .unwrap_or_default()
+    };
 
     // Phase 2: assemble params — no lock held; disk reads happen here.
     let mut new_entries: HashMap<PathBuf, String> = HashMap::new();
-    let result = assemble_elaborate_params(project, open_text, |path| {
-        if let Some(text) = cached_texts.get(path) {
-            return Some(text.clone());
-        }
-        let text = std::fs::read_to_string(path).ok()?;
-        new_entries.insert(path.to_path_buf(), text.clone());
-        Some(text)
-    });
+    let result = {
+        mimir_core::time_scope!("elaborate.assemble.disk_reads_and_params");
+        assemble_elaborate_params(project, open_text, |path| {
+            if let Some(text) = cached_texts.get(path) {
+                return Some(text.clone());
+            }
+            let text = std::fs::read_to_string(path).ok()?;
+            new_entries.insert(path.to_path_buf(), text.clone());
+            Some(text)
+        })
+    };
 
     // Phase 3: merge newly-read texts into the cache.
     {
+        mimir_core::time_scope!("elaborate.assemble.cache_merge");
         let mut guard = closed_file_cache.write().await;
         let cache = guard.get_or_insert_with(ClosedFileDiskCache::default);
         cache.texts.extend(new_entries);

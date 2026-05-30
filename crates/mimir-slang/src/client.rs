@@ -224,19 +224,29 @@ where
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
-        let req = Request {
-            id,
-            method: method.to_string(),
-            params: serde_json::to_value(params)?,
+        let req = {
+            mimir_core::time_scope!("slang.ipc.serialize");
+            Request {
+                id,
+                method: method.to_string(),
+                params: serde_json::to_value(params)?,
+            }
         };
 
         // Encode + write + newline + flush. Doing the encode and append in
         // one allocation avoids a second syscall just for the `\n`.
-        let mut line = serde_json::to_string(&req)?;
-        line.push('\n');
+        let line = {
+            mimir_core::time_scope!("slang.ipc.encode_envelope");
+            let mut l = serde_json::to_string(&req)?;
+            l.push('\n');
+            l
+        };
         debug!(bytes = line.len(), "sending request");
-        self.writer.write_all(line.as_bytes()).await?;
-        self.writer.flush().await?;
+        {
+            mimir_core::time_scope!("slang.ipc.write_to_sidecar");
+            self.writer.write_all(line.as_bytes()).await?;
+            self.writer.flush().await?;
+        }
 
         // Read lines until we find the response for `id`.
         //
@@ -248,18 +258,31 @@ where
         // acquires the lock with `next_id` already advanced but the stale
         // bytes still sitting in the sidecar's stdout buffer.  We drain
         // them here rather than surfacing an `IdMismatch` error.
+        // Outer timer captures the full read-and-match phase including any
+        // stale responses we drain. Per-line decode + result decode are
+        // sub-timers so we can attribute deserialise cost vs. raw wait.
+        mimir_core::time_scope!("slang.ipc.read_and_match");
         loop {
             self.line_buf.clear();
-            let n = self.reader.read_line(&mut self.line_buf).await?;
+            let n = {
+                mimir_core::time_scope!("slang.ipc.read_line");
+                self.reader.read_line(&mut self.line_buf).await?
+            };
             if n == 0 {
                 return Err(ConnectionError::Closed);
             }
             debug!(bytes = n, "received response");
 
-            let resp: Response = serde_json::from_str(&self.line_buf)?;
+            let resp: Response = {
+                mimir_core::time_scope!("slang.ipc.decode_envelope");
+                serde_json::from_str(&self.line_buf)?
+            };
             if resp.id == id {
                 return match (resp.result, resp.error) {
-                    (Some(value), None) => Ok(serde_json::from_value(value)?),
+                    (Some(value), None) => {
+                        mimir_core::time_scope!("slang.ipc.decode_result");
+                        Ok(serde_json::from_value(value)?)
+                    }
                     (None, Some(err)) => Err(ConnectionError::Sidecar(err)),
                     (None, None) | (Some(_), Some(_)) => {
                         Err(ConnectionError::EmptyResponse { id })
@@ -284,6 +307,7 @@ where
         &mut self,
         params: &ElaborateParams,
     ) -> Result<CompileResult, ConnectionError> {
+        mimir_core::time_scope!("slang.compile.connection_total");
         self.request(methods::COMPILE, params).await
     }
 }
@@ -368,7 +392,11 @@ impl Client {
         &self,
         params: &ElaborateParams,
     ) -> Result<CompileResult, ClientError> {
-        let mut conn = self.connection.lock().await;
+        mimir_core::time_scope!("slang.compile.client_total");
+        let mut conn = {
+            mimir_core::time_scope!("slang.compile.client_lock_wait");
+            self.connection.lock().await
+        };
         Ok(conn.compile(params).await?)
     }
 

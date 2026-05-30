@@ -208,6 +208,7 @@ impl Backend {
     /// sync or first open), we do a full re-parse from scratch.
     #[instrument(level = "debug", skip(self), fields(uri = %uri))]
     async fn reparse_and_publish(&self, uri: Url, edits: Vec<InputEdit>) {
+        mimir_core::time_scope!("syntax.reparse_and_publish");
         let (text, version, prior_tree) = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
@@ -231,7 +232,10 @@ impl Backend {
         // already logged at error! — we deliberately leave state.tree and
         // state.index untouched so mid-keystroke failures don't erase the
         // last-known-good results.
-        let parse_result = self.ts.parse(&text, &edits, prior_tree).await;
+        let parse_result = {
+            mimir_core::time_scope!("syntax.parse");
+            self.ts.parse(&text, &edits, prior_tree).await
+        };
         let (diags, new_state) = match parse_result {
             Some(r) => (r.diagnostics, Some((r.symbols, r.tree))),
             None => (Vec::new(), None),
@@ -838,6 +842,7 @@ fn make_input_edit(rope: &Rope, range: MRange, new_text: &str) -> Option<InputEd
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
+        mimir_core::time_scope!("lsp.initialize");
         info!(
             client = ?params.client_info,
             root = ?params.root_uri,
@@ -1102,6 +1107,7 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        mimir_core::time_scope!("lsp.initialized");
         info!("initialized — ready for requests");
         // Dynamically register a `workspace/didChangeWatchedFiles`
         // watcher for `.mimir.toml` and SV source files. The static
@@ -1160,6 +1166,7 @@ impl LanguageServer for Backend {
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        mimir_core::time_scope!("lsp.did_open");
         let TextDocumentItem {
             uri,
             language_id,
@@ -1193,6 +1200,7 @@ impl LanguageServer for Backend {
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        mimir_core::time_scope!("lsp.did_change");
         let uri = params.text_document.uri;
         let new_version = params.text_document.version;
 
@@ -1261,6 +1269,7 @@ impl LanguageServer for Backend {
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        mimir_core::time_scope!("lsp.did_close");
         let uri = params.text_document.uri;
         {
             let mut docs = self.documents.write().await;
@@ -1283,6 +1292,7 @@ impl LanguageServer for Backend {
     /// end). No-op when slang isn't configured.
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        mimir_core::time_scope!("lsp.did_save");
         let uri = params.text_document.uri;
         debug!("did_save");
         self.elaborate.schedule(uri).await;
@@ -1307,6 +1317,7 @@ impl LanguageServer for Backend {
     /// no events here and the documented external-edit gap stays open.
     #[instrument(level = "debug", skip_all, fields(count = params.changes.len()))]
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        mimir_core::time_scope!("lsp.did_change_watched_files");
         for evt in params.changes {
             let path = match evt.uri.to_file_path() {
                 Ok(p) => p,
@@ -1360,6 +1371,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
+        mimir_core::time_scope!("lsp.goto_definition");
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -1392,6 +1404,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
+        mimir_core::time_scope!("lsp.goto_declaration");
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -1424,6 +1437,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
+        mimir_core::time_scope!("lsp.goto_type_definition");
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
@@ -1450,6 +1464,7 @@ impl LanguageServer for Backend {
         &self,
         _params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
+        mimir_core::time_scope!("lsp.goto_implementation");
         // Implementation lookup is not yet available in the AST-based path.
         Ok(None)
     }
@@ -1463,6 +1478,7 @@ impl LanguageServer for Backend {
         &self,
         params: CallHierarchyPrepareParams,
     ) -> LspResult<Option<Vec<CallHierarchyItem>>> {
+        mimir_core::time_scope!("lsp.prepare_call_hierarchy");
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let mpos = MPosition::new(pos.line, pos.character);
@@ -1529,6 +1545,7 @@ impl LanguageServer for Backend {
         &self,
         params: CallHierarchyIncomingCallsParams,
     ) -> LspResult<Option<Vec<CallHierarchyIncomingCall>>> {
+        mimir_core::time_scope!("lsp.incoming_calls");
         let callee_name = params.item.name.clone();
 
         // Snapshot open-doc trees (excluding the callee's own file where it's
@@ -1570,6 +1587,7 @@ impl LanguageServer for Backend {
         &self,
         params: CallHierarchyOutgoingCallsParams,
     ) -> LspResult<Option<Vec<CallHierarchyOutgoingCall>>> {
+        mimir_core::time_scope!("lsp.outgoing_calls");
         let item = &params.item;
         let uri = &item.uri;
 
@@ -1594,6 +1612,7 @@ impl LanguageServer for Backend {
         &self,
         params: TypeHierarchyPrepareParams,
     ) -> LspResult<Option<Vec<TypeHierarchyItem>>> {
+        mimir_core::time_scope!("lsp.prepare_type_hierarchy");
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let mpos = MPosition::new(pos.line, pos.character);
@@ -1647,6 +1666,7 @@ impl LanguageServer for Backend {
         &self,
         params: TypeHierarchySupertypesParams,
     ) -> LspResult<Option<Vec<TypeHierarchyItem>>> {
+        mimir_core::time_scope!("lsp.supertypes");
         let class_name = params.item.name.clone();
         let ast = self.adapter.cached_ast().await;
         let results = {
@@ -1666,6 +1686,7 @@ impl LanguageServer for Backend {
         &self,
         params: TypeHierarchySubtypesParams,
     ) -> LspResult<Option<Vec<TypeHierarchyItem>>> {
+        mimir_core::time_scope!("lsp.subtypes");
         let class_name = params.item.name.clone();
         let results = {
             let ws = self.workspace.read().await;
@@ -1693,6 +1714,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentHighlightParams,
     ) -> LspResult<Option<Vec<DocumentHighlight>>> {
+        mimir_core::time_scope!("lsp.document_highlight");
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -1750,6 +1772,7 @@ impl LanguageServer for Backend {
         fields(uri = %params.text_document_position.text_document.uri),
     )]
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
+        mimir_core::time_scope!("lsp.references");
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -1843,6 +1866,7 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> LspResult<Option<PrepareRenameResponse>> {
+        mimir_core::time_scope!("lsp.prepare_rename");
         let uri = params.text_document.uri;
         let pos = params.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -1881,6 +1905,7 @@ impl LanguageServer for Backend {
         fields(uri = %params.text_document_position.text_document.uri, new_name = %params.new_name),
     )]
     async fn rename(&self, params: RenameParams) -> LspResult<Option<WorkspaceEdit>> {
+        mimir_core::time_scope!("lsp.rename");
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -1988,6 +2013,7 @@ impl LanguageServer for Backend {
     /// to resolve.
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document_position_params.text_document.uri))]
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        mimir_core::time_scope!("lsp.hover");
         let uri = params
             .text_document_position_params
             .text_document
@@ -2054,6 +2080,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> LspResult<Option<DocumentSymbolResponse>> {
+        mimir_core::time_scope!("lsp.document_symbol");
         let uri = params.text_document.uri;
         let index = {
             let docs = self.documents.read().await;
@@ -2087,6 +2114,7 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
+        mimir_core::time_scope!("lsp.workspace_symbol");
         let ws = self.workspace.read().await;
         let results = rank_workspace_symbols(&params.query, ws.index.entries());
         debug!(returned = results.len(), "workspace/symbol returned");
@@ -2102,6 +2130,7 @@ impl LanguageServer for Backend {
         &self,
         params: FoldingRangeParams,
     ) -> LspResult<Option<Vec<FoldingRange>>> {
+        mimir_core::time_scope!("lsp.folding_range");
         let uri = params.text_document.uri;
         let Some(tree) = self.cached_tree(&uri).await else {
             debug!("folding_range: no tree available");
@@ -2127,6 +2156,7 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> LspResult<Option<SemanticTokensResult>> {
+        mimir_core::time_scope!("lsp.semantic_tokens_full");
         let features = self.current_features().await;
         if !features.semantic_tokens {
             debug!("semantic_tokens_full: disabled by feature toggle");
@@ -2171,6 +2201,7 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensRangeParams,
     ) -> LspResult<Option<SemanticTokensRangeResult>> {
+        mimir_core::time_scope!("lsp.semantic_tokens_range");
         let features = self.current_features().await;
         if !features.semantic_tokens {
             debug!("semantic_tokens_range: disabled by feature toggle");
@@ -2225,6 +2256,7 @@ impl LanguageServer for Backend {
         &self,
         params: SignatureHelpParams,
     ) -> LspResult<Option<SignatureHelp>> {
+        mimir_core::time_scope!("lsp.signature_help");
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -2314,6 +2346,7 @@ impl LanguageServer for Backend {
         fields(uri = %params.text_document.uri),
     )]
     async fn inlay_hint(&self, params: InlayHintParams) -> LspResult<Option<Vec<InlayHint>>> {
+        mimir_core::time_scope!("lsp.inlay_hint");
         let uri = params.text_document.uri;
         let vp = params.range;
         let vp_range = MRange::new(
@@ -2508,6 +2541,7 @@ impl LanguageServer for Backend {
         fields(uri = %params.text_document_position.text_document.uri),
     )]
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+        mimir_core::time_scope!("lsp.completion");
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -2636,6 +2670,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentFormattingParams,
     ) -> LspResult<Option<Vec<TextEdit>>> {
+        mimir_core::time_scope!("lsp.formatting");
         let features = self.current_features().await;
         if !features.formatting {
             debug!("formatting: disabled by feature toggle");
@@ -2712,6 +2747,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentRangeFormattingParams,
     ) -> LspResult<Option<Vec<TextEdit>>> {
+        mimir_core::time_scope!("lsp.range_formatting");
         let features = self.current_features().await;
         if !features.formatting {
             debug!("range_formatting: disabled by feature toggle");
@@ -2790,6 +2826,7 @@ impl LanguageServer for Backend {
 
     #[instrument(level = "debug", skip_all, fields(label = %item.label))]
     async fn completion_resolve(&self, item: CompletionItem) -> LspResult<CompletionItem> {
+        mimir_core::time_scope!("lsp.completion_resolve");
         let Some(data) = item.data.clone() else {
             return Ok(item);
         };

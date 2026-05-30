@@ -596,6 +596,62 @@ Every `#[instrument]`-decorated handler emits an "enter" breadcrumb at
 `debug` level, so the last line of the log before a crash identifies the
 exact handler that triggered it.
 
+### Per-scope wall-clock timing (finding bottlenecks)
+
+Set `MIMIR_DEBUG_TIMING=1` in the server environment to enable RAII scope
+timers across every LSP handler and every stage of the slang elaborate
+pipeline. Each scope logs one structured line on exit:
+
+```
+INFO debug_timer scope="elaborate.task_total" ms=18412
+INFO debug_timer scope="elaborate.debounce_sleep" ms=350
+INFO debug_timer scope="elaborate.build_params" ms=42
+INFO debug_timer scope="slang.compile.adapter_total" ms=18019
+INFO debug_timer scope="slang.compile.connection_total" ms=17986
+INFO debug_timer scope="slang.ipc.serialize" ms=12
+INFO debug_timer scope="slang.ipc.write_to_sidecar" ms=8
+INFO debug_timer scope="slang.ipc.read_and_match" ms=17841
+INFO debug_timer scope="slang.ipc.decode_result" ms=124
+INFO debug_timer scope="slang.compile.adapter.cache_ast_write" ms=2
+INFO debug_timer scope="elaborate.publish_diagnostics" ms=15
+```
+
+Filter the noise to see only the timing breakdown:
+
+```bash
+RUST_LOG=mimir=info MIMIR_DEBUG_TIMING=1 mimir-server 2>&1 | grep debug_timer
+```
+
+Or in VS Code:
+
+```jsonc
+{
+  "mimir.server.env": {
+    "RUST_LOG": "mimir=info",
+    "MIMIR_DEBUG_TIMING": "1"
+  }
+}
+```
+
+When unset (default), every timer is one cached-atomic-bool check and an
+`Instant::now()` — no formatting, no allocation, no log line.
+
+**Label namespaces:**
+
+| Prefix | Meaning |
+|--------|---------|
+| `lsp.*` | LSP handler entry (`lsp.hover`, `lsp.did_change`, `lsp.completion`, …) |
+| `elaborate.*` | Background slang elaborate task — debounce, param assembly, hashing, publishing |
+| `slang.compile.*` | Compile RPC layers — service, adapter, client, connection |
+| `slang.ipc.*` | NDJSON wire phases — serialize, write, read, decode |
+| `syntax.*` | Tree-sitter parse + index update |
+| `assemble_with_cache.*` | Closed-file disk-read cache phases |
+
+For the C++ sidecar, the **`MIMIR_SLANG_TIMING=1`** env var emits a single
+per-compile breakdown line (`stage=build|diags|visit|...`) summarising the
+work inside `handle_compile`. Use both env vars together for end-to-end
+attribution from LSP handler entry through the sidecar's elaborate stages.
+
 [tracing]: https://docs.rs/tracing
 
 ---
@@ -634,7 +690,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 - ⬜ `workspaceSymbol/resolve` — lazy enrichment for workspace symbols; gated on a tower-lsp upgrade that exposes the LSP 3.17 `WorkspaceSymbol` response type.
 - ✅ `textDocument/foldingRange` — pure tree-sitter walk. Emits one foldable line range per top-level construct (modules, classes, functions, tasks, packages, interfaces, programs, properties, sequences, covergroups) and per `begin...end` block (`seq_block`) inside `if`/`else`/`for`/`while`/`fork` statements. Nested folds are emitted (a class's methods fold inside the class's own fold). Single-line constructs are skipped. `kind: Region` in the LSP response. Compiler directives and standalone UVM macro calls (`` `ifdef ``, `` `uvm_fatal ``, etc.) are preprocessed before parsing so include-guard wrappers and UVM-heavy files produce correct structural folds. Comment folding is deferred.
 - ✅ `textDocument/documentHighlight` — scope-aware intra-file highlighter built on tree-sitter. Uses `identifier_at` to grab the name under the cursor, climbs the parse tree to the narrowest enclosing scope (function/task/class/module/interface/program/package/begin-block/initial/always/generate) that *locally* declares that name, and collects only the `simple_identifier` / `system_tf_identifier` matches inside that scope. Nested scopes that re-declare the same name are pruned, so a `phase` parameter in `build_phase` no longer lights up the unrelated `phase` parameter in `connect_phase`, and a shadowed inner `int x;` doesn't pollute outer-scope highlights. Free-standing references whose declaration isn't visible (e.g. `super.x`) fall back to whole-file matching. Full-token equality (no prefix matches). Cursor on whitespace / keyword / non-identifier returns nothing. Cross-file scope resolution is future work atop slang.
-- ✅ `textDocument/inlayHint` — slang-first with a tree-sitter fallback. Finds all call sites in the editor's visible viewport and places ghost-text labels before each argument. **Method-call resolution is slang-first**: when a cached `MimirAst` is available, the method-name token is resolved through the reference map (`MimirFile::references` via `ast_features::method_params_at`), and the callee's formal parameters are read from the resolved declaration. Because slang's name binder is authoritative, this resolves methods **inherited from base classes the tree-sitter workspace index never indexed** (e.g. UVM bases — the `m_obj.configure(...)` case), which the tree-sitter inheritance walk could not reach. On a miss (no cached AST, or a call shape the visitor doesn't cover) it falls back to the tree-sitter resolver below. **Label format is configurable** via `[inlay_hints] method_hint` in `.mimir.toml`: `"name"` (default) shows only the parameter name (`a`); `"type"` shows only the type (`int`, falls back to name when unknown); `"name+type"` shows both (`a: int`). Macro callsites always show bare param names (`ID`, `MSG`) regardless of the setting — macro args carry no SV type. Whole-line macro callsites are preserved past the preprocessor under the 0.3.1 grammar's compiler-directive allowlist, so AST-backed features see them as `text_macro_usage` nodes. The tree-sitter fallback covers four shapes via the AST: `this.X(...)` and `super.X(...)` use the enclosing `class_declaration` (and `extends` chain walked through `Symbol::parent_class_name` — `extern virtual` prototypes like UVM's `run_phase`/`build_phase` are indexed too); `obj.method(...)` uses `find_variable_type_at` to read `obj`'s declared type from any enclosing scope (class field, function arg, local) and normalizes type qualifiers (`virtual`, `pkg::`, `#(...)`, `[…]`, `.modport`) before looking up the method on the resolved class; `ap = new("ap", this)` (and `T x = new();`) reads the LHS's declared type and looks up the constructor. Chained access (`obj.field.method(...)`) is resolved on the tree-sitter path via the chain resolver (up to 2 intermediate hops); deeper chains and bare unattached `new(...)` fall back to slang (when configured) or skip with an explicit trace. Calls with more arguments than declared parameters are silently skipped (avoids wrong labels for variadic-style patterns).
+- ✅ `textDocument/inlayHint` — slang-first with a tree-sitter fallback. Finds all call sites in the editor's visible viewport and places ghost-text labels before each argument. **Method-call resolution is slang-first**: when a cached `MimirAst` is available, the method-name token is resolved through the reference map (`MimirFile::references` via `ast_features::method_params_at`), and the callee's formal parameters are read from the resolved declaration. Because slang's name binder is authoritative, this resolves methods **inherited from base classes the tree-sitter workspace index never indexed** (e.g. UVM bases — the `m_obj.configure(...)` case), which the tree-sitter inheritance walk could not reach. On a miss (no cached AST, or a call shape the visitor doesn't cover) it falls back to the tree-sitter resolver below. **Label format is configurable** via `[inlay_hints] method_hint` in `.mimir.toml`: `"name"` (default) shows only the parameter name (`a`); `"type"` shows only the type (`int`, falls back to name when unknown); `"name+type"` shows both (`a: int`). Macro callsites always show bare param names (`ID`, `MSG`) regardless of the setting — macro args carry no SV type. Whole-line macro callsites are preserved past the preprocessor under the 0.3.1 grammar's compiler-directive allowlist, so AST-backed features see them as `text_macro_usage` nodes. The tree-sitter fallback covers four shapes via the AST: `this.X(...)` and `super.X(...)` use the enclosing `class_declaration` (and `extends` chain walked through `Symbol::parent_class_name` — `extern virtual` prototypes like UVM's `run_phase`/`build_phase` are indexed too); `obj.method(...)` uses `find_variable_type_at` to read `obj`'s declared type from any enclosing scope (class field, function arg, local) and normalizes type qualifiers (`virtual`, `pkg::`, `#(...)`, `[…]`, `.modport`) before looking up the method on the resolved class; `ap = new("ap", this)` (and `T x = new();`) reads the LHS's declared type and looks up the constructor. Chained access (`obj.field.method(...)`) is resolved on the tree-sitter path via the chain resolver (up to 2 intermediate hops); deeper chains and bare unattached `new(...)` fall back to slang (when configured) or skip with an explicit trace. Calls with more arguments than declared parameters are silently skipped (avoids wrong labels for variadic-style patterns). Named-argument syntax (`.name(value)`) is detected and suppresses the inline label for that argument — the user has already written the name at the call site, so an inlay would be redundant; before v0.7.17 the value would have been incorrectly prefixed with whichever positional param happened to share its slot.
 - ✅ Keyword / system-task hover help — covered in the `textDocument/hover` entry above. Curated `KEYWORD_DOCS` + `SYSTEM_TASK_DOCS` tables in [`crates/mimir-syntax/src/keywords.rs`](./crates/mimir-syntax/src/keywords.rs).
 - ✅ Built-in SV method hover — hover on LRM-defined methods that never appear in the workspace index (`push_back`, `pop_front`, `rand_mode`, `constraint_mode`, `randomize`, `len`, `toupper`, `tolower`, `substr`, `atoi`, `itoa`, `exists`, `first`, `last`, `sort`, `shuffle`, …) returns the IEEE 1800-2017 signature and a one-line description. Type-aware for `string` receivers (uses `find_variable_type_at`); dimension-suffix–aware for queues / dynamic arrays / associative arrays (uses `find_variable_type_info_at` which returns a `TypeInfo { base, suffix }` so `push_back` / `pop_front` appear for `int q[$]` and `exists` / `delete` appear for `int aa[string]`); universal-table–aware for any class receiver (`rand_mode`, `constraint_mode`, `randomize`). Curated tables (`STRING_METHODS`, `QUEUE_METHODS`, `DYNAMIC_ARRAY_METHODS`, `ASSOC_ARRAY_METHODS`, `UNIVERSAL_METHODS`) live in [`crates/mimir-syntax/src/builtin_methods.rs`](./crates/mimir-syntax/src/builtin_methods.rs).
 - ✅ Typedef expansion in hover — when the cursor is on a `typedef` name (e.g. `addr_t`), the hover popup shows the full declaration line plus an **Expands to:** note with the underlying type extracted from that line (e.g. `logic [31:0]`). Implemented via `typedef_base_from_line` in `backend.rs` which parses the `typedef <base> <alias>;` pattern without a second tree-sitter traversal.
