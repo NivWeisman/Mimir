@@ -791,6 +791,27 @@ static bool refs_emission_enabled() {
     return std::string_view{env} != "0";
 }
 
+// When `MIMIR_SLANG_DUMP_BUFFERS=1`, dump every buffer slang's
+// SourceManager has loaded after compilation finishes — both the buffers
+// we registered via `assignText` and any the preprocessor opened on its
+// own via `` `include `` resolution. The output is the decisive answer to
+// "did slang ever see this file, and under what path?" and isolates
+// include-path divergence between editor URIs and slang's `+incdir+`
+// resolution.
+static void maybe_dump_source_manager_buffers(const slang::SourceManager& sm) {
+    const char* env = std::getenv("MIMIR_SLANG_DUMP_BUFFERS");
+    if (env == nullptr || std::string_view{env} == "0") return;
+    auto buffers = sm.getAllBuffers();
+    std::cerr << "[mimir-slang-sidecar] SourceManager has " << buffers.size()
+              << " buffer(s):\n";
+    for (auto bid : buffers) {
+        const auto& full = sm.getFullPath(bid);
+        std::cerr << "  " << (full.empty() ? std::string{sm.getRawFileName(bid)}
+                                           : full.string())
+                  << '\n';
+    }
+}
+
 static json handle_compile(const json& params) {
     auto built      = build_compilation(params);
     auto& sm        = *built.sm;
@@ -859,6 +880,8 @@ static json handle_compile(const json& params) {
 
     json ast;
     ast["files"] = std::move(files);
+
+    maybe_dump_source_manager_buffers(sm);
 
     json result;
     result["ast"]         = std::move(ast);
