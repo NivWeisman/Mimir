@@ -916,7 +916,18 @@ static json handle_compile(const json& params) {
     }
 
     // Sort each sent-file's refs by use_range.start so the Rust side can
-    // binary-search at the cursor.
+    // binary-search at the cursor, then dedupe adjacent identical entries.
+    //
+    // Dedup is load-bearing for method calls: slang represents
+    // `obj.method(args)` such that *both* the MemberAccessExpression
+    // handler (visiting the callee) and the CallExpression handler
+    // (covering the method name in InvocationExpression.left) fire on the
+    // same use, with `narrow_member_access_range` and `narrow_call_range`
+    // returning the same `.method` token range and the same resolved
+    // SubroutineSymbol. Without dedup every method-call ref is emitted
+    // twice, bloating the wire payload (a UVM project has tens of
+    // thousands of method calls) and forcing the Rust binary search to
+    // discard duplicates at lookup time.
     for (auto& [_, vec] : refs_by_sent) {
         std::sort(vec.begin(), vec.end(), [](const json& a, const json& b) {
             const auto& as = a["use_range"]["start"];
@@ -926,6 +937,7 @@ static json handle_compile(const json& params) {
             if (al != bl) return al < bl;
             return as["character"].get<uint32_t>() < bs["character"].get<uint32_t>();
         });
+        vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
     }
 
     json files = json::array();

@@ -319,113 +319,16 @@ pub(crate) fn definition(
     pos: MimirPos,
     rope: &Rope,
 ) -> Option<GotoDefinitionResponse> {
-    match ast.find_file(file_uri) {
-        Some(file) => {
-            let refs_in_file = file.references.len();
-            match find_ref_at(file, pos) {
-                Some(r) => {
-                    let uri = Url::parse(&format!("file://{}", r.target_path)).ok()?;
-                    let location =
-                        Location { uri, range: mimir_to_lsp_range(r.target_range) };
-                    debug!(
-                        file_uri,
-                        refs_in_file,
-                        target_path = %r.target_path,
-                        target_kind = ?r.target_kind,
-                        "ast definition: gate=ref_map_hit",
-                    );
-                    return Some(GotoDefinitionResponse::Scalar(location));
-                }
-                None => {
-                    // File is in the AST but no ref covers the cursor. Most
-                    // common causes: (a) refs_in_file == 0 → slang didn't
-                    // elaborate this file *under this path* (often because
-                    // it's open in the editor + reached via `` `include `` and
-                    // slang resolved the include to a different path string,
-                    // creating a second buffer whose refs key elsewhere), or
-                    // (b) refs_in_file > 0 but the visitor didn't emit one
-                    // for this exact token shape.
-                    //
-                    // When refs_in_file == 0, also dump the top-5 paths that
-                    // *did* receive refs so a path-mismatch is easy to spot.
-                    if refs_in_file == 0 {
-                        let mut by_count: Vec<(&str, usize)> = ast
-                            .files
-                            .iter()
-                            .filter(|f| !f.references.is_empty())
-                            .map(|f| (f.uri.as_str(), f.references.len()))
-                            .collect();
-                        by_count.sort_by_key(|b| std::cmp::Reverse(b.1));
-                        by_count.truncate(5);
-
-                        // Smoking gun for include-path-key mismatch: a file
-                        // whose basename matches the cursor's file and has
-                        // refs > 0 means slang elaborated the same content
-                        // under a different path string than what the editor
-                        // sent — usually because the parent CU's
-                        // `` `include "x" `` resolved via +incdir+ to a path
-                        // string that differs from the editor's open-file
-                        // URI. The per-file ref emit keys by the resolved
-                        // path; our find_file lookup uses the editor URI →
-                        // miss → "0 refs".
-                        let target_basename =
-                            std::path::Path::new(file_uri)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("");
-                        let basename_matches: Vec<(&str, usize)> = ast
-                            .files
-                            .iter()
-                            .filter(|f| {
-                                !f.references.is_empty()
-                                    && std::path::Path::new(&f.uri)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .map(|n| n == target_basename)
-                                        .unwrap_or(false)
-                            })
-                            .map(|f| (f.uri.as_str(), f.references.len()))
-                            .collect();
-
-                        debug!(
-                            file_uri,
-                            pos_line = pos.line,
-                            pos_char = pos.character,
-                            refs_in_file,
-                            top_paths_with_refs = ?by_count,
-                            basename_matches = ?basename_matches,
-                            "ast definition: gate=ref_not_at_pos (falling through to name lookup)",
-                        );
-                    } else {
-                        debug!(
-                            file_uri,
-                            pos_line = pos.line,
-                            pos_char = pos.character,
-                            refs_in_file,
-                            "ast definition: gate=ref_not_at_pos (falling through to name lookup)",
-                        );
-                    }
-                }
-            }
-        }
-        None => {
-            // The cursor's file URI isn't in the AST at all. Usually a path
-            // mismatch (symlink resolution, `/private/var` vs `/var`,
-            // trailing slash) — slang knows the file under a different
-            // string than the LSP URI maps to. Log the first few URIs the
-            // AST does know so the user can diff.
-            let known: Vec<&str> = ast
-                .files
-                .iter()
-                .take(5)
-                .map(|f| f.uri.as_str())
-                .collect();
+    if let Some(file) = ast.find_file(file_uri) {
+        if let Some(r) = find_ref_at(file, pos) {
+            let uri = Url::parse(&format!("file://{}", r.target_path)).ok()?;
+            let location = Location { uri, range: mimir_to_lsp_range(r.target_range) };
             debug!(
-                file_uri,
-                total_files_in_ast = ast.files.len(),
-                first_known_uris = ?known,
-                "ast definition: gate=file_not_in_ast (falling through to name lookup)",
+                target_path = %r.target_path,
+                target_kind = ?r.target_kind,
+                "ast definition resolved via reference map",
             );
+            return Some(GotoDefinitionResponse::Scalar(location));
         }
     }
 
@@ -433,7 +336,7 @@ pub(crate) fn definition(
     let (decl, decl_file) = find_decl(ast, file_uri, pos, &name)?;
     let uri = Url::parse(&format!("file://{decl_file}")).ok()?;
     let location = Location { uri, range: mimir_to_lsp_range(decl.range) };
-    debug!(name, file = decl_file, "ast definition: gate=name_lookup_hit");
+    debug!(name, file = decl_file, "ast definition resolved via name lookup");
     Some(GotoDefinitionResponse::Scalar(location))
 }
 
