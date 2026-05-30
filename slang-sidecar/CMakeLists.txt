@@ -48,10 +48,16 @@ FetchContent_Declare(
 )
 
 # --- slang ---------------------------------------------------------------
-# We don't need slang's CLI driver, tests, docs, or install rules. Turning
-# them off shrinks the build by a noticeable amount and keeps `cmake
-# --build` from running test compilations we don't care about.
-set(SLANG_INCLUDE_TOOLS    OFF CACHE BOOL "" FORCE)
+# Tests/docs/install/pylib stay off — only the sidecar consumes libslang.
+# SLANG_INCLUDE_TOOLS stays ON so the slang CLI binaries land under
+# slang-sidecar/build/_deps/slang-build/bin/ (already gitignored via
+# slang-sidecar/build/). They aren't part of the sidecar runtime, but
+# having `slang`, `slang-hier`, `slang-tidy`, etc. locally available is
+# invaluable for benchmarking the sidecar against slang's own pipeline
+# and for ad-hoc preprocessor/elaboration sanity checks — `slang -f
+# my.f --single-unit --ast-json out.json` answers a lot of questions
+# faster than instrumenting the sidecar.
+set(SLANG_INCLUDE_TOOLS    ON  CACHE BOOL "" FORCE)
 set(SLANG_INCLUDE_TESTS    OFF CACHE BOOL "" FORCE)
 set(SLANG_INCLUDE_DOCS     OFF CACHE BOOL "" FORCE)
 set(SLANG_INCLUDE_INSTALL  OFF CACHE BOOL "" FORCE)
