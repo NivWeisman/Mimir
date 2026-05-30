@@ -28,9 +28,11 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod debug_timer;
 pub mod document;
 pub mod logging;
 
 // Re-export the most commonly-used items at the crate root so callers can
 // write `mimir_core::Position` instead of `mimir_core::document::Position`.
+pub use debug_timer::ScopeTimer;
 pub use document::{Position, Range, TextDocument, TextDocumentError};

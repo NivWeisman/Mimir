@@ -558,6 +558,62 @@ static json symbol_to_mimir_decl(const slang::SourceManager& sm,
 // `MemberAccessExpression.member`. The CallExpression handler skips
 // these to avoid emitting a duplicate ref.
 
+// Populate `target_type_str`, `target_params`, `target_parent_class` on
+// a ref so hover/inlay-hint/signature-help can render entirely from the
+// ref — without needing to find the target's `MimirDecl` in `MimirAst`
+// (which is impossible for targets in files the client didn't send,
+// e.g. inherited methods on UVM base classes). All three fields are
+// optional on the wire (skip_serializing_if), so emitting nothing here
+// for an unsupported kind degrades cleanly: the consumer falls back to
+// its name-based path.
+static void enrich_ref_with_target_info(const slang::ast::Symbol& target, json& entry) {
+    using namespace slang::ast;
+    switch (target.kind) {
+        case SymbolKind::Subroutine: {
+            auto& sub = target.as<SubroutineSymbol>();
+            // Tasks return void → skip the field entirely (decoded as None).
+            if (sub.subroutineKind == SubroutineKind::Function) {
+                entry["target_type_str"] =
+                    std::string(sub.getReturnType().toString());
+            }
+            json params = json::array();
+            for (const auto* arg : sub.getArguments()) {
+                if (arg == nullptr) continue;
+                json p;
+                p["name"] = std::string(arg->name);
+                p["type_str"] = std::string(arg->getType().toString());
+                params.push_back(std::move(p));
+            }
+            if (!params.empty()) {
+                entry["target_params"] = std::move(params);
+            }
+            break;
+        }
+        case SymbolKind::Variable:
+        case SymbolKind::Net:
+        case SymbolKind::Field:
+        case SymbolKind::Port:
+            entry["target_type_str"] =
+                std::string(target.as<ValueSymbol>().getType().toString());
+            break;
+        case SymbolKind::Parameter:
+            entry["target_type_str"] =
+                std::string(target.as<ParameterSymbol>().getType().toString());
+            break;
+        default:
+            // Other kinds (Class, Package, Typedef, …) carry their meaning
+            // entirely in `target_kind`; no extra metadata to denormalise.
+            break;
+    }
+    // Parent class is only meaningful for members of a class scope.
+    if (const auto* parent_scope = target.getParentScope()) {
+        const auto& parent_sym = parent_scope->asSymbol();
+        if (parent_sym.kind == SymbolKind::ClassType && !parent_sym.name.empty()) {
+            entry["target_parent_class"] = std::string(parent_sym.name);
+        }
+    }
+}
+
 static const char* symbol_kind_to_decl_kind(const slang::ast::Symbol& sym) {
     using SK = slang::ast::SymbolKind;
     switch (sym.kind) {
@@ -727,6 +783,7 @@ struct RefCollector
         entry["target_path"]  = std::move(target_path);
         entry["target_range"] = std::move(target_range_json);
         entry["target_kind"]  = kind;
+        enrich_ref_with_target_info(*target, entry);
         refs_by_sent[*attach].push_back(std::move(entry));
     }
 
@@ -795,6 +852,45 @@ public:
         return ms;
     }
 };
+
+// Drop-in scope timer for ad-hoc bottleneck hunts. Logs the scope's
+// elapsed milliseconds on destruction when `MIMIR_DEBUG_TIMING=1` is
+// set in the sidecar environment; no-op otherwise (one cached bool
+// load, no formatting). Pairs with the Rust-side `time_scope!` macro
+// in `mimir-core::debug_timer` so both halves of the pipeline share
+// one knob.
+class ScopedTimer {
+    const char* name_;
+    std::chrono::steady_clock::time_point start_;
+
+    static bool enabled() {
+        static const bool v = []{
+            const char* e = std::getenv("MIMIR_DEBUG_TIMING");
+            return e != nullptr && std::string_view{e} != "0";
+        }();
+        return v;
+    }
+
+public:
+    explicit ScopedTimer(const char* name)
+        : name_(name), start_(std::chrono::steady_clock::now()) {}
+
+    ~ScopedTimer() {
+        if (!enabled()) return;
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - start_).count();
+        std::cerr << "[mimir-slang-sidecar] debug_timer scope=" << name_
+                  << " ms=" << ms << "\n";
+    }
+
+    ScopedTimer(const ScopedTimer&) = delete;
+    ScopedTimer& operator=(const ScopedTimer&) = delete;
+};
+
+#define MIMIR_SCOPED_TIMER_CAT_IMPL(a, b) a##b
+#define MIMIR_SCOPED_TIMER_CAT(a, b)      MIMIR_SCOPED_TIMER_CAT_IMPL(a, b)
+#define MIMIR_SCOPED_TIMER(name) \
+    ::ScopedTimer MIMIR_SCOPED_TIMER_CAT(_mimir_scope_timer_, __LINE__){name}
 
 // When `MIMIR_SLANG_DUMP_BUFFERS=1`, dump every buffer slang's
 // SourceManager has loaded after compilation finishes — both the buffers

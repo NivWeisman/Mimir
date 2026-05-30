@@ -166,6 +166,21 @@ pub enum Visibility {
     Local,
 }
 
+/// One formal parameter of a callable target, as carried inline on a
+/// [`MimirRef`] so hover/inlay-hint/signature-help consumers can render
+/// without a round-trip into the target's declaring file (which may not
+/// be in [`MimirAst::files`] at all — UVM source, vendor code, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MimirParam {
+    /// Parameter name.
+    pub name: String,
+    /// Declared parameter type as a string (e.g. `"int unsigned"`,
+    /// `"uvm_reg_block"`). `None` when slang couldn't resolve a type
+    /// string for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_str: Option<String>,
+}
+
 /// One resolved name-use → declaration link, emitted by the backend for
 /// every identifier whose binding is known at elaboration time.
 ///
@@ -173,6 +188,16 @@ pub enum Visibility {
 /// in a different file (cross-file references are the whole point — that's
 /// what unblocks goto-def for inherited fields, typedef chains, and
 /// package-imported symbols).
+///
+/// The `target_*` fields beyond `target_path`/`target_range`/`target_kind`
+/// are **denormalised metadata** for the target — return type, formal
+/// params, parent class. They let hover/inlay-hint/signature-help render
+/// without ever looking up the target's declaration in the AST (which
+/// may be impossible for targets in files the client didn't send, e.g.
+/// inherited methods on UVM base classes). All are
+/// `#[serde(default, skip_serializing_if)]` so older sidecars stay
+/// wire-compatible; on a payload without them the consumer falls back
+/// to its name-based path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MimirRef {
     /// Source range of the use site (the identifier as it appears in the
@@ -188,6 +213,22 @@ pub struct MimirRef {
     /// Kind of the target declaration. Clients can filter (e.g. skip a
     /// `Port` when the user wanted a `Function`).
     pub target_kind: DeclKind,
+
+    /// For callables (Function/Task) this is the return type string;
+    /// for value-bearing symbols (Variable/Field/Port/Parameter) it's
+    /// the declared type. `None` for kinds without a meaningful type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_type_str: Option<String>,
+
+    /// Formal parameters when the target is callable; empty otherwise.
+    /// Order matches the declaration order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_params: Vec<MimirParam>,
+
+    /// For class members, the enclosing class's name. Lets hover
+    /// disambiguate (e.g. "field of `m_base_mem`"); `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_parent_class: Option<String>,
 }
 
 /// A single diagnostic emitted by a backend.
@@ -331,6 +372,9 @@ mod tests {
                     target_path: "/tmp/defs.sv".to_string(),
                     target_range: range(10, 6, 10, 15),
                     target_kind: DeclKind::Function,
+                    target_type_str: None,
+                    target_params: vec![],
+                    target_parent_class: None,
                 }],
             }],
         };
@@ -358,6 +402,70 @@ mod tests {
         }"#;
         let ast: MimirAst = serde_json::from_str(legacy_json).expect("legacy decode");
         assert!(ast.files[0].references.is_empty());
+    }
+
+    #[test]
+    fn ref_target_info_roundtrips() {
+        // Build a ref carrying the full denormalised target metadata —
+        // covers all four new fields (target_type_str, target_params,
+        // target_parent_class, and MimirParam.type_str) so a schema
+        // change to any of them would fail this test.
+        let r = MimirRef {
+            use_range: range(4, 10, 4, 19),
+            target_path: "/uvm-1.2/src/reg/uvm_mem.svh".to_string(),
+            target_range: range(1234, 17, 1234, 26),
+            target_kind: DeclKind::Function,
+            target_type_str: Some("void".into()),
+            target_params: vec![
+                MimirParam { name: "name".into(), type_str: Some("string".into()) },
+                MimirParam { name: "size".into(), type_str: Some("longint unsigned".into()) },
+                MimirParam { name: "n_bits".into(), type_str: Some("int unsigned".into()) },
+            ],
+            target_parent_class: Some("uvm_mem".into()),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: MimirRef = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn ref_target_info_omits_defaults_on_wire() {
+        // A ref with no target metadata serialises as a strict v0.7.15
+        // shape — none of the new fields appear in the JSON. That keeps
+        // wire payloads small for non-callable refs (most variables /
+        // ports) and decodes cleanly on older clients that lack the
+        // fields entirely.
+        let r = MimirRef {
+            use_range: range(0, 0, 0, 5),
+            target_path: "/x.sv".into(),
+            target_range: range(0, 0, 0, 5),
+            target_kind: DeclKind::Variable,
+            target_type_str: None,
+            target_params: vec![],
+            target_parent_class: None,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(!s.contains("target_type_str"), "expected default field skipped: {s}");
+        assert!(!s.contains("target_params"),  "expected default field skipped: {s}");
+        assert!(!s.contains("target_parent_class"), "expected default field skipped: {s}");
+    }
+
+    #[test]
+    fn ref_legacy_decode_without_target_info() {
+        // A wire payload from v0.7.15 (or any client that doesn't know
+        // about the new fields) must still decode — the new fields
+        // default to None/empty so the consumer's ref-first paths
+        // simply fall back to its name-based behaviour.
+        let legacy = r#"{
+            "use_range":    {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}},
+            "target_path":  "/x.sv",
+            "target_range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 3}},
+            "target_kind":  "function"
+        }"#;
+        let r: MimirRef = serde_json::from_str(legacy).expect("legacy ref decode");
+        assert!(r.target_type_str.is_none());
+        assert!(r.target_params.is_empty());
+        assert!(r.target_parent_class.is_none());
     }
 
     #[test]

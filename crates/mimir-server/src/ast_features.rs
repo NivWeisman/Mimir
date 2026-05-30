@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use mimir_ast::{DeclKind, MimirAst, MimirDecl, MimirFile, MimirPos, MimirRange, MimirRef, MimirScope};
+use mimir_ast::{DeclKind, MimirAst, MimirDecl, MimirFile, MimirParam, MimirPos, MimirRange, MimirRef, MimirScope};
 use ropey::Rope;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, GotoDefinitionResponse, Hover,
@@ -242,6 +242,14 @@ fn find_ref_at(file: &MimirFile, pos: MimirPos) -> Option<&MimirRef> {
 /// `file`'s scope tree and descending into each decl's `members` (methods
 /// and fields live as members of their enclosing class decl, so a flat
 /// scope walk would miss them).
+///
+/// Currently only the tests exercise this — v0.7.16 collapsed
+/// `method_params_at` onto the ref's denormalised `target_params` and no
+/// longer needs to find the target decl. Kept around because hover /
+/// signature-help could fall back to it for finer-grained metadata
+/// (e.g. doc strings, once slang exposes them) without re-introducing
+/// the lookup helper.
+#[allow(dead_code)]
 fn find_decl_at(file: &MimirFile, target: MimirRange) -> Option<&MimirDecl> {
     fn search_decls(decls: &[MimirDecl], target: MimirRange) -> Option<&MimirDecl> {
         for d in decls {
@@ -264,15 +272,21 @@ fn find_decl_at(file: &MimirFile, target: MimirRange) -> Option<&MimirDecl> {
 }
 
 /// Resolve the method call whose name token is at `pos` to its formal
-/// parameters, via the slang reference map plus the target decl's `Port`
-/// members.
+/// parameters via the slang reference map's denormalised
+/// `target_params` field.
 ///
 /// Returns `(name, type_str)` pairs in declaration order, or `None` when
-/// `pos` isn't on a resolved function/task call or the target decl can't
-/// be located in the AST. Powers the slang-first path of `inlay_hint`,
-/// which needs the callee's parameters to label call arguments — and is
-/// receiver-aware, so it resolves methods inherited from base classes the
-/// tree-sitter workspace index never indexed (e.g. UVM bases).
+/// `pos` isn't on a resolved function/task call. Powers the slang-first
+/// path of `inlay_hint`; receiver-aware because slang's name binder
+/// produced the ref, so this resolves inherited methods on UVM base
+/// classes (and any other target whose declaration lives in a file
+/// outside `params["files"]`).
+///
+/// This used to round-trip into the target file's `MimirDecl` via
+/// `find_decl_at`; v0.7.16 denormalised the params onto every callable
+/// ref, so we read them straight off `r.target_params` — the lookup is
+/// O(log n) end-to-end and works for cross-file targets the AST
+/// doesn't even contain.
 pub(crate) fn method_params_at(
     ast: &MimirAst,
     file_uri: &str,
@@ -283,15 +297,12 @@ pub(crate) fn method_params_at(
     if !matches!(r.target_kind, DeclKind::Function | DeclKind::Task) {
         return None;
     }
-    let target_file = ast.find_file(&r.target_path)?;
-    let decl = find_decl_at(target_file, r.target_range)?;
-    let params = decl
-        .members
-        .iter()
-        .filter(|m| m.kind == DeclKind::Port)
-        .map(|m| (m.name.clone(), m.type_str.clone()))
-        .collect();
-    Some(params)
+    Some(
+        r.target_params
+            .iter()
+            .map(|p| (p.name.clone(), p.type_str.clone()))
+            .collect(),
+    )
 }
 
 // --------------------------------------------------------------------------
@@ -381,19 +392,8 @@ pub(crate) fn type_definition(
 // hover
 // --------------------------------------------------------------------------
 
-/// Build a [`Hover`] response for the symbol at `pos`.
-pub(crate) fn hover(
-    ast: &Arc<MimirAst>,
-    file_uri: &str,
-    pos: MimirPos,
-    rope: &Rope,
-) -> Option<Hover> {
-    let name = word_at_rope(rope, pos)?;
-    let (decl, _) = find_decl(ast, file_uri, pos, &name)?;
-
-    let mut parts: Vec<String> = Vec::new();
-
-    let kind_label = match decl.kind {
+fn kind_label(kind: DeclKind) -> &'static str {
+    match kind {
         DeclKind::Module => "module",
         DeclKind::Interface => "interface",
         DeclKind::Program => "program",
@@ -413,7 +413,76 @@ pub(crate) fn hover(
         DeclKind::Enum => "enum",
         DeclKind::EnumMember => "enum member",
         DeclKind::Macro => "macro",
-    };
+    }
+}
+
+/// Render a [`Hover`] from a ref's denormalised target metadata. Shared
+/// by `hover`'s ref-first arm so the same formatting is reused. The
+/// hover range is the ref's `use_range` — the actual identifier under
+/// the cursor (more LSP-correct than the legacy "decl range" behaviour,
+/// which only worked by accident for same-file targets).
+fn build_hover_from_ref(name: &str, r: &MimirRef) -> Hover {
+    let label = kind_label(r.target_kind);
+    let mut parts: Vec<String> = Vec::new();
+
+    if matches!(r.target_kind, DeclKind::Function | DeclKind::Task) {
+        let params: Vec<String> = r
+            .target_params
+            .iter()
+            .map(|p| match &p.type_str {
+                Some(t) => format!("{t} {}", p.name),
+                None => p.name.clone(),
+            })
+            .collect();
+        let sig = format!("{label} {name}({})", params.join(", "));
+        parts.push(mimir_syntax::hover_format::format_sv_signature(&sig));
+    } else {
+        let type_part = match &r.target_type_str {
+            Some(t) => format!("{t} {name}"),
+            None => format!("{label} {name}"),
+        };
+        parts.push(format!("```systemverilog\n{type_part}\n```"));
+    }
+
+    if let Some(parent) = &r.target_parent_class {
+        parts.push(format!("*{label} of class `{parent}`*"));
+    }
+
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: parts.join("\n\n"),
+        }),
+        range: Some(mimir_to_lsp_range(r.use_range)),
+    }
+}
+
+/// Build a [`Hover`] response for the symbol at `pos`.
+///
+/// Ref-first: when the cursor lands on a tracked use, render hover
+/// content from the ref's denormalised target metadata
+/// (`target_kind`/`target_type_str`/`target_params`/`target_parent_class`).
+/// This works for inherited methods on UVM bases and other targets the
+/// AST doesn't contain a `MimirDecl` for. Falls back to the legacy
+/// name-based path on a ref miss (macros, completion mid-typing, etc.).
+pub(crate) fn hover(
+    ast: &Arc<MimirAst>,
+    file_uri: &str,
+    pos: MimirPos,
+    rope: &Rope,
+) -> Option<Hover> {
+    let name = word_at_rope(rope, pos)?;
+
+    if let Some(file) = ast.find_file(file_uri) {
+        if let Some(r) = find_ref_at(file, pos) {
+            return Some(build_hover_from_ref(&name, r));
+        }
+    }
+
+    let (decl, _) = find_decl(ast, file_uri, pos, &name)?;
+
+    let mut parts: Vec<String> = Vec::new();
+    let kind_label = kind_label(decl.kind);
 
     let type_part = match &decl.type_str {
         Some(t) => format!("{t} {name}"),
@@ -569,6 +638,53 @@ fn decls_to_completion_items(decls: &[MimirDecl]) -> Vec<CompletionItem> {
 // signature help
 // --------------------------------------------------------------------------
 
+/// Build a [`SignatureHelp`] from a ref's denormalised target metadata.
+/// Shared by the ref-first arm of [`signature_help`] so the same label /
+/// active-parameter logic can be reused for any callable target — same
+/// shape the name-based fallback computes from a [`MimirDecl`].
+fn build_sig_help_from_target(
+    name: &str,
+    kind: DeclKind,
+    return_type: Option<&str>,
+    params: &[MimirParam],
+    active_param: usize,
+) -> SignatureHelp {
+    let lsp_params: Vec<ParameterInformation> = params
+        .iter()
+        .map(|p| {
+            let label = match &p.type_str {
+                Some(t) => format!("{t} {}", p.name),
+                None => p.name.clone(),
+            };
+            ParameterInformation {
+                label: ParameterLabel::Simple(label),
+                documentation: None,
+            }
+        })
+        .collect();
+    let kind_label = if kind == DeclKind::Task { "task" } else { "function" };
+    let ret = return_type.map(|t| format!("{t} ")).unwrap_or_default();
+    let param_text: Vec<String> = lsp_params
+        .iter()
+        .map(|p| match &p.label {
+            ParameterLabel::Simple(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    let label = format!("{kind_label} {ret}{name}({})", param_text.join(", "));
+    let active = active_param.min(params.len().saturating_sub(1)) as u32;
+    SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation: None,
+            parameters: Some(lsp_params),
+            active_parameter: Some(active),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(active),
+    }
+}
+
 /// Signature help for the callable at `pos`.
 ///
 /// Scans backward from the cursor to find the function/task name and the
@@ -581,7 +697,29 @@ pub(crate) fn signature_help(
     pos: MimirPos,
     rope: &Rope,
 ) -> Option<SignatureHelp> {
-    let (callee_name, active_param) = callee_at(rope, pos)?;
+    let (callee_name, name_range, active_param) = callee_at(rope, pos)?;
+
+    // Ref-first arm: when the callee's name token has a resolved ref,
+    // build the signature from `target_params` directly — works for
+    // inherited methods on UVM/vendor classes whose declarations are
+    // in files the client didn't put in params["files"] and therefore
+    // aren't in `ast.files`.
+    if let Some(file) = ast.find_file(file_uri) {
+        if let Some(r) = find_ref_at(file, name_range.start) {
+            if matches!(r.target_kind, DeclKind::Function | DeclKind::Task) {
+                return Some(build_sig_help_from_target(
+                    &callee_name,
+                    r.target_kind,
+                    r.target_type_str.as_deref(),
+                    &r.target_params,
+                    active_param,
+                ));
+            }
+        }
+    }
+
+    // Name-based fallback (covers same-file callables when no ref is
+    // available, e.g. older sidecars or kinds the visitor doesn't track).
     let (decl, _) = find_decl(ast, file_uri, pos, callee_name.as_str())?;
 
     if !matches!(decl.kind, DeclKind::Function | DeclKind::Task) {
@@ -639,25 +777,30 @@ pub(crate) fn signature_help(
     })
 }
 
-/// Scan backward from `pos` to find the name of the function being called
-/// and how many commas (= active parameter index) precede the cursor inside
-/// the argument list.
+/// Scan backward from `pos` to find the name of the function being called,
+/// its source range (so callers can look up a [`MimirRef`] at the name
+/// token's position), and how many commas (= active parameter index)
+/// precede the cursor inside the argument list.
 ///
-/// Returns `None` if the cursor is not inside a `(…)` call context.
-fn callee_at(rope: &Rope, pos: MimirPos) -> Option<(String, usize)> {
+/// Returns `None` if the cursor is not inside a `(…)` call context or
+/// the receiver before `(` doesn't parse as an identifier.
+fn callee_at(rope: &Rope, pos: MimirPos) -> Option<(String, MimirRange, usize)> {
     if (pos.line as usize) >= rope.len_lines() {
         return None;
     }
 
     let line = rope.line(pos.line as usize);
-    // Build a char vec up to the cursor column (UTF-16 aware).
-    let mut chars_before: Vec<char> = Vec::new();
+    // Build a char vec up to the cursor column (UTF-16 aware). Track the
+    // UTF-16 column at the START of each char so we can convert
+    // identifier-byte-indices back into UTF-16 positions for the
+    // returned MimirRange.
+    let mut chars_before: Vec<(u32, char)> = Vec::new();
     let mut utf16: u32 = 0;
     for ch in line.chars() {
         if ch == '\n' || ch == '\r' || utf16 >= pos.character {
             break;
         }
-        chars_before.push(ch);
+        chars_before.push((utf16, ch));
         utf16 += ch.len_utf16() as u32;
     }
 
@@ -666,7 +809,7 @@ fn callee_at(rope: &Rope, pos: MimirPos) -> Option<(String, usize)> {
     let mut commas = 0usize;
     let mut paren_open_idx: Option<usize> = None;
 
-    for (i, &ch) in chars_before.iter().enumerate().rev() {
+    for (i, &(_, ch)) in chars_before.iter().enumerate().rev() {
         match ch {
             ')' => depth += 1,
             '(' => {
@@ -682,22 +825,43 @@ fn callee_at(rope: &Rope, pos: MimirPos) -> Option<(String, usize)> {
     }
 
     let paren_idx = paren_open_idx?;
-    // Extract the identifier immediately before the `(`.
-    let before_paren: String = chars_before[..paren_idx].iter().collect();
-    let name: String = before_paren
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_' || *c == '$')
-        .map(|(_, c)| c)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-
-    if name.is_empty() {
+    // Identifier characters immediately before the `(` are the callee.
+    // Scan back from paren_idx - 1.
+    let mut id_end = paren_idx;
+    while id_end > 0 {
+        let (_, ch) = chars_before[id_end - 1];
+        if !(ch.is_alphanumeric() || ch == '_' || ch == '$') {
+            break;
+        }
+        id_end -= 1;
+    }
+    let id_start = id_end;
+    // Walk forward to find where the identifier actually starts (the
+    // first char going right that is an identifier char). Same effect
+    // as the reverse take_while in the old impl.
+    let mut name_start_idx = paren_idx;
+    while name_start_idx > id_start {
+        let (_, ch) = chars_before[name_start_idx - 1];
+        if !(ch.is_alphanumeric() || ch == '_' || ch == '$') {
+            break;
+        }
+        name_start_idx -= 1;
+    }
+    if name_start_idx == paren_idx {
         return None;
     }
-    Some((name, commas))
+    let name: String = chars_before[name_start_idx..paren_idx]
+        .iter()
+        .map(|(_, c)| *c)
+        .collect();
+    let name_start_col = chars_before[name_start_idx].0;
+    let name_end_col = chars_before[paren_idx - 1].0
+        + chars_before[paren_idx - 1].1.len_utf16() as u32;
+    let name_range = MimirRange {
+        start: MimirPos { line: pos.line, character: name_start_col },
+        end:   MimirPos { line: pos.line, character: name_end_col },
+    };
+    Some((name, name_range, commas))
 }
 
 // --------------------------------------------------------------------------
@@ -820,6 +984,9 @@ mod tests {
             target_path: "/tmp/other.sv".to_string(),
             target_range: make_range(42, 6, 42, 15),
             target_kind: DeclKind::Function,
+            target_type_str: None,
+            target_params: vec![],
+            target_parent_class: None,
         });
         let ast = Arc::new(ast);
 
@@ -844,6 +1011,9 @@ mod tests {
             target_path: "/tmp/other.sv".to_string(),
             target_range: make_range(42, 6, 42, 15),
             target_kind: DeclKind::Function,
+            target_type_str: None,
+            target_params: vec![],
+            target_parent_class: None,
         });
         let ast = Arc::new(ast);
 
@@ -877,24 +1047,36 @@ mod tests {
                     target_path: "/x.sv".into(),
                     target_range: make_range(0, 0, 0, 1),
                     target_kind: DeclKind::Variable,
+                    target_type_str: None,
+                    target_params: vec![],
+                    target_parent_class: None,
                 },
                 MimirRef {
                     use_range: make_range(3, 0, 3, 5),
                     target_path: "/y.sv".into(),
                     target_range: make_range(0, 0, 0, 1),
                     target_kind: DeclKind::Variable,
+                    target_type_str: None,
+                    target_params: vec![],
+                    target_parent_class: None,
                 },
                 MimirRef {
                     use_range: make_range(5, 4, 5, 12),
                     target_path: "/target.sv".into(),
                     target_range: make_range(20, 0, 20, 4),
                     target_kind: DeclKind::Function,
+                    target_type_str: None,
+                    target_params: vec![],
+                    target_parent_class: None,
                 },
                 MimirRef {
                     use_range: make_range(7, 0, 7, 3),
                     target_path: "/z.sv".into(),
                     target_range: make_range(0, 0, 0, 1),
                     target_kind: DeclKind::Variable,
+                    target_type_str: None,
+                    target_params: vec![],
+                    target_parent_class: None,
                 },
             ],
         };
@@ -949,6 +1131,17 @@ mod tests {
                         // range = line,0 .. line,name_len).
                         target_range: make_range(5, 0, 5, "configure".len() as u32),
                         target_kind: DeclKind::Function,
+                        // Denormalised params (v0.7.16): method_params_at /
+                        // hover / signature_help read these straight off the
+                        // ref instead of finding the target decl in the AST,
+                        // so they work even when the target file isn't in
+                        // `ast.files` (the inherited-from-UVM case).
+                        target_type_str: Some("void".into()),
+                        target_params: vec![
+                            MimirParam { name: "a".into(), type_str: Some("int".into()) },
+                            MimirParam { name: "b".into(), type_str: Some("string".into()) },
+                        ],
+                        target_parent_class: Some("base_cls".into()),
                     }],
                 },
                 MimirFile {
@@ -1005,6 +1198,56 @@ mod tests {
         assert_eq!(decl.kind, DeclKind::Function);
     }
 
+    /// Hover lands on a tracked use → renders content from the ref's
+    /// denormalised target metadata. Verifies the parent-class line
+    /// makes it into the hover (the key signal that this is the
+    /// inherited-method path) and that the hover range is the use_range
+    /// (the actual identifier under the cursor), not the target's range.
+    #[test]
+    fn hover_renders_from_ref_target_metadata() {
+        let ast = Arc::new(ast_with_method_ref());
+        // Cursor inside the ref's use_range (line 30, characters 8..17).
+        let rope = Rope::from_str(&"\n".repeat(31)); // cheap rope so word_at_rope returns None? Actually word_at_rope needs an identifier at the position.
+        // We need the rope to have an identifier at pos (30, 10) so
+        // word_at_rope returns it as the hover-display name. Build a
+        // line whose chars 8..17 spell "configure".
+        let mut lines = vec![String::new(); 31];
+        lines[30] = format!("{:>8}configure(", "");
+        let rope = Rope::from_str(&lines.join("\n"));
+        let h = hover(&ast, "/tmp/call.sv", make_pos(30, 10), &rope)
+            .expect("ref-first hover should fire");
+        let HoverContents::Markup(m) = h.contents else { panic!("expected markup") };
+        assert!(m.value.contains("configure"),  "hover body missing name: {}", m.value);
+        assert!(m.value.contains("base_cls"),   "hover should mention parent class: {}", m.value);
+        // Range must match the use, not the target.
+        let r = h.range.expect("hover should carry a range");
+        assert_eq!(r.start.line, 30);
+        assert_eq!(r.start.character, 8);
+    }
+
+    /// Signature help at a cursor inside `name(│)`: callee_at finds the
+    /// callee name range; find_ref_at hits the ref; build_sig_help_from_target
+    /// renders params straight from the ref. No `find_decl` round-trip.
+    #[test]
+    fn signature_help_renders_from_ref_target_metadata() {
+        let ast = Arc::new(ast_with_method_ref());
+        // Build a line that puts a `configure(` callee starting at
+        // column 8 (matches the fixture's ref use_range on line 30),
+        // with the cursor positioned right after the open paren.
+        let mut lines = vec![String::new(); 31];
+        lines[30] = format!("{:>8}configure(", "");
+        let rope = Rope::from_str(&lines.join("\n"));
+        // Cursor at line 30, just inside the paren — column = 8 + len("configure(") = 18.
+        let sh = signature_help(&ast, "/tmp/call.sv", make_pos(30, 18), &rope)
+            .expect("ref-first signature_help should fire");
+        let sig = &sh.signatures[0];
+        assert!(sig.label.contains("configure"), "label missing name: {}", sig.label);
+        assert!(sig.label.contains("int a"),     "label missing first param: {}", sig.label);
+        assert!(sig.label.contains("string b"),  "label missing second param: {}", sig.label);
+        let params = sig.parameters.as_ref().expect("params present");
+        assert_eq!(params.len(), 2);
+    }
+
     #[test]
     fn identifier_completion_returns_visible_names() {
         let ast = Arc::new(simple_ast());
@@ -1059,9 +1302,12 @@ mod tests {
     fn callee_at_finds_name_and_param_index() {
         let src = "foo(a, b, ";
         let rope = Rope::from_str(src);
-        let (name, idx) = callee_at(&rope, make_pos(0, 10)).unwrap();
+        let (name, name_range, idx) = callee_at(&rope, make_pos(0, 10)).unwrap();
         assert_eq!(name, "foo");
         assert_eq!(idx, 2);
+        // "foo" is at columns 0..3 on line 0.
+        assert_eq!(name_range.start, MimirPos { line: 0, character: 0 });
+        assert_eq!(name_range.end,   MimirPos { line: 0, character: 3 });
     }
 
     #[test]

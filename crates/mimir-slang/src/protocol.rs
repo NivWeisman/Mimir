@@ -502,6 +502,86 @@ mod tests {
         assert!(decoded.ast.files[0].references.is_empty());
     }
 
+    /// A wire payload that includes a fully-populated ref — with
+    /// target_type_str / target_params / target_parent_class — decodes
+    /// into the new `MimirRef` fields. This locks the wire shape that
+    /// the sidecar will emit for callable targets (functions, tasks)
+    /// so hover/inlay-hint/signature-help can render entirely from the
+    /// ref, without needing to find the target's declaration in the
+    /// AST (which often lives in a UVM-or-vendor file the client
+    /// didn't put in `params["files"]`).
+    #[test]
+    fn ref_with_target_metadata_decodes_on_the_wire() {
+        let payload = serde_json::json!({
+            "ast": {
+                "files": [{
+                    "uri": "/proj/use.sv",
+                    "diagnostics": [],
+                    "top_scope": {
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 0}},
+                        "declarations": [],
+                        "children": [],
+                        "imported_packages": []
+                    },
+                    "references": [{
+                        "use_range":    {"start": {"line": 4, "character": 10}, "end": {"line": 4, "character": 19}},
+                        "target_path":  "/uvm-1.2/src/reg/uvm_mem.svh",
+                        "target_range": {"start": {"line": 1234, "character": 17}, "end": {"line": 1234, "character": 26}},
+                        "target_kind":  "function",
+                        "target_type_str": "void",
+                        "target_params": [
+                            {"name": "name",  "type_str": "string"},
+                            {"name": "size",  "type_str": "longint unsigned"},
+                            {"name": "n_bits","type_str": "int unsigned"}
+                        ],
+                        "target_parent_class": "uvm_mem"
+                    }]
+                }]
+            },
+            "diagnostics": []
+        });
+        let decoded: CompileResult =
+            serde_json::from_value(payload).expect("decode ref with target metadata");
+        let r = &decoded.ast.files[0].references[0];
+        assert_eq!(r.target_type_str.as_deref(), Some("void"));
+        assert_eq!(r.target_params.len(), 3);
+        assert_eq!(r.target_params[1].name, "size");
+        assert_eq!(r.target_params[1].type_str.as_deref(), Some("longint unsigned"));
+        assert_eq!(r.target_parent_class.as_deref(), Some("uvm_mem"));
+    }
+
+    /// Refs from older sidecars (without target_* metadata) must still
+    /// decode — the new fields default to None/empty so the consumer's
+    /// ref-first paths gracefully fall back to their name-based behaviour.
+    #[test]
+    fn ref_without_target_metadata_decodes_with_defaults() {
+        let legacy = serde_json::json!({
+            "ast": {
+                "files": [{
+                    "uri": "/proj/use.sv",
+                    "diagnostics": [],
+                    "top_scope": {
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
+                        "declarations": [], "children": [], "imported_packages": []
+                    },
+                    "references": [{
+                        "use_range":    {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                        "target_path":  "/x.sv",
+                        "target_range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 3}},
+                        "target_kind":  "variable"
+                    }]
+                }]
+            },
+            "diagnostics": []
+        });
+        let decoded: CompileResult =
+            serde_json::from_value(legacy).expect("legacy ref decode");
+        let r = &decoded.ast.files[0].references[0];
+        assert!(r.target_type_str.is_none());
+        assert!(r.target_params.is_empty());
+        assert!(r.target_parent_class.is_none());
+    }
+
     /// `Diagnostic` round-trips with a realistic-looking range.
     #[test]
     fn diagnostic_roundtrip() {
