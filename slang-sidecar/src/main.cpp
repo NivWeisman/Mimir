@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -849,8 +850,9 @@ static json handle_compile(const json& params) {
     }
 
     // Walk every elaborated expression in the compilation and capture
-    // resolved name-use → declaration links. Sorted per-file by
-    // use_range.start so the Rust side can binary-search at the cursor.
+    // resolved name-use → declaration links, keyed by whatever path
+    // string slang gave us via `loc_to_file_path` (i.e. `getFullPath`
+    // on the use site's buffer).
     std::unordered_map<std::string, std::vector<json>> refs_by_file;
     if (refs_emission_enabled()) {
         RefCollector collector{sm, refs_by_file};
@@ -858,16 +860,72 @@ static json handle_compile(const json& params) {
         for (const auto* pkg : comp.getPackages()) {
             if (pkg != nullptr) pkg->visit(collector);
         }
-        for (auto& [_, vec] : refs_by_file) {
-            std::sort(vec.begin(), vec.end(), [](const json& a, const json& b) {
-                const auto& as = a["use_range"]["start"];
-                const auto& bs = b["use_range"]["start"];
-                auto al = as["line"].get<uint32_t>();
-                auto bl = bs["line"].get<uint32_t>();
-                if (al != bl) return al < bl;
-                return as["character"].get<uint32_t>() < bs["character"].get<uint32_t>();
-            });
+    }
+
+    // Re-key refs onto the path strings the client sent. The exact string
+    // slang uses for a buffer can differ from the editor's URI when the
+    // preprocessor opens a file via `+incdir+ resolution to a different
+    // absolute form — most commonly a symlink target vs the symlink path
+    // the editor opens. Without this remap the refs land in a bucket that
+    // the per-file emit loop never consults and the file appears with 0
+    // refs even though it was elaborated. Direct string match wins (fast
+    // path); on miss, fs::canonical resolves both sides and looks up via
+    // a canonical → sent path index.
+    std::unordered_map<std::string, std::string> canonical_to_sent;
+    std::unordered_set<std::string> sent_path_set;
+    if (params.contains("files") && params["files"].is_array()) {
+        for (const auto& f : params["files"]) {
+            std::string p = f.value("path", std::string{});
+            if (p.empty()) continue;
+            sent_path_set.insert(p);
+            try {
+                auto c = std::filesystem::canonical(p).string();
+                canonical_to_sent.emplace(std::move(c), p);
+            } catch (const std::exception&) {
+                // canonical throws when the path doesn't exist on disk
+                // (e.g. for an unsaved in-memory buffer). Skip — the
+                // direct-string-match fast path still works for these.
+            }
         }
+    }
+
+    std::unordered_map<std::string, std::vector<json>> refs_by_sent;
+    for (auto& [slang_path, refs] : refs_by_file) {
+        if (refs.empty()) continue;
+        std::string attach_to;
+        if (sent_path_set.count(slang_path)) {
+            attach_to = slang_path;
+        } else {
+            try {
+                auto c = std::filesystem::canonical(slang_path).string();
+                if (auto it = canonical_to_sent.find(c);
+                    it != canonical_to_sent.end()) {
+                    attach_to = it->second;
+                }
+            } catch (const std::exception&) {
+                // Slang path doesn't exist on disk (rare — usually means
+                // the buffer was a synthetic one with a junk path). Drop.
+            }
+        }
+        if (!attach_to.empty()) {
+            auto& dst = refs_by_sent[attach_to];
+            dst.insert(dst.end(),
+                       std::make_move_iterator(refs.begin()),
+                       std::make_move_iterator(refs.end()));
+        }
+    }
+
+    // Sort each sent-file's refs by use_range.start so the Rust side can
+    // binary-search at the cursor.
+    for (auto& [_, vec] : refs_by_sent) {
+        std::sort(vec.begin(), vec.end(), [](const json& a, const json& b) {
+            const auto& as = a["use_range"]["start"];
+            const auto& bs = b["use_range"]["start"];
+            auto al = as["line"].get<uint32_t>();
+            auto bl = bs["line"].get<uint32_t>();
+            if (al != bl) return al < bl;
+            return as["character"].get<uint32_t>() < bs["character"].get<uint32_t>();
+        });
     }
 
     json files = json::array();
@@ -889,10 +947,11 @@ static json handle_compile(const json& params) {
             file_json["diagnostics"] = std::move(file_diags);
             file_json["top_scope"]   = build_file_top_scope(sm, comp, path);
 
-            // Attach the collected refs (empty array when the kill-switch
-            // is set or the file had no resolved uses).
+            // Attach refs that were remapped to this sent path (covers
+            // both direct slang_path == sent_path hits and canonical
+            // equivalents like symlinks).
             json refs_json = json::array();
-            if (auto it = refs_by_file.find(path); it != refs_by_file.end()) {
+            if (auto it = refs_by_sent.find(path); it != refs_by_sent.end()) {
                 for (auto& r : it->second) refs_json.push_back(std::move(r));
             }
             file_json["references"] = std::move(refs_json);
