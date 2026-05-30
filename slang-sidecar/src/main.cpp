@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -798,18 +799,40 @@ static bool refs_emission_enabled() {
 // "did slang ever see this file, and under what path?" and isolates
 // include-path divergence between editor URIs and slang's `+incdir+`
 // resolution.
+//
+// Destination:
+//   * `MIMIR_SLANG_DUMP_FILE=/some/path` → write to that file, truncated
+//     each compile so the user sees only the latest run. Use this when
+//     the sidecar runs under mimir-server, which pipes stderr but does
+//     not drain it (large dumps to stderr can block the sidecar).
+//   * Otherwise → write to stderr (fine for standalone probes).
 static void maybe_dump_source_manager_buffers(const slang::SourceManager& sm) {
     const char* env = std::getenv("MIMIR_SLANG_DUMP_BUFFERS");
     if (env == nullptr || std::string_view{env} == "0") return;
+
     auto buffers = sm.getAllBuffers();
-    std::cerr << "[mimir-slang-sidecar] SourceManager has " << buffers.size()
-              << " buffer(s):\n";
-    for (auto bid : buffers) {
-        const auto& full = sm.getFullPath(bid);
-        std::cerr << "  " << (full.empty() ? std::string{sm.getRawFileName(bid)}
-                                           : full.string())
-                  << '\n';
+    auto write_dump = [&](std::ostream& os) {
+        os << "[mimir-slang-sidecar] SourceManager has " << buffers.size()
+           << " buffer(s):\n";
+        for (auto bid : buffers) {
+            const auto& full = sm.getFullPath(bid);
+            os << "  " << (full.empty() ? std::string{sm.getRawFileName(bid)}
+                                        : full.string())
+               << '\n';
+        }
+    };
+
+    if (const char* path = std::getenv("MIMIR_SLANG_DUMP_FILE");
+        path != nullptr && *path != '\0') {
+        std::ofstream f(path, std::ios::trunc);
+        if (f.is_open()) {
+            write_dump(f);
+            return;
+        }
+        std::cerr << "[mimir-slang-sidecar] MIMIR_SLANG_DUMP_FILE='" << path
+                  << "' could not be opened for writing; falling back to stderr\n";
     }
+    write_dump(std::cerr);
 }
 
 static json handle_compile(const json& params) {
