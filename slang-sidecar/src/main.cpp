@@ -15,6 +15,7 @@
 // sidecar down.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -714,6 +715,30 @@ static bool refs_emission_enabled() {
     return std::string_view{env} != "0";
 }
 
+// Phase timing for `handle_compile`. Off by default; gated by
+// `MIMIR_SLANG_TIMING=1`. Emits a single newline-terminated line to
+// stderr per compile so it can't fill the pipe buffer in mimir-server
+// environments where stderr isn't drained (a single line is tens of
+// bytes, well below any plausible pipe capacity).
+static bool timing_enabled() {
+    const char* env = std::getenv("MIMIR_SLANG_TIMING");
+    return env != nullptr && std::string_view{env} != "0";
+}
+
+// Captures elapsed milliseconds between successive `lap()` calls.
+class Stopwatch {
+    using clock = std::chrono::steady_clock;
+    clock::time_point start_ = clock::now();
+public:
+    int64_t lap() {
+        auto now = clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now - start_).count();
+        start_ = now;
+        return ms;
+    }
+};
+
 // When `MIMIR_SLANG_DUMP_BUFFERS=1`, dump every buffer slang's
 // SourceManager has loaded after compilation finishes — both the buffers
 // we registered via `assignText` and any the preprocessor opened on its
@@ -758,11 +783,19 @@ static void maybe_dump_source_manager_buffers(const slang::SourceManager& sm) {
 }
 
 static json handle_compile(const json& params) {
+    const bool tm = timing_enabled();
+    Stopwatch sw;
+    int64_t t_build=0, t_diags=0, t_visit=0, t_refs_remap=0,
+            t_decls=0, t_emit=0;
+    size_t n_refs_raw = 0, n_decls_extracted = 0;
+
     auto built      = build_compilation(params);
     auto& sm        = *built.sm;
     auto& comp      = *built.compilation;
+    if (tm) t_build = sw.lap();
 
     json all_diags = diagnostics_for_compilation(sm, comp);
+    if (tm) t_diags = sw.lap();
 
     // Group diagnostics by file path for per-file attachment.
     std::unordered_map<std::string, json> diags_by_file;
@@ -781,6 +814,10 @@ static json handle_compile(const json& params) {
         for (const auto* pkg : comp.getPackages()) {
             if (pkg != nullptr) pkg->visit(collector);
         }
+    }
+    if (tm) {
+        for (auto& [_, v] : refs_by_file) n_refs_raw += v.size();
+        t_visit = sw.lap();
     }
 
     // Re-key refs onto the path strings the client sent. The exact string
@@ -860,6 +897,7 @@ static json handle_compile(const json& params) {
         });
         vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
     }
+    if (tm) t_refs_remap = sw.lap();
 
     // ── Single-pass top-level decl extraction ─────────────────────────────
     //
@@ -953,6 +991,10 @@ static json handle_compile(const json& params) {
                        std::make_move_iterator(decls.end()));
         }
     }
+    if (tm) {
+        for (auto& [_, v] : decls_by_sent) n_decls_extracted += v.size();
+        t_decls = sw.lap();
+    }
 
     json files = json::array();
     if (params.contains("files") && params["files"].is_array()) {
@@ -1009,6 +1051,23 @@ static json handle_compile(const json& params) {
     json result;
     result["ast"]         = std::move(ast);
     result["diagnostics"] = std::move(all_diags);
+
+    if (tm) {
+        t_emit = sw.lap();
+        int64_t total = t_build + t_diags + t_visit + t_refs_remap
+                      + t_decls + t_emit;
+        std::cerr << "[mimir-slang-sidecar] timing"
+                  << " build="       << t_build       << "ms"
+                  << " diags="       << t_diags       << "ms"
+                  << " visit="       << t_visit       << "ms"
+                  << " refs_raw="    << n_refs_raw
+                  << " refs_remap="  << t_refs_remap  << "ms"
+                  << " decls="       << t_decls       << "ms"
+                  << " decls_n="     << n_decls_extracted
+                  << " emit="        << t_emit        << "ms"
+                  << " total="       << total         << "ms"
+                  << " (json_dump not included; measured in main)\n";
+    }
     return result;
 }
 
@@ -1064,7 +1123,19 @@ int main() {
             };
         }
 
-        std::cout << resp.dump() << '\n';
+        // For `compile` responses, time the JSON->string serialisation
+        // separately so the user can compare against the in-handle_compile
+        // breakdown. nlohmann_json::dump is the suspect when a payload
+        // serialises slowly (allocation-heavy on deep AST trees).
+        const bool tm_dump = timing_enabled() && method == "compile";
+        Stopwatch sw_dump;
+        std::string dumped = resp.dump();
+        if (tm_dump) {
+            int64_t ms = sw_dump.lap();
+            std::cerr << "[mimir-slang-sidecar] timing json_dump=" << ms
+                      << "ms bytes=" << dumped.size() << "\n";
+        }
+        std::cout << dumped << '\n';
         std::cout.flush();
     }
 
