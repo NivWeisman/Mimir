@@ -339,17 +339,41 @@ pub(crate) fn definition(
                 None => {
                     // File is in the AST but no ref covers the cursor. Most
                     // common causes: (a) refs_in_file == 0 → slang didn't
-                    // elaborate this file (likely sent as
-                    // `is_compilation_unit: false` because it's not in the
-                    // project filelist), or (b) refs_in_file > 0 but the
-                    // visitor didn't emit one for this exact token shape.
-                    debug!(
-                        file_uri,
-                        pos_line = pos.line,
-                        pos_char = pos.character,
-                        refs_in_file,
-                        "ast definition: gate=ref_not_at_pos (falling through to name lookup)",
-                    );
+                    // elaborate this file *under this path* (often because
+                    // it's open in the editor + reached via `` `include `` and
+                    // slang resolved the include to a different path string,
+                    // creating a second buffer whose refs key elsewhere), or
+                    // (b) refs_in_file > 0 but the visitor didn't emit one
+                    // for this exact token shape.
+                    //
+                    // When refs_in_file == 0, also dump the top-5 paths that
+                    // *did* receive refs so a path-mismatch is easy to spot.
+                    if refs_in_file == 0 {
+                        let mut by_count: Vec<(&str, usize)> = ast
+                            .files
+                            .iter()
+                            .filter(|f| !f.references.is_empty())
+                            .map(|f| (f.uri.as_str(), f.references.len()))
+                            .collect();
+                        by_count.sort_by_key(|b| std::cmp::Reverse(b.1));
+                        by_count.truncate(5);
+                        debug!(
+                            file_uri,
+                            pos_line = pos.line,
+                            pos_char = pos.character,
+                            refs_in_file,
+                            top_paths_with_refs = ?by_count,
+                            "ast definition: gate=ref_not_at_pos (falling through to name lookup)",
+                        );
+                    } else {
+                        debug!(
+                            file_uri,
+                            pos_line = pos.line,
+                            pos_char = pos.character,
+                            refs_in_file,
+                            "ast definition: gate=ref_not_at_pos (falling through to name lookup)",
+                        );
+                    }
                 }
             }
         }
