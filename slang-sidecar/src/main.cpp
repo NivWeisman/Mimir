@@ -535,85 +535,6 @@ static json symbol_to_mimir_decl(const slang::SourceManager& sm,
     return decl;
 }
 
-// Build the MimirScope for one file by collecting top-level definitions
-// (packages + module/interface/program definitions) whose declaration site
-// lives in `file_path`.
-static json build_file_top_scope(
-    const slang::SourceManager& sm,
-    slang::ast::Compilation& compilation,
-    const std::string& file_path) {
-
-    using namespace slang::ast;
-
-    json decls = json::array();
-
-    // Packages declared in this file.
-    for (const auto* pkg : compilation.getPackages()) {
-        if (!pkg || pkg->name.empty()) continue;
-        if (loc_to_file_path(sm, pkg->location) != file_path) continue;
-        auto d = symbol_to_mimir_decl(sm, *pkg, /*recurse=*/true);
-        if (!d.is_null()) decls.push_back(std::move(d));
-    }
-
-    // Top-level module/interface/program definitions. The root holds one
-    // InstanceSymbol per top-level instantiation; we deduplicate via a
-    // position key so that a module instantiated several times appears only
-    // once.
-    std::unordered_set<std::string> seen_defs;
-    for (const auto& member : compilation.getRoot().members()) {
-        if (member.kind != SymbolKind::Instance) continue;
-        auto& inst = member.as<InstanceSymbol>();
-        auto& def  = inst.getDefinition();
-        if (def.name.empty()) continue;
-        if (loc_to_file_path(sm, def.location) != file_path) continue;
-
-        // Dedup key: line:character of the definition name token.
-        auto p = to_lsp_pos(sm, def.location);
-        std::string key = std::to_string(p.line) + ":" + std::to_string(p.character);
-        if (!seen_defs.insert(key).second) continue;
-
-        // Determine the module kind from the syntax node kind.
-        const char* kind_str = "module";
-        if (auto* syn = def.getSyntax(); syn != nullptr) {
-            using SK = slang::syntax::SyntaxKind;
-            if (syn->kind == SK::InterfaceDeclaration) kind_str = "interface";
-            else if (syn->kind == SK::ProgramDeclaration) kind_str = "program";
-        }
-
-        // Body members: ports, local vars, functions, nested classes.
-        json members = extract_members(sm, inst.body, /*recurse=*/true);
-
-        json name_range, full_range;
-        if (auto* syn = def.getSyntax(); syn != nullptr) {
-            full_range = make_mimir_range(sm, syn->sourceRange());
-            name_range = full_range;
-        } else {
-            name_range = make_mimir_point_range(sm, def.location);
-            full_range = name_range;
-        }
-
-        json decl;
-        decl["name"]         = std::string(def.name);
-        decl["kind"]         = kind_str;
-        decl["range"]        = std::move(name_range);
-        decl["full_range"]   = std::move(full_range);
-        decl["type_str"]     = nullptr;
-        decl["members"]      = std::move(members);
-        decl["parent_class"] = nullptr;
-        decl["visibility"]   = "public";
-        decl["doc"]          = nullptr;
-        decls.push_back(std::move(decl));
-    }
-
-    json scope;
-    scope["range"]             = {{"start", {{"line", 0}, {"character", 0}}},
-                                  {"end",   {{"line", 999999}, {"character", 0}}}};
-    scope["declarations"]      = std::move(decls);
-    scope["children"]          = json::array();
-    scope["imported_packages"] = json::array();
-    return scope;
-}
-
 // --- reference map -------------------------------------------------------
 //
 // Walk the elaborated AST and collect resolved (use-site → target-decl)
@@ -940,6 +861,99 @@ static json handle_compile(const json& params) {
         vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
     }
 
+    // ── Single-pass top-level decl extraction ─────────────────────────────
+    //
+    // Build a `slang_path → top-level decls` index once. The per-file emit
+    // loop below then does an O(1) hash lookup instead of re-walking
+    // `compilation.getPackages()` and `compilation.getRoot().members()` per
+    // sent file. On a project with N sent files and P+I top-level symbols
+    // the old shape was O(N × (P + I)); the new shape is O(P + I + N).
+    //
+    // After collection, remap onto sent paths via the same
+    // `canonical_to_sent` index the refs path uses, so symlinked or
+    // `+incdir+ -resolved` paths land in the editor-facing bucket.
+    std::unordered_map<std::string, std::vector<json>> decls_by_slang_path;
+    {
+        for (const auto* pkg : comp.getPackages()) {
+            if (pkg == nullptr || pkg->name.empty()) continue;
+            std::string fp = loc_to_file_path(sm, pkg->location);
+            if (fp.empty()) continue;
+            auto d = symbol_to_mimir_decl(sm, *pkg, /*recurse=*/true);
+            if (!d.is_null()) decls_by_slang_path[fp].push_back(std::move(d));
+        }
+
+        // Global dedup across all top-level instances (multiple
+        // instantiations of the same module share a definition).
+        std::unordered_set<std::string> seen_inst_keys;
+        for (const auto& member : comp.getRoot().members()) {
+            if (member.kind != slang::ast::SymbolKind::Instance) continue;
+            auto& inst = member.as<slang::ast::InstanceSymbol>();
+            auto& def  = inst.getDefinition();
+            if (def.name.empty()) continue;
+            std::string fp = loc_to_file_path(sm, def.location);
+            if (fp.empty()) continue;
+
+            auto p = to_lsp_pos(sm, def.location);
+            std::string key = fp + ":" + std::to_string(p.line)
+                                 + ":" + std::to_string(p.character);
+            if (!seen_inst_keys.insert(std::move(key)).second) continue;
+
+            const char* kind_str = "module";
+            if (auto* syn = def.getSyntax(); syn != nullptr) {
+                using SK = slang::syntax::SyntaxKind;
+                if (syn->kind == SK::InterfaceDeclaration)      kind_str = "interface";
+                else if (syn->kind == SK::ProgramDeclaration)   kind_str = "program";
+            }
+            json members = extract_members(sm, inst.body, /*recurse=*/true);
+
+            json name_range, full_range;
+            if (auto* syn = def.getSyntax(); syn != nullptr) {
+                full_range = make_mimir_range(sm, syn->sourceRange());
+                name_range = full_range;
+            } else {
+                name_range = make_mimir_point_range(sm, def.location);
+                full_range = name_range;
+            }
+
+            json decl;
+            decl["name"]         = std::string(def.name);
+            decl["kind"]         = kind_str;
+            decl["range"]        = std::move(name_range);
+            decl["full_range"]   = std::move(full_range);
+            decl["type_str"]     = nullptr;
+            decl["members"]      = std::move(members);
+            decl["parent_class"] = nullptr;
+            decl["visibility"]   = "public";
+            decl["doc"]          = nullptr;
+            decls_by_slang_path[fp].push_back(std::move(decl));
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<json>> decls_by_sent;
+    for (auto& [slang_path, decls] : decls_by_slang_path) {
+        if (decls.empty()) continue;
+        std::string attach_to;
+        if (sent_path_set.count(slang_path)) {
+            attach_to = slang_path;
+        } else {
+            try {
+                auto c = std::filesystem::canonical(slang_path).string();
+                if (auto it = canonical_to_sent.find(c);
+                    it != canonical_to_sent.end()) {
+                    attach_to = it->second;
+                }
+            } catch (const std::exception&) {
+                // Slang path doesn't exist on disk; drop (rare).
+            }
+        }
+        if (!attach_to.empty()) {
+            auto& dst = decls_by_sent[attach_to];
+            dst.insert(dst.end(),
+                       std::make_move_iterator(decls.begin()),
+                       std::make_move_iterator(decls.end()));
+        }
+    }
+
     json files = json::array();
     if (params.contains("files") && params["files"].is_array()) {
         for (const auto& f : params["files"]) {
@@ -957,7 +971,22 @@ static json handle_compile(const json& params) {
                 }
             }
             file_json["diagnostics"] = std::move(file_diags);
-            file_json["top_scope"]   = build_file_top_scope(sm, comp, path);
+
+            // Top-scope decls: O(1) lookup into the pre-built index
+            // (replaces the per-file traversal of getRoot()/getPackages()).
+            json scope;
+            scope["range"]             = {{"start", {{"line", 0}, {"character", 0}}},
+                                          {"end",   {{"line", 999999}, {"character", 0}}}};
+            if (auto it = decls_by_sent.find(path); it != decls_by_sent.end()) {
+                json arr = json::array();
+                for (auto& d : it->second) arr.push_back(std::move(d));
+                scope["declarations"] = std::move(arr);
+            } else {
+                scope["declarations"] = json::array();
+            }
+            scope["children"]          = json::array();
+            scope["imported_packages"] = json::array();
+            file_json["top_scope"]     = std::move(scope);
 
             // Attach refs that were remapped to this sent path (covers
             // both direct slang_path == sent_path hits and canonical
