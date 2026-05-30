@@ -357,12 +357,43 @@ pub(crate) fn definition(
                             .collect();
                         by_count.sort_by_key(|b| std::cmp::Reverse(b.1));
                         by_count.truncate(5);
+
+                        // Smoking gun for include-path-key mismatch: a file
+                        // whose basename matches the cursor's file and has
+                        // refs > 0 means slang elaborated the same content
+                        // under a different path string than what the editor
+                        // sent — usually because the parent CU's
+                        // `` `include "x" `` resolved via +incdir+ to a path
+                        // string that differs from the editor's open-file
+                        // URI. The per-file ref emit keys by the resolved
+                        // path; our find_file lookup uses the editor URI →
+                        // miss → "0 refs".
+                        let target_basename =
+                            std::path::Path::new(file_uri)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("");
+                        let basename_matches: Vec<(&str, usize)> = ast
+                            .files
+                            .iter()
+                            .filter(|f| {
+                                !f.references.is_empty()
+                                    && std::path::Path::new(&f.uri)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .map(|n| n == target_basename)
+                                        .unwrap_or(false)
+                            })
+                            .map(|f| (f.uri.as_str(), f.references.len()))
+                            .collect();
+
                         debug!(
                             file_uri,
                             pos_line = pos.line,
                             pos_char = pos.character,
                             refs_in_file,
                             top_paths_with_refs = ?by_count,
+                            basename_matches = ?basename_matches,
                             "ast definition: gate=ref_not_at_pos (falling through to name lookup)",
                         );
                     } else {
