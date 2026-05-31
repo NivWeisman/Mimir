@@ -46,7 +46,8 @@ use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tracing::{debug, instrument, warn, trace};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::protocol::{
     methods, CompileResult, ElaborateParams, Request, Response, ResponseError,
@@ -332,17 +333,31 @@ pub struct Client {
     /// without competing with anyone else; `drop` doesn't need the lock
     /// (Mutex's `drop` is fine even if we never lock it).
     child: Mutex<Child>,
+    /// Background task that drains the sidecar's stderr line-by-line and
+    /// re-emits each line through `tracing`. Held to keep the task alive
+    /// for the lifetime of the client; aborted on drop.
+    stderr_pump: Option<JoinHandle<()>>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(h) = self.stderr_pump.take() {
+            h.abort();
+        }
+    }
 }
 
 impl Client {
     /// Spawn the sidecar at `program` with the given arguments.
     ///
-    /// All three of stdin/stdout/stderr are piped — stdin/stdout for the
-    /// NDJSON channel, stderr so the sidecar's logs don't leak to ours.
-    /// Stderr isn't currently drained; a future change will wire it into
-    /// the `tracing` subscriber. (Until then, a chatty sidecar can fill
-    /// the pipe buffer and block — fine for now because slang's logging
-    /// is opt-in.)
+    /// All three of stdin/stdout/stderr are piped: stdin/stdout for the
+    /// NDJSON channel, stderr for the sidecar's log output. Stderr is
+    /// drained line-by-line on a background task and each line is
+    /// re-emitted through `tracing` under the `mimir_slang_sidecar`
+    /// target — both so the lines reach the same destination as the
+    /// rest of the server's logs and so the OS pipe buffer never fills
+    /// (an undrained pipe buffer eventually blocks `write` on the
+    /// sidecar's end and stalls the elaborator).
     #[instrument(level = "debug", skip(args), fields(program = ?program.as_ref()))]
     pub async fn spawn<P, A, S>(program: P, args: A) -> Result<Self, ClientError>
     where
@@ -375,12 +390,19 @@ impl Client {
             .stdout
             .take()
             .ok_or(ClientError::MissingStdio { which: "stdout" })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(ClientError::MissingStdio { which: "stderr" })?;
+
+        let stderr_pump = tokio::spawn(drain_sidecar_stderr(stderr));
 
         let connection = Connection::new(BufReader::new(stdout), stdin);
         debug!("sidecar spawned");
         Ok(Self {
             connection: Mutex::new(connection),
             child: Mutex::new(child),
+            stderr_pump: Some(stderr_pump),
         })
     }
 
@@ -447,6 +469,71 @@ impl ConnectionError {
 impl From<std::io::Error> for ClientError {
     fn from(e: std::io::Error) -> Self {
         ClientError::Connection(ConnectionError::Io(e))
+    }
+}
+
+// --------------------------------------------------------------------------
+// Stderr drain
+// --------------------------------------------------------------------------
+
+/// Background task: read the sidecar's stderr line-by-line and re-emit
+/// each line through `tracing`.
+///
+/// Level is picked from the line contents so users can filter normally:
+///   * `panic`, `error:`, `parse error`           → `error!`
+///   * `warn`                                     → `warn!`
+///   * everything else (incl. `timing`, `scope=`) → `info!`
+///
+/// All lines use the `mimir_slang_sidecar` target so callers can scope
+/// log filters at it specifically:
+///
+/// ```text
+/// RUST_LOG=mimir=info,mimir_slang_sidecar=info
+/// ```
+///
+/// Two invariants this preserves:
+///
+/// 1. **No pipe stalls.** Without this drain, the OS pipe buffer for
+///    the sidecar's stderr (typically 64 KiB on Linux) fills under
+///    `MIMIR_SLANG_TIMING=1` or `MIMIR_DEBUG_TIMING=1`, eventually
+///    blocking the sidecar's `write` and stalling elaborate.
+///
+/// 2. **Timing output is visible.** Before this drain, the sidecar's
+///    `[mimir-slang-sidecar] timing build=... visit=...` summary was
+///    written but never observed because nothing read the pipe and the
+///    pipe closed when the child exited.
+async fn drain_sidecar_stderr(stderr: tokio::process::ChildStderr) {
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => {
+                debug!("sidecar stderr closed");
+                return;
+            }
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\n', '\r']);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if lower.contains("panic")
+                    || lower.contains("error:")
+                    || lower.contains("parse error")
+                {
+                    error!(target: "mimir_slang_sidecar", "{}", trimmed);
+                } else if lower.contains("warn") {
+                    warn!(target: "mimir_slang_sidecar", "{}", trimmed);
+                } else {
+                    info!(target: "mimir_slang_sidecar", "{}", trimmed);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "sidecar stderr read failed; ending drain");
+                return;
+            }
+        }
     }
 }
 

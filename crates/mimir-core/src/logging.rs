@@ -32,7 +32,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 ///
 /// We err on the side of quiet: a release-mode LSP that writes to stderr on
 /// every keystroke clutters the editor's log pane.
-const DEFAULT_FILTER: &str = "warn,mimir=info";
+const DEFAULT_FILTER: &str = "warn,mimir=info,mimir_slang_sidecar=info";
 
 /// Install the global tracing subscriber, sending logs to stderr.
 ///
