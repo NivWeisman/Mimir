@@ -15,6 +15,7 @@
 // sidecar down.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -22,10 +23,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -740,10 +744,35 @@ struct RefCollector
     // cache), so the per-file emit loop is a straight hash lookup —
     // no post-hoc remap needed.
     std::unordered_map<std::string, std::vector<json>>& refs_by_sent;
+    // Per-target enrichment memoisation. `enrich_ref_with_target_info`
+    // dives into slang's lazy evaluators (`getReturnType`, `getType`,
+    // `getArguments`, `getParentScope`) which dominate `record` cost.
+    // 72k refs in an ibex compile point at ~hundreds of unique
+    // symbols, so caching by raw pointer collapses ~72k slang lookups
+    // to ~hundreds.
+    //
+    // Keyed on raw pointer: `Symbol*` identity is stable inside one
+    // `Compilation` and that's the only thing alive while a
+    // `RefCollector` exists. The cached JSON holds 0–3 string keys
+    // and is copied (cheap) into each emitted entry.
+    std::unordered_map<const slang::ast::Symbol*, json> enrich_cache;
 
     RefCollector(const slang::SourceManager& sm_, ScopeAttach& scope_,
                  std::unordered_map<std::string, std::vector<json>>& refs_by_sent_)
         : sm(sm_), scope(scope_), refs_by_sent(refs_by_sent_) {}
+
+    // Look up (or compute + cache) the enrichment JSON object for
+    // `target`. Returned reference is stable for the rest of this
+    // RefCollector's lifetime — callers must copy values out, not
+    // mutate.
+    const json& cached_enrichment(const slang::ast::Symbol& target) {
+        auto [it, inserted] = enrich_cache.try_emplace(&target);
+        if (inserted) {
+            it->second = json::object();
+            enrich_ref_with_target_info(target, it->second);
+        }
+        return it->second;
+    }
 
     void record(slang::SourceRange use_range, const slang::ast::Symbol* target) {
         if (target == nullptr) return;
@@ -783,7 +812,13 @@ struct RefCollector
         entry["target_path"]  = std::move(target_path);
         entry["target_range"] = std::move(target_range_json);
         entry["target_kind"]  = kind;
-        enrich_ref_with_target_info(*target, entry);
+        // Merge memoised enrichment (0–3 string fields). The cache
+        // saves the slang lazy-eval cost on repeat targets — the same
+        // method is referenced thousands of times in a UVM project.
+        const json& enrichment = cached_enrichment(*target);
+        for (auto it_e = enrichment.begin(); it_e != enrichment.end(); ++it_e) {
+            entry[it_e.key()] = it_e.value();
+        }
         refs_by_sent[*attach].push_back(std::move(entry));
     }
 
@@ -827,6 +862,31 @@ static bool refs_emission_enabled() {
     const char* env = std::getenv("MIMIR_SLANG_EMIT_REFS");
     if (env == nullptr) return true;
     return std::string_view{env} != "0";
+}
+
+// EXPERIMENTAL / UNSAFE: parallelise the RefCollector visit across
+// (packages... + root) when `MIMIR_SLANG_PARALLEL=1`.
+//
+// **Known to crash the sidecar** on UVM-style projects (ibex was the
+// reproducer): slang's lazy evaluators (`getReturnType`, `getType`,
+// `getArguments`, `getParentScope`) mutate internal Compilation state
+// on first call, and concurrent calls race on that mutation. The
+// failure mode is "stdout closes before response" — slang aborts
+// mid-write.
+//
+// Kept behind an opt-in env var for future experimentation (e.g. a
+// two-phase split where enrichment is pre-warmed sequentially and only
+// the JSON build runs in parallel). For now, leave it OFF.
+//
+// Each worker owns its own `RefCollector`, its own `ScopeAttach`
+// cache, and its own `refs_by_sent` map; the only shared reads are
+// the `SourceManager` and the const sent_paths / canonical map.
+//
+// Worker count is `min(hardware_concurrency, unit_count)` so single-
+// package / single-instance projects don't oversubscribe.
+static bool parallel_enabled() {
+    const char* env = std::getenv("MIMIR_SLANG_PARALLEL");
+    return env != nullptr && std::string_view{env} != "0";
 }
 
 // Phase timing for `handle_compile`. Off by default; gated by
@@ -985,12 +1045,59 @@ static json handle_compile(const json& params) {
     // drops refs from out-of-scope buffers (UVM headers, vendor source,
     // anything the editor didn't put in params["files"]) without paying
     // the cost of building their JSON.
+    //
+    // Two execution modes:
+    //   * Sequential (default): single `RefCollector` walks root + each
+    //     package in turn.
+    //   * Parallel (`MIMIR_SLANG_PARALLEL=1`): each `(package..., root)`
+    //     entry is one work unit, distributed across worker threads
+    //     with an atomic next-unit counter. Per-worker `ScopeAttach`
+    //     and refs map are merged under a mutex at the end. See
+    //     `parallel_enabled()` for safety notes.
     std::unordered_map<std::string, std::vector<json>> refs_by_sent;
     if (refs_emission_enabled()) {
-        RefCollector collector{sm, scope, refs_by_sent};
-        comp.getRoot().visit(collector);
+        using slang::ast::Symbol;
+        std::vector<const Symbol*> units;
+        units.reserve(comp.getPackages().size() + 1);
         for (const auto* pkg : comp.getPackages()) {
-            if (pkg != nullptr) pkg->visit(collector);
+            if (pkg != nullptr) units.push_back(pkg);
+        }
+        units.push_back(&comp.getRoot());
+
+        const bool parallel    = parallel_enabled();
+        const unsigned hwconc  = std::max(1u, std::thread::hardware_concurrency());
+        const size_t worker_n  = (parallel && units.size() > 1)
+            ? std::min<size_t>(hwconc, units.size())
+            : 1;
+
+        if (worker_n <= 1) {
+            RefCollector collector{sm, scope, refs_by_sent};
+            for (const auto* u : units) u->visit(collector);
+        } else {
+            std::atomic<size_t> next{0};
+            std::mutex          merge_mtx;
+            auto worker = [&]() {
+                ScopeAttach local_scope{sm, sent_path_set, canonical_to_sent};
+                std::unordered_map<std::string, std::vector<json>> local_refs;
+                RefCollector local_collector{sm, local_scope, local_refs};
+                while (true) {
+                    size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= units.size()) break;
+                    units[i]->visit(local_collector);
+                }
+                std::lock_guard<std::mutex> lk(merge_mtx);
+                for (auto& [k, v] : local_refs) {
+                    auto& dst = refs_by_sent[k];
+                    dst.reserve(dst.size() + v.size());
+                    dst.insert(dst.end(),
+                               std::make_move_iterator(v.begin()),
+                               std::make_move_iterator(v.end()));
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(worker_n);
+            for (size_t i = 0; i < worker_n; ++i) workers.emplace_back(worker);
+            for (auto& t : workers) t.join();
         }
     }
     if (tm) {
