@@ -889,6 +889,43 @@ static bool parallel_enabled() {
     return env != nullptr && std::string_view{env} != "0";
 }
 
+// Decide how many worker threads to use for the parallel visit, given
+// `unit_count` independent work items (root + each package).
+//
+// Returns 0 when parallelism is disabled — the caller takes the
+// sequential single-collector path. Returns ≥1 otherwise; never more
+// than `unit_count` (extra workers would just spin waiting for work
+// that never arrives).
+//
+// Precedence:
+//   * `MIMIR_SLANG_PARALLEL` unset / "0"   → 0 (sequential).
+//   * `MIMIR_SLANG_PARALLEL_THREADS=N`     → clamp(N, 1, unit_count).
+//   * Otherwise (parallel on, threads unset) → min(hardware_concurrency,
+//     unit_count). hardware_concurrency() can return 0 on weird
+//     systems; we floor it at 1 so we don't degenerate to "no workers".
+//
+// The threads cap matters for two scenarios:
+//   1. Running under a constrained CI box where you want to leave
+//      cores for other jobs.
+//   2. Bisecting the crash signature — `THREADS=2` reproduces faster
+//      than `THREADS=hwconc` on machines with many cores.
+static size_t parallel_worker_count(size_t unit_count) {
+    if (!parallel_enabled() || unit_count <= 1) return 0;
+    const unsigned hwconc = std::max(1u, std::thread::hardware_concurrency());
+    size_t desired = std::min<size_t>(hwconc, unit_count);
+    if (const char* env = std::getenv("MIMIR_SLANG_PARALLEL_THREADS")) {
+        try {
+            int parsed = std::stoi(env);
+            if (parsed >= 1) {
+                desired = std::min<size_t>(static_cast<size_t>(parsed), unit_count);
+            }
+        } catch (const std::exception&) {
+            // Ignore parse errors — fall back to hwconc default.
+        }
+    }
+    return desired;
+}
+
 // Phase timing for `handle_compile`. Off by default; gated by
 // `MIMIR_SLANG_TIMING=1`. Emits a single newline-terminated line to
 // stderr per compile so it can't fill the pipe buffer in mimir-server
@@ -1064,13 +1101,9 @@ static json handle_compile(const json& params) {
         }
         units.push_back(&comp.getRoot());
 
-        const bool parallel    = parallel_enabled();
-        const unsigned hwconc  = std::max(1u, std::thread::hardware_concurrency());
-        const size_t worker_n  = (parallel && units.size() > 1)
-            ? std::min<size_t>(hwconc, units.size())
-            : 1;
+        const size_t worker_n = parallel_worker_count(units.size());
 
-        if (worker_n <= 1) {
+        if (worker_n == 0) {
             RefCollector collector{sm, scope, refs_by_sent};
             for (const auto* u : units) u->visit(collector);
         } else {
