@@ -44,6 +44,7 @@
 #include <slang/ast/expressions/MiscExpressions.h>
 #include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/symbols/ClassSymbols.h>
+#include <slang/ast/symbols/CompilationUnitSymbols.h>
 #include <slang/ast/symbols/InstanceSymbols.h>
 #include <slang/ast/symbols/ParameterSymbols.h>
 #include <slang/ast/symbols/SubroutineSymbols.h>
@@ -852,6 +853,61 @@ struct RefCollector
             record(narrow_call_range(expr), sub);
         }
         visitDefault(expr);
+    }
+
+    // ── Body-level subtree pruning ────────────────────────────────────
+    //
+    // The per-expression scope check in `record()` already drops refs
+    // whose source location is in a buffer the editor didn't send
+    // (UVM, vendor IP, third-party packages, etc.). That filter is
+    // necessary but late — we still paid the cost of slang's
+    // recursion into the entire subtree, plus a `record()` call per
+    // expression inside it.
+    //
+    // The handlers below short-circuit that recursion at the
+    // **scope-bearing** symbol level. When the body's declaring
+    // location is in an out-of-scope buffer, we return without
+    // calling `visitDefault`, so slang never recurses into the body's
+    // members. The savings are proportional to how much of the
+    // elaborated tree lives outside the editor's filelist — typically
+    // most of it in any project that uses UVM or vendor IP.
+    //
+    // Correctness: refs inside an out-of-scope body all have source
+    // locations in that same out-of-scope buffer (by definition of
+    // "the body lives there") and would be dropped by the
+    // per-expression filter anyway. Macro expansions are unaffected
+    // because their *invocation* site is in whatever body invoked the
+    // macro — that body's scope is what matters, not the macro
+    // definition's. So pruning here is speed-only, not behaviour.
+    //
+    // Symbols we prune at:
+    //   * `InstanceBodySymbol` — the elaborated body of a
+    //     module/interface/program instance. The big one for RTL.
+    //   * `PackageSymbol`      — a `package … endpackage` scope.
+    //     Catches `uvm_pkg` and similar.
+    //   * `ClassType`          — a `class … endclass` scope.
+    //     Catches top-level classes declared outside packages.
+    //
+    // Bodies whose `location` is invalid (synthetic / built-in) get
+    // visited normally — we'd rather pay traversal cost than risk
+    // dropping a real ref.
+    bool body_in_scope(const slang::ast::Symbol& body) {
+        auto loc = body.location;
+        if (!loc.valid()) return true;
+        return scope.lookup(loc.buffer()) != nullptr;
+    }
+
+    void handle(const slang::ast::InstanceBodySymbol& body) {
+        if (!body_in_scope(body)) return;
+        visitDefault(body);
+    }
+    void handle(const slang::ast::PackageSymbol& body) {
+        if (!body_in_scope(body)) return;
+        visitDefault(body);
+    }
+    void handle(const slang::ast::ClassType& body) {
+        if (!body_in_scope(body)) return;
+        visitDefault(body);
     }
 };
 
