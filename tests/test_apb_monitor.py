@@ -298,21 +298,19 @@ class ApbMonitorTest(unittest.TestCase):
         # source line — that's the signal that we read more than line 1.
         self.assertIn("uvm_report_fatal", value)
 
-    @unittest.expectedFailure
     def test_hover_get_on_uvm_config_db_returns_full_signature(self) -> None:
         """Cursor on `get` in `uvm_config_db#(apb_vif)::get(this, ...)`
-        (line 56 / 0-idx 55) should resolve to `uvm_config_db::get` and
-        return its full multi-line signature — the declaration spans four
-        source lines and a single-line read would only show the first
+        (line 56 / 0-idx 55) resolves to `uvm_config_db::get` and returns
+        its full multi-line signature — the declaration spans four source
+        lines and a single-line read would only show the first
         comma-terminated line.
 
-        XFAIL: Requires slang to be configured with UVM headers so that
-        the class-scope qualified call `uvm_config_db#(T)::get` resolves to
-        the UVM standard-library declaration. Without UVM in the include path
-        the server correctly returns None (we no longer return a misleading
-        workspace-index `get` because `is_scope_qualified_at` skips the bare
-        identifier lookup for `::` expressions). Drop this decorator when
-        slang+UVM is wired into the CI test environment."""
+        Resolves via the slang reference map: the qualified-call ref at
+        this position carries the resolved `get` target with its formal
+        params. (Previously XFAIL because duplicate per-instance refs at
+        this position could win the post-hoc dedup with incomplete target
+        info; the sidecar's canonical-body visit dedup now emits a single
+        ref from the canonical specialization with full signature data.)"""
         # Line 56 raw: `         if (!uvm_config_db#(apb_vif)::get(this, "", "vif", tmp)) begin`
         # `get` starts at the position right after `::`.
         result = self._hover(55, 41)

@@ -135,23 +135,32 @@ static LspPos to_lsp_pos(const slang::SourceManager& sm, slang::SourceLocation l
         return {0, 0};
     }
 
-    // Walk the buffer to find the start byte of this line, then count
-    // UTF-16 units in [line_start, line_start + byte_col - 1).
+    // The line's start byte offset is the location's own byte offset
+    // minus its (1-based) byte column. slang already maintains a
+    // line-start table internally, so both `getLineNumber` and
+    // `getColumnNumber` are cheap lookups; combining them with
+    // `SourceLocation::offset()` gives the line start in O(1).
+    //
+    // The previous implementation linearly scanned the buffer from
+    // byte 0 counting newlines on *every* call — O(line_depth) per
+    // call, ~4 calls per ref, which on a large compilation (ibex:
+    // ~72k refs, files thousands of lines deep) dominated the whole
+    // sidecar compile (~6s of a ~6.7s total). This is the hot path.
     auto buffer_text = sm.getSourceText(orig.buffer());
-    size_t cursor = 0;
-    uint32_t cur_line = 1;
-    while (cur_line < line_1based && cursor < buffer_text.size()) {
-        if (buffer_text[cursor] == '\n') {
-            ++cur_line;
-        }
-        ++cursor;
-    }
-
     size_t prefix_bytes = byte_col_1based - 1;
-    if (cursor + prefix_bytes > buffer_text.size()) {
-        prefix_bytes = buffer_text.size() - cursor;
+    size_t loc_offset = orig.offset();
+    size_t line_start = (loc_offset >= prefix_bytes) ? loc_offset - prefix_bytes : 0;
+
+    // Clamp against the buffer in case slang's column ran past the
+    // stored text (shouldn't happen for valid locs, but a bad column
+    // must not index out of bounds).
+    if (line_start > buffer_text.size()) {
+        return {line_1based - 1, 0};
     }
-    auto utf16 = utf8_prefix_to_utf16_units(buffer_text.substr(cursor, prefix_bytes));
+    if (line_start + prefix_bytes > buffer_text.size()) {
+        prefix_bytes = buffer_text.size() - line_start;
+    }
+    auto utf16 = utf8_prefix_to_utf16_units(buffer_text.substr(line_start, prefix_bytes));
 
     return {line_1based - 1, utf16};
 }
@@ -737,7 +746,7 @@ private:
 };
 
 struct RefCollector
-    : public slang::ast::ASTVisitor<RefCollector, slang::ast::VisitFlags::AllGood> {
+    : public slang::ast::ASTVisitor<RefCollector, slang::ast::VisitFlags::AllCanonical> {
     const slang::SourceManager& sm;
     ScopeAttach& scope;
     // sent-path → vector of JSON ref entries. RefCollector writes
@@ -757,6 +766,21 @@ struct RefCollector
     // `RefCollector` exists. The cached JSON holds 0–3 string keys
     // and is copied (cheap) into each emitted entry.
     std::unordered_map<const slang::ast::Symbol*, json> enrich_cache;
+
+    // Instance-body dedup. With `VisitFlags::Canonical` (see the
+    // ASTVisitor base above), every instance of a module/interface/
+    // program whose body is an exact duplicate of another resolves to
+    // the *same* canonical `InstanceBodySymbol`. The visitor still
+    // calls `body.visit()` once per instance, so without this set a
+    // module instantiated N times would have its body walked N times,
+    // producing N identical refs that the post-hoc remap dedup then
+    // throws away — pure wasted work.
+    //
+    // Tracking the canonical body pointers we've already descended
+    // into lets us walk each unique body exactly once. This is the
+    // record-time equivalent of the refs_remap dedup, but it avoids
+    // building the duplicate refs in the first place.
+    std::unordered_set<const slang::ast::InstanceBodySymbol*> visited_bodies;
 
     RefCollector(const slang::SourceManager& sm_, ScopeAttach& scope_,
                  std::unordered_map<std::string, std::vector<json>>& refs_by_sent_)
@@ -899,6 +923,10 @@ struct RefCollector
 
     void handle(const slang::ast::InstanceBodySymbol& body) {
         if (!body_in_scope(body)) return;
+        // Walk each canonical body once. Repeated instances of the same
+        // module resolve here to the same pointer (via the Canonical
+        // visit flag); skip the body after the first descent.
+        if (!visited_bodies.insert(&body).second) return;
         visitDefault(body);
     }
     void handle(const slang::ast::PackageSymbol& body) {
