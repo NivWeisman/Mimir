@@ -17,9 +17,39 @@ Helix, Sublime, Zed, etc.
 
 ## Status
 
-Mimir is in **early development**. The skeleton is in place; most LSP features
-are not implemented yet. See the [feature checklist](#feature-checklist) below
-for the live state of every LSP request, kept in sync with the code.
+Mimir is in **active development and usable today**. The general-purpose LSP
+surface is broad and shipped:
+
+- **Document sync** — incremental, rope-backed `didOpen` / `didChange` /
+  `didClose` / `didSave`, plus project reload on `.mimir.toml` and source
+  file-watcher events.
+- **Diagnostics** — tree-sitter syntax/parse errors always on; full semantic
+  diagnostics (type mismatches, undeclared identifiers, elaboration errors)
+  when the slang sidecar is configured.
+- **Editing assistance** — semantic tokens, hover (incl. keyword / system-task
+  / built-in-method docs and typedef expansion), completion (member-access,
+  package-scope, scope-aware, built-in methods), signature help, document &
+  workspace symbols, inlay hints, folding ranges, document highlights.
+- **Navigation** — go-to definition / declaration / type-definition /
+  implementation, find-all-references, call hierarchy, type hierarchy.
+- **Refactoring** — workspace-wide rename, whole-file & range formatting
+  (via Verible).
+
+**Two-tier architecture.** Everything above works in **tree-sitter-only mode**
+with no external tools. Pointing mimir at the optional **slang sidecar**
+(`MIMIR_SLANG_PATH` + a `.mimir.toml`) unlocks the semantic tier:
+receiver-aware, type-accurate resolution for definition / hover / signature
+help / inlay hints (e.g. methods inherited from UVM base classes), plus
+`typeDefinition`, `implementation`, and elaboration-driven diagnostics.
+
+**What's next.** The verification-specific frontier — UVM class-tree
+navigation, phase awareness, factory validation, SVA expansion, functional
+coverage structure, constraint navigation — is the active focus and is **not
+yet implemented**. See "[Verification-focused features](#verification-focused-features-the-actual-product-goals)"
+in the checklist.
+
+The [feature checklist](#feature-checklist) below is the canonical, per-request
+source of truth, kept in sync with the code on every change.
 
 ---
 
@@ -641,16 +671,38 @@ When unset (default), every timer is one cached-atomic-bool check and an
 | Prefix | Meaning |
 |--------|---------|
 | `lsp.*` | LSP handler entry (`lsp.hover`, `lsp.did_change`, `lsp.completion`, …) |
-| `elaborate.*` | Background slang elaborate task — debounce, param assembly, hashing, publishing |
+| `elaborate.*` | Background slang elaborate task — debounce, param assembly (`elaborate.assemble.*`), hashing, publishing |
 | `slang.compile.*` | Compile RPC layers — service, adapter, client, connection |
 | `slang.ipc.*` | NDJSON wire phases — serialize, write, read, decode |
 | `syntax.*` | Tree-sitter parse + index update |
-| `assemble_with_cache.*` | Closed-file disk-read cache phases |
 
 For the C++ sidecar, the **`MIMIR_SLANG_TIMING=1`** env var emits a single
-per-compile breakdown line (`stage=build|diags|visit|...`) summarising the
-work inside `handle_compile`. Use both env vars together for end-to-end
-attribution from LSP handler entry through the sidecar's elaborate stages.
+per-compile breakdown line summarising the work inside `handle_compile`:
+
+```
+[mimir-slang-sidecar] timing build=183ms diags=85ms visit=611ms \
+    refs_raw=71910 refs_remap=274ms decls=50ms emit=1ms total=...
+```
+
+The sidecar's own stderr is drained through the server's `tracing`
+subscriber under the `mimir_slang_sidecar` target, so these lines show up
+in the editor's LSP log alongside everything else (no separate channel to
+watch). Use both env vars together for end-to-end attribution from LSP
+handler entry through the sidecar's elaborate stages.
+
+**Sidecar performance notes.** The `visit` stage builds the
+receiver-aware reference map by walking the elaborated AST. Two
+optimisations keep it fast: (1) out-of-scope subtrees (UVM, vendor IP,
+anything not in the editor's filelist) are pruned at the
+module/package/class body level rather than filtered per-expression, and
+(2) repeated instances of the same module resolve to a single canonical
+body that's walked once. An experimental parallel visit
+(`MIMIR_SLANG_PARALLEL=1`, thread-capped via
+`MIMIR_SLANG_PARALLEL_THREADS=N`) exists but is **off by default and
+known to be unsafe** — slang's lazy evaluators race under concurrent
+traversal. Set `MIMIR_SLANG_EMIT_REFS=0` to disable the reference map
+entirely on pathologically large compilations (the consumer falls back
+to its legacy resolution paths).
 
 [tracing]: https://docs.rs/tracing
 
