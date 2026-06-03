@@ -355,6 +355,36 @@ pub(crate) fn definition(
 // type-definition
 // --------------------------------------------------------------------------
 
+/// Resolve the bare *type name* of the symbol at `pos`.
+///
+/// Finds the declaration at the cursor and reads its `type_str`, returning
+/// the bare type identifier (the last whitespace-separated token, with any
+/// trailing `#(...)` parameterization stripped). Returns `None` when the
+/// symbol has no declared type — e.g. the cursor is on a type name itself
+/// rather than on an instance/handle of that type.
+///
+/// Used by [`type_definition`] and by the type-hierarchy prepare step to
+/// turn an instance/handle under the cursor into the class to inspect.
+pub(crate) fn type_name_at(
+    ast: &Arc<MimirAst>,
+    file_uri: &str,
+    pos: MimirPos,
+    rope: &Rope,
+) -> Option<String> {
+    let name = word_at_rope(rope, pos)?;
+    let (decl, _) = find_decl(ast, file_uri, pos, &name)?;
+
+    let type_name = decl.type_str.as_deref()?;
+    let bare_type = type_name.split_whitespace().last().unwrap_or(type_name);
+    // Strip parameterization (`my_class#(int)` → `my_class`) so the bare
+    // name matches the class declaration in the index.
+    let bare_type = bare_type.split('#').next().unwrap_or(bare_type);
+    if bare_type.is_empty() {
+        return None;
+    }
+    Some(bare_type.to_owned())
+}
+
 /// Resolve the declaration of the *type* of the symbol at `pos`.
 ///
 /// Finds the declaration at the cursor, reads its `type_str`, and
@@ -366,13 +396,9 @@ pub(crate) fn type_definition(
     pos: MimirPos,
     rope: &Rope,
 ) -> Option<GotoDefinitionResponse> {
-    let name = word_at_rope(rope, pos)?;
-    let (decl, _) = find_decl(ast, file_uri, pos, &name)?;
+    let bare_type = type_name_at(ast, file_uri, pos, rope)?;
 
-    let type_name = decl.type_str.as_deref()?;
-    let bare_type = type_name.split_whitespace().last().unwrap_or(type_name);
-
-    let (type_decl, type_file) = find_decl_global(ast, bare_type)?;
+    let (type_decl, type_file) = find_decl_global(ast, &bare_type)?;
 
     let interesting = matches!(
         type_decl.kind,
@@ -384,7 +410,7 @@ pub(crate) fn type_definition(
 
     let uri = Url::parse(&format!("file://{type_file}")).ok()?;
     let location = Location { uri, range: mimir_to_lsp_range(type_decl.range) };
-    debug!(name, type_name = bare_type, "ast type_definition resolved");
+    debug!(type_name = %bare_type, "ast type_definition resolved");
     Some(GotoDefinitionResponse::Scalar(location))
 }
 
@@ -971,6 +997,64 @@ mod tests {
     fn find_decl_unknown_returns_none() {
         let ast = simple_ast();
         assert!(find_decl(&ast, "/tmp/a.sv", make_pos(0, 0), "nonexistent").is_none());
+    }
+
+    #[test]
+    fn type_name_at_resolves_instance_to_type() {
+        // A variable `my_handle` of declared type `my_class`. The cursor sits
+        // on the instance, and type_name_at must return the bare type name.
+        let mut decl = make_decl("my_handle", DeclKind::Variable, 5);
+        decl.type_str = Some("my_class".to_owned());
+        let ast = Arc::new(MimirAst {
+            files: vec![MimirFile {
+                uri: "/tmp/a.sv".to_string(),
+                diagnostics: vec![],
+                top_scope: MimirScope {
+                    range: make_range(0, 0, 100, 0),
+                    declarations: vec![decl],
+                    children: vec![],
+                    imported_packages: vec![],
+                },
+                references: vec![],
+            }],
+        });
+        let rope = Rope::from_str("\n\n\n\n\nmy_handle\n");
+        let ty = type_name_at(&ast, "/tmp/a.sv", make_pos(5, 2), &rope);
+        assert_eq!(ty.as_deref(), Some("my_class"));
+    }
+
+    #[test]
+    fn type_name_at_strips_parameterization() {
+        // A parameterized handle: `my_class#(int)` must reduce to `my_class`.
+        let mut decl = make_decl("my_handle", DeclKind::Variable, 0);
+        decl.type_str = Some("my_class#(int)".to_owned());
+        let ast = Arc::new(MimirAst {
+            files: vec![MimirFile {
+                uri: "/tmp/a.sv".to_string(),
+                diagnostics: vec![],
+                top_scope: MimirScope {
+                    range: make_range(0, 0, 100, 0),
+                    declarations: vec![decl],
+                    children: vec![],
+                    imported_packages: vec![],
+                },
+                references: vec![],
+            }],
+        });
+        let rope = Rope::from_str("my_handle\n");
+        let ty = type_name_at(&ast, "/tmp/a.sv", make_pos(0, 2), &rope);
+        assert_eq!(ty.as_deref(), Some("my_class"));
+    }
+
+    #[test]
+    fn type_name_at_none_when_no_declared_type() {
+        // Cursor on a class declaration itself — no `type_str`, so there is
+        // no instance type to resolve.
+        let ast = simple_ast();
+        let ast = Arc::new(ast);
+        let rope = Rope::from_str("\n\n\n\n\n\n\n\n\n\nmy_class\n");
+        let ty = type_name_at(&ast, "/tmp/a.sv", make_pos(10, 2), &rope);
+        assert_eq!(ty, None);
     }
 
     #[test]

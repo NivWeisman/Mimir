@@ -1757,36 +1757,53 @@ impl LanguageServer for Backend {
         };
         let name = name.to_owned();
 
+        // Candidate class names to look up, in priority order. The identifier
+        // may name a class directly, or it may be an instance/handle whose
+        // declared type is the class — resolve that via the AST and try it as
+        // a fallback so the type hierarchy can be opened on a concrete object.
+        let mut candidates = vec![name.clone()];
+        if let Some(ast) = self.adapter.cached_ast().await {
+            if let Some(path) =
+                uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned))
+            {
+                let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
+                if let Some(type_name) = ast_features::type_name_at(&ast, &path, mimir_pos, &rope) {
+                    if type_name != name {
+                        candidates.push(type_name);
+                    }
+                }
+            }
+        }
+
         let item = {
             let docs = self.documents.read().await;
-            let per_file_hit = docs.get(&uri).and_then(|s| {
-                s.index
-                    .iter()
-                    .find(|sym| sym.name == name && sym.kind == MSymbolKind::Class)
-                    .map(|sym| {
-                        hierarchy_features::type_hierarchy_item(
-                            &sym.name, sym.name_range, sym.full_range, &uri,
-                        )
-                    })
-            });
-            drop(docs);
-            if let Some(item) = per_file_hit {
-                Some(item)
-            } else {
-                let ws = self.workspace.read().await;
-                ws.index
-                    .lookup(&name)
-                    .iter()
-                    .find(|e| e.symbol.kind == MSymbolKind::Class)
-                    .map(|e| {
-                        hierarchy_features::type_hierarchy_item(
-                            &e.symbol.name,
-                            e.symbol.name_range,
-                            e.symbol.full_range,
-                            &e.url,
-                        )
-                    })
-            }
+            let ws = self.workspace.read().await;
+            candidates.iter().find_map(|cand| {
+                let per_file_hit = docs.get(&uri).and_then(|s| {
+                    s.index
+                        .iter()
+                        .find(|sym| sym.name == *cand && sym.kind == MSymbolKind::Class)
+                        .map(|sym| {
+                            hierarchy_features::type_hierarchy_item(
+                                &sym.name, sym.name_range, sym.full_range, &uri,
+                            )
+                        })
+                });
+                per_file_hit.or_else(|| {
+                    ws.index
+                        .lookup(cand)
+                        .iter()
+                        .find(|e| e.symbol.kind == MSymbolKind::Class)
+                        .map(|e| {
+                            hierarchy_features::type_hierarchy_item(
+                                &e.symbol.name,
+                                e.symbol.name_range,
+                                e.symbol.full_range,
+                                &e.url,
+                            )
+                        })
+                })
+            })
         };
         debug!(name = %name, found = item.is_some(), "prepare_type_hierarchy");
         Ok(item.map(|i| vec![i]))
