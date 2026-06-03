@@ -56,6 +56,7 @@ pub mod selection;
 pub mod semantic_tokens;
 pub mod signature;
 pub mod symbols;
+pub mod uvm;
 
 pub use calls::{ArgSpan, CallKind, CallSite, EnclosingCallable};
 pub use diagnostics::{Diagnostic, DiagnosticSeverity};

@@ -750,7 +750,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 - ✅ Syntax / parse-error diagnostics from tree-sitter (`ERROR` & `MISSING` nodes)
 - ⬜ Lint diagnostics (style, naming, dead code)
 - ✅ Semantic diagnostics (type mismatches, undeclared identifiers) — via the slang sidecar `compile` RPC which exports a full `MimirAst`; opt-in with `MIMIR_SLANG_PATH` + `.mimir.toml`
-- ⬜ UVM-aware diagnostics (missing `super.build_phase`, factory misuse)
+- 🚧 UVM-aware diagnostics — **missing `super.<phase>()` shipped**; factory misuse pending. A tree-sitter check (works without slang) flags any UVM phase-method override (`build_phase`, `connect_phase`, `run_phase`, … — identified by a `uvm_phase` parameter, so unrelated same-named helpers are ignored) whose body never chains to `super.<phase>(...)`. Covers in-class and out-of-class (`function void cls::build_phase`) bodies; `extern`/pure prototypes are skipped. Configure under `[diagnostics]` in `.mimir.toml`: `uvm_phase_super_call` (on/off, default true), `uvm_phase_super_severity` (`error`/`warning`/`information`/`hint`, default `warning`), `uvm_phases` (override the checked phase list; default = the UVM common phases). Lives in [`mimir_syntax::uvm`](./crates/mimir-syntax/src/uvm.rs).
 - ⬜ SVA diagnostics (malformed property/sequence)
 
 ### Editing assistance

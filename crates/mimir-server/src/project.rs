@@ -197,10 +197,37 @@ pub struct DiagnosticsConfig {
     /// entirely. Takes precedence over `demote_paths`.
     #[serde(default)]
     pub ignore_paths: Vec<String>,
+
+    /// Enable the UVM "phase override forgets `super.<phase>()`" lint
+    /// (a tree-sitter check, independent of slang). Default `true`.
+    #[serde(default = "default_true")]
+    pub uvm_phase_super_call: bool,
+
+    /// Severity for the missing-`super` diagnostic. One of
+    /// `error` / `warning` / `information` / `hint` (default `warning`).
+    /// An unrecognised value falls back to `warning`.
+    #[serde(default = "default_uvm_phase_super_severity")]
+    pub uvm_phase_super_severity: String,
+
+    /// Phase method names the missing-`super` check applies to. Defaults to
+    /// the UVM common phases ([`mimir_syntax::uvm::DEFAULT_UVM_PHASES`]).
+    #[serde(default = "default_uvm_phases")]
+    pub uvm_phases: Vec<String>,
 }
 
 fn default_demote_severity() -> String {
     "hint".to_string()
+}
+
+fn default_uvm_phase_super_severity() -> String {
+    "warning".to_string()
+}
+
+fn default_uvm_phases() -> Vec<String> {
+    mimir_syntax::uvm::DEFAULT_UVM_PHASES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 impl Default for DiagnosticsConfig {
@@ -209,7 +236,57 @@ impl Default for DiagnosticsConfig {
             demote_paths: Vec::new(),
             demote_severity: default_demote_severity(),
             ignore_paths: Vec::new(),
+            uvm_phase_super_call: true,
+            uvm_phase_super_severity: default_uvm_phase_super_severity(),
+            uvm_phases: default_uvm_phases(),
         }
+    }
+}
+
+/// Resolved UVM-lint settings, derived from [`DiagnosticsConfig`]. Kept
+/// separate from [`crate::diag_policy::DiagnosticPolicy`] (which is purely
+/// path-based demote/ignore of *slang* diagnostics) because UVM lint is its
+/// own concern: a set of tree-sitter checks with their own severity.
+#[derive(Debug, Clone)]
+pub struct UvmLintConfig {
+    /// Whether the missing-`super.<phase>()` check runs.
+    pub phase_super_call: bool,
+    /// Severity emitted for the missing-`super` diagnostic.
+    pub phase_super_severity: mimir_syntax::DiagnosticSeverity,
+    /// Phase method names the check applies to.
+    pub phases: Vec<String>,
+}
+
+impl Default for UvmLintConfig {
+    fn default() -> Self {
+        Self {
+            phase_super_call: true,
+            phase_super_severity: mimir_syntax::DiagnosticSeverity::Warning,
+            phases: default_uvm_phases(),
+        }
+    }
+}
+
+impl UvmLintConfig {
+    /// Build the resolved form from the raw `[diagnostics]` table.
+    fn from_config(cfg: &DiagnosticsConfig) -> Self {
+        Self {
+            phase_super_call: cfg.uvm_phase_super_call,
+            phase_super_severity: parse_severity(&cfg.uvm_phase_super_severity),
+            phases: cfg.uvm_phases.clone(),
+        }
+    }
+}
+
+/// Parse a severity string into [`mimir_syntax::DiagnosticSeverity`],
+/// falling back to `Warning` on an unrecognised value.
+fn parse_severity(s: &str) -> mimir_syntax::DiagnosticSeverity {
+    use mimir_syntax::DiagnosticSeverity as S;
+    match s.to_ascii_lowercase().as_str() {
+        "error" => S::Error,
+        "information" | "info" => S::Information,
+        "hint" => S::Hint,
+        _ => S::Warning,
     }
 }
 
@@ -609,6 +686,9 @@ pub struct ResolvedProject {
     /// `.mimir.toml`). Applied to slang diagnostics at publish time. The
     /// default is a no-op (publish everything unchanged).
     pub diagnostics: crate::diag_policy::DiagnosticPolicy,
+    /// Resolved UVM-lint settings (also from `[diagnostics]`). Applied to
+    /// tree-sitter diagnostics on every reparse.
+    pub uvm_lint: UvmLintConfig,
 }
 
 impl ResolvedProject {
@@ -721,6 +801,11 @@ impl ResolvedProject {
             _ => mimir_syntax::MethodHintMode::Name,
         };
 
+        // Resolve UVM lint settings before the demote/ignore fields are
+        // moved into `DiagnosticPolicy::from_config` below (they're distinct
+        // fields, so the partial moves don't conflict).
+        let uvm_lint = UvmLintConfig::from_config(&cfg.diagnostics);
+
         Ok(Self {
             root,
             files,
@@ -740,6 +825,7 @@ impl ResolvedProject {
                 &cfg.diagnostics.demote_severity,
                 cfg.diagnostics.ignore_paths,
             ),
+            uvm_lint,
         })
     }
 }

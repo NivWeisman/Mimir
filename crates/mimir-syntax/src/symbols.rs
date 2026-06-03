@@ -333,7 +333,7 @@ fn extract_class_extends_name(node: Node<'_>, source: &str) -> Option<String> {
 
 /// Extract formal parameters for callable declarations, or `None` for
 /// non-callable symbols. Called from [`symbol_for`].
-fn extract_callable_params(node: Node<'_>, source: &str) -> Option<Vec<Param>> {
+pub(crate) fn extract_callable_params(node: Node<'_>, source: &str) -> Option<Vec<Param>> {
     match node.kind() {
         "function_body_declaration"
         | "task_body_declaration"

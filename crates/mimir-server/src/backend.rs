@@ -237,10 +237,27 @@ impl Backend {
             mimir_core::time_scope!("syntax.parse");
             self.ts.parse(&text, &edits, prior_tree).await
         };
-        let (diags, new_state) = match parse_result {
+        let (mut diags, new_state) = match parse_result {
             Some(r) => (r.diagnostics, Some((r.symbols, r.tree))),
             None => (Vec::new(), None),
         };
+
+        // UVM-aware lint over the freshly parsed tree (tree-sitter only, no
+        // slang). Gated by `[diagnostics] uvm_phase_super_call`; the phase
+        // set and severity are configurable. Published alongside the parse
+        // diagnostics below.
+        if let Some((_, tree)) = new_state.as_ref() {
+            let cfg = self.slang.current_uvm_lint_config().await;
+            if cfg.phase_super_call {
+                let rope = Rope::from_str(&text);
+                diags.extend(mimir_syntax::uvm::phase_super_call_diagnostics(
+                    tree,
+                    &rope,
+                    &cfg.phases,
+                    cfg.phase_super_severity,
+                ));
+            }
+        }
 
         // Write the fresh index + tree back into the doc store, but only if
         // the version we parsed is still the live one — otherwise a

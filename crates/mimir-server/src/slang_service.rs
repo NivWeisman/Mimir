@@ -162,6 +162,18 @@ impl SlangService {
             .unwrap_or_default()
     }
 
+    /// Return the project's resolved UVM-lint settings (from `[diagnostics]`).
+    /// Falls back to [`UvmLintConfig::default`] (check on, `warning`, the
+    /// common phases) when no project config is loaded.
+    pub(crate) async fn current_uvm_lint_config(&self) -> crate::project::UvmLintConfig {
+        self.project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.uvm_lint.clone())
+            .unwrap_or_default()
+    }
+
     /// Return the project's `` `include `` search directories, in order.
     ///
     /// Used by `textDocument/documentLink` to resolve `` `include "..." ``
@@ -608,6 +620,7 @@ mod tests {
             single_unit: false,
             timescale: None,
             diagnostics: crate::diag_policy::DiagnosticPolicy::default(),
+            uvm_lint: crate::project::UvmLintConfig::default(),
         }
     }
 
