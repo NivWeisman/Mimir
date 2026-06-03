@@ -58,6 +58,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::ast_features;
 use crate::chain_resolve;
+use crate::code_lens;
 use crate::completion_score;
 use crate::hierarchy_features;
 use crate::includes;
@@ -1180,6 +1181,11 @@ impl LanguageServer for Backend {
                 document_link_provider: Some(DocumentLinkOptions {
                     resolve_provider: Some(false),
                     work_done_progress_options: Default::default(),
+                }),
+                // "▷ overrides Base::method" CodeLens. Computed in one stage
+                // (the title needs the base class name), so no resolve step.
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
                 }),
                 // Slang-first, then tree-sitter fallback for signature popup.
                 // Trigger on `(` so the popup appears immediately when the user
@@ -2417,6 +2423,31 @@ impl LanguageServer for Backend {
 
         debug!(count = links.len(), "document_link returned");
         Ok(Some(links))
+    }
+
+    /// CodeLens: "▷ overrides Base::method" above each method that overrides
+    /// an ancestor. Tree-sitter only (no slang). Scope (`uvm` / `all` /
+    /// `none`) comes from `[code_lens] overrides`. The lens is computed in
+    /// one stage — the title needs the base class name, so there's nothing
+    /// useful to defer to `codeLens/resolve`.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
+        mimir_core::time_scope!("lsp.code_lens");
+        let mode = self.slang.current_code_lens_mode().await;
+        if mode == code_lens::OverrideLensMode::None {
+            return Ok(None);
+        }
+        let uri = params.text_document.uri;
+        let Some((_, index)) = self.cached_tree_and_index(&uri).await else {
+            debug!("code_lens: no cached parse for this URI");
+            return Ok(None);
+        };
+        let lenses = {
+            let ws = self.workspace.read().await;
+            code_lens::override_lenses(&index, &ws.index, mode)
+        };
+        debug!(count = lenses.len(), "code_lens returned");
+        Ok(Some(lenses))
     }
 
     /// SV-aware semantic tokens for the whole document. Pure

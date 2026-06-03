@@ -174,6 +174,20 @@ impl SlangService {
             .unwrap_or_default()
     }
 
+    /// Return the project's resolved CodeLens override mode (from
+    /// `[code_lens] overrides`). Falls back to the default (`Uvm`) when no
+    /// project config is loaded.
+    pub(crate) async fn current_code_lens_mode(
+        &self,
+    ) -> crate::code_lens::OverrideLensMode {
+        self.project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.code_lens_overrides)
+            .unwrap_or_default()
+    }
+
     /// Return the project's `` `include `` search directories, in order.
     ///
     /// Used by `textDocument/documentLink` to resolve `` `include "..." ``
@@ -621,6 +635,7 @@ mod tests {
             timescale: None,
             diagnostics: crate::diag_policy::DiagnosticPolicy::default(),
             uvm_lint: crate::project::UvmLintConfig::default(),
+            code_lens_overrides: crate::code_lens::OverrideLensMode::default(),
         }
     }
 

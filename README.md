@@ -777,7 +777,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 - ⬜ Built-in hover for `this.push_back` / `super.push_back`-style calls — the `this`/`super` receiver arm in `builtin_method_hover_at` only queries `UNIVERSAL_METHODS`; container methods (queue, array, assoc) are excluded because the class type is not checked and false positives would be worse than silence.
 - ✅ `textDocument/selectionRange` — smart "expand selection" (VS Code `Shift+Alt+→`, Emacs `expand-region`-style). Pure tree-sitter: [`mimir_syntax::selection::selection_ranges_at`](./crates/mimir-syntax/src/selection.rs) walks the parse tree from the leaf node under the cursor up to the root, emitting each ancestor's range so each keypress grows the selection to the next enclosing construct (identifier → expression → statement → `begin…end` block → function/task → class → module → file). Consecutive ancestors that share the exact same span (tree-sitter wrapper nodes) are collapsed so no keypress is a visible no-op. Handles a batch of cursor positions per request (multi-cursor) and links each into the LSP `SelectionRange` parent-chain at the server boundary. No symbol table needed; works without slang.
 - ✅ `textDocument/documentLink` — clickable `` `include "..." `` paths. Scans the document for include directives via [`includes::scan_includes_with_spans`](./crates/mimir-server/src/includes.rs) (same comment/string-aware text scan the workspace indexer uses, but span-returning), resolves each filename against the file's own directory then the project `include_dirs` (same order as slang's preprocessor), and returns a `DocumentLink` whose range underlines just the filename and whose target is the resolved file URL. `resolve_provider: false` — the target is filled eagerly. Unresolved includes (macro-derived paths, missing headers) yield no link rather than a dead one. Pure text scan — no slang round-trip; the project `include_dirs` come from `.mimir.toml` and are available even when the sidecar isn't configured.
-- ⬜ `textDocument/codeLens`
+- ✅ `textDocument/codeLens` — "▷ overrides Base::method" lens above each method that overrides an ancestor; clicking jumps to the overridden declaration. Tree-sitter only (no slang): the enclosing class's `extends` chain is walked through the workspace index for the nearest ancestor declaring the same method. Computed in one stage (the title needs the base class name), so `resolve_provider` is `false`. Scope is set by `[code_lens] overrides` in `.mimir.toml`: `"uvm"` (default — only UVM phase methods like `build_phase`/`run_phase`), `"all"` (every override), or `"none"` (disabled). The lens fires the `mimir.gotoLocation` client command (a tiny VS Code shim that opens + reveals the target). Lives in [`code_lens`](./crates/mimir-server/src/code_lens.rs).
 
 ### Navigation
 
@@ -800,7 +800,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 ### Verification-focused features (the actual product goals)
 
 - ⬜ UVM class-tree navigation (component/object hierarchy)
-- ⬜ UVM phase awareness (jump to overridden `build_phase`, `run_phase`, …)
+- 🚧 UVM phase awareness — jump to an overridden phase via the `textDocument/codeLens` "overrides Base::method" lens (see above; default scope is UVM phase methods). Phase-graph ordering / phase-jump-by-name is still pending.
 - ⬜ UVM factory registration validation (`uvm_object_utils`, `uvm_component_utils`)
 - ⬜ UVM sequence ↔ sequencer ↔ driver navigation
 - ⬜ SVA property/sequence index, hover-preview of expansion

@@ -174,6 +174,15 @@ pub struct ProjectConfig {
     /// ```
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+
+    /// CodeLens settings — controls the "overrides Base::method" lens.
+    ///
+    /// ```toml
+    /// [code_lens]
+    /// overrides = "uvm"   # "uvm" (default) | "all" | "none"
+    /// ```
+    #[serde(default)]
+    pub code_lens: CodeLensConfig,
 }
 
 /// `[diagnostics]` section of `.mimir.toml`. Controls per-path demote/ignore
@@ -380,6 +389,32 @@ fn default_method_hint() -> String {
 impl Default for InlayHintsConfig {
     fn default() -> Self {
         Self { method_hint: default_method_hint() }
+    }
+}
+
+/// `[code_lens]` section of `.mimir.toml`. Controls the "overrides
+/// Base::method" CodeLens.
+///
+/// ```toml
+/// [code_lens]
+/// overrides = "uvm"   # "uvm" (default) | "all" | "none"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeLensConfig {
+    /// Which method overrides get a lens: `"uvm"` (UVM phase methods only,
+    /// the default), `"all"` (every override), or `"none"` (disabled).
+    #[serde(default = "default_code_lens_overrides")]
+    pub overrides: String,
+}
+
+fn default_code_lens_overrides() -> String {
+    "uvm".to_owned()
+}
+
+impl Default for CodeLensConfig {
+    fn default() -> Self {
+        Self { overrides: default_code_lens_overrides() }
     }
 }
 
@@ -689,6 +724,8 @@ pub struct ResolvedProject {
     /// Resolved UVM-lint settings (also from `[diagnostics]`). Applied to
     /// tree-sitter diagnostics on every reparse.
     pub uvm_lint: UvmLintConfig,
+    /// Resolved CodeLens override mode (from `[code_lens] overrides`).
+    pub code_lens_overrides: crate::code_lens::OverrideLensMode,
 }
 
 impl ResolvedProject {
@@ -805,6 +842,8 @@ impl ResolvedProject {
         // moved into `DiagnosticPolicy::from_config` below (they're distinct
         // fields, so the partial moves don't conflict).
         let uvm_lint = UvmLintConfig::from_config(&cfg.diagnostics);
+        let code_lens_overrides =
+            crate::code_lens::OverrideLensMode::from_config_str(&cfg.code_lens.overrides);
 
         Ok(Self {
             root,
@@ -826,6 +865,7 @@ impl ResolvedProject {
                 cfg.diagnostics.ignore_paths,
             ),
             uvm_lint,
+            code_lens_overrides,
         })
     }
 }

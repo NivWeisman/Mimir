@@ -21,6 +21,7 @@ use tower_lsp::{LspService, Server};
 mod ast_features;
 mod backend;
 mod chain_resolve;
+mod code_lens;
 mod completion_score;
 mod diag_policy;
 mod diagnostics;

@@ -39,6 +39,35 @@ interface ExpandMacroResponse {
 const expansionContents = new Map<string, string>();
 const expansionEmitter = new vscode.EventEmitter<vscode.Uri>();
 
+/**
+ * Register `mimir.gotoLocation` — the command server CodeLenses invoke to
+ * jump to a target declaration. Args: `[uriString, { line, character }]`.
+ * Kept tiny on purpose: the server decides *what* to point at; the client
+ * just opens it.
+ */
+function registerGotoLocation(context: vscode.ExtensionContext): void {
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "mimir.gotoLocation",
+      async (uriStr: string, pos: { line: number; character: number }) => {
+        try {
+          const uri = vscode.Uri.parse(uriStr);
+          const position = new vscode.Position(pos.line, pos.character);
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const editor = await vscode.window.showTextDocument(doc);
+          editor.selection = new vscode.Selection(position, position);
+          editor.revealRange(
+            new vscode.Range(position, position),
+            vscode.TextEditorRevealType.InCenter,
+          );
+        } catch (err) {
+          void vscode.window.showErrorMessage(`Mimir: could not open location: ${err}`);
+        }
+      },
+    ),
+  );
+}
+
 /** Register the "Mimir: Expand Macro" command + its virtual-doc provider. */
 function registerMacroExpansion(context: vscode.ExtensionContext): void {
   const provider: vscode.TextDocumentContentProvider = {
@@ -134,9 +163,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     clientOptions,
   );
 
-  // Register the macro-expansion command + virtual-doc provider before the
-  // client starts so the command is available as soon as the editor loads.
+  // Register commands before the client starts so they're available as soon
+  // as the editor loads.
   registerMacroExpansion(context);
+  registerGotoLocation(context);
 
   // Surface failure clearly: if the binary isn't on PATH we want a real
   // notification, not a silent dead client.
