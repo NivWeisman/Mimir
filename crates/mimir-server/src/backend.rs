@@ -60,6 +60,7 @@ use crate::ast_features;
 use crate::chain_resolve;
 use crate::completion_score;
 use crate::hierarchy_features;
+use crate::includes;
 use crate::elaborate_service::ElaborateService;
 use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
 use crate::parse_provider::TreeSitterProvider;
@@ -1152,6 +1153,17 @@ impl LanguageServer for Backend {
                 // foldable range per top-level construct (module, class,
                 // function, …). No semantic info, no symbol table needed.
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                // Smart "expand selection": walk the parse tree from the
+                // cursor's leaf node outward. Pure tree-sitter, no symbol
+                // table needed.
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                // Clickable `` `include "..." `` paths. `resolve_provider:
+                // false` because we fill the target eagerly (the path is
+                // cheap to resolve against the project include dirs).
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
                 // Slang-first, then tree-sitter fallback for signature popup.
                 // Trigger on `(` so the popup appears immediately when the user
                 // opens a function's argument list; `,` keeps it updated as the
@@ -2236,6 +2248,101 @@ impl LanguageServer for Backend {
             .collect();
         debug!(count = ranges.len(), "folding_range returned");
         Ok(Some(ranges))
+    }
+
+    /// Smart "expand selection" — for each requested position, return the
+    /// chain of nested syntactic ranges (token → expression → statement →
+    /// block → … → file) the editor steps through as the user grows the
+    /// selection. Pure tree-sitter.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> LspResult<Option<Vec<SelectionRange>>> {
+        mimir_core::time_scope!("lsp.selection_range");
+        let uri = params.text_document.uri;
+        let Some(tree) = self.cached_tree(&uri).await else {
+            debug!("selection_range: no tree available");
+            return Ok(None);
+        };
+        let rope = Rope::from_str(tree.source());
+
+        let out: Vec<SelectionRange> = params
+            .positions
+            .iter()
+            .map(|pos| {
+                let chain =
+                    mimir_syntax::selection::selection_ranges_at(
+                        &tree,
+                        &rope,
+                        MPosition::new(pos.line, pos.character),
+                    );
+                build_selection_range(&chain)
+            })
+            .collect();
+
+        debug!(count = out.len(), "selection_range returned");
+        Ok(Some(out))
+    }
+
+    /// Clickable `` `include "..." `` directives. Scans the document for
+    /// include directives, resolves each filename against the file's own
+    /// directory then the project include dirs (same order as slang's
+    /// preprocessor), and returns a `DocumentLink` per resolved path. Pure
+    /// tree-sitter-adjacent text scan — no slang round-trip.
+    #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> LspResult<Option<Vec<DocumentLink>>> {
+        mimir_core::time_scope!("lsp.document_link");
+        let uri = params.text_document.uri;
+
+        let text = {
+            let docs = self.documents.read().await;
+            match docs.get(&uri) {
+                Some(state) => state.document.text(),
+                None => {
+                    debug!("document_link: URI not in open-doc store");
+                    return Ok(None);
+                }
+            }
+        };
+        let rope = Rope::from_str(&text);
+
+        // The directory of the current file is searched first.
+        let current_dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let include_dirs = self.slang.current_include_dirs().await;
+
+        let mut links: Vec<DocumentLink> = Vec::new();
+        for span in includes::scan_includes_with_spans(&text) {
+            let resolved = includes::resolve_include_with(
+                &span.name,
+                current_dir.as_deref().unwrap_or_else(|| Path::new(".")),
+                &include_dirs,
+                |p| p.is_file(),
+            );
+            let Some(target_path) = resolved else {
+                continue; // unresolved (macro path, missing header) → no link
+            };
+            let Ok(target) = Url::from_file_path(&target_path) else {
+                continue;
+            };
+            let start = MPosition::from_byte_offset(&rope, span.start);
+            let end = MPosition::from_byte_offset(&rope, span.end);
+            links.push(DocumentLink {
+                range: m_range_to_lsp(MRange::new(start, end)),
+                target: Some(target),
+                tooltip: Some(format!("Open {}", target_path.display())),
+                data: None,
+            });
+        }
+
+        debug!(count = links.len(), "document_link returned");
+        Ok(Some(links))
     }
 
     /// SV-aware semantic tokens for the whole document. Pure
@@ -4174,6 +4281,28 @@ fn m_fold_to_lsp(f: mimir_syntax::FoldRange) -> FoldingRange {
         kind: Some(FoldingRangeKind::Region),
         collapsed_text: None,
     }
+}
+
+/// Link an innermost-first range chain into an `lsp_types::SelectionRange`,
+/// where each entry's `parent` is the next-larger range. The returned value
+/// is the innermost range with its parent chain attached. An empty chain
+/// (cursor out of bounds) degenerates to a zero-width range at the chain's
+/// implied position — but since we can't recover the position here, callers
+/// pass at least the leaf range; an empty chain yields a single empty range
+/// at (0,0) which the editor harmlessly ignores.
+fn build_selection_range(chain: &[MRange]) -> SelectionRange {
+    let mut acc: Option<SelectionRange> = None;
+    // Walk outermost → innermost so each inner range points at the outer one.
+    for r in chain.iter().rev() {
+        acc = Some(SelectionRange {
+            range: m_range_to_lsp(*r),
+            parent: acc.map(Box::new),
+        });
+    }
+    acc.unwrap_or_else(|| SelectionRange {
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        parent: None,
+    })
 }
 
 /// Build the LSP semantic-tokens legend from

@@ -52,6 +52,7 @@ pub mod hover_format;
 pub mod inlay;
 pub mod keywords;
 pub mod parser;
+pub mod selection;
 pub mod semantic_tokens;
 pub mod signature;
 pub mod symbols;

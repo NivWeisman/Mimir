@@ -113,6 +113,108 @@ pub fn scan_includes(text: &str) -> Vec<String> {
     out
 }
 
+/// One `` `include `` directive located in source, with the byte span of its
+/// filename (the text *inside* the quotes/brackets, excluding them).
+///
+/// Powers `textDocument/documentLink`: the server converts `start..end` to an
+/// LSP range via the document rope and resolves `name` to a clickable target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncludeSpan {
+    /// Filename as written, without the surrounding `"…"` / `<…>`.
+    pub name: String,
+    /// Byte offset of the first character of `name` in the source.
+    pub start: usize,
+    /// Byte offset one past the last character of `name`.
+    pub end: usize,
+}
+
+/// Like [`scan_includes`] but also returns the byte span of each filename so
+/// the caller can build clickable document links.
+///
+/// Same scanning rules as [`scan_includes`] (skips comments and strings,
+/// matches `` `include `` followed by `"…"` or `<…>`, ignores macro-derived
+/// paths). The returned span covers only the filename text, not the
+/// delimiters — clicking anywhere on the path navigates to the file.
+#[must_use]
+pub fn scan_includes_with_spans(text: &str) -> Vec<IncludeSpan> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<IncludeSpan> = Vec::new();
+    let mut i = 0;
+    let n = bytes.len();
+
+    while i < n {
+        let b = bytes[i];
+
+        // Line comment.
+        if b == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment.
+        if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        // Plain double-quoted string.
+        if b == b'"' {
+            i += 1;
+            while i < n && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            i = (i + 1).min(n);
+            continue;
+        }
+        // `` `include "..." `` / `` `include <...> ``.
+        if b == b'`' {
+            let rest = &bytes[i + 1..];
+            if rest.starts_with(b"include")
+                && rest.get(7).map_or(true, |c| c.is_ascii_whitespace())
+            {
+                i += 1 + 7;
+                while i < n && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    i += 1;
+                }
+                if i >= n {
+                    break;
+                }
+                let close = match bytes[i] {
+                    b'"' => b'"',
+                    b'<' => b'>',
+                    _ => continue,
+                };
+                i += 1;
+                let start = i;
+                while i < n && bytes[i] != close && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                if i < n && bytes[i] == close {
+                    if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
+                        out.push(IncludeSpan {
+                            name: s.to_owned(),
+                            start,
+                            end: i,
+                        });
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Resolve a single relative include filename to an absolute path,
 /// delegating the existence check to `exists`.
 ///
@@ -233,6 +335,33 @@ mod tests {
     fn scan_includes_quoted() {
         let text = r#"`include "uvm_pkg.sv""#;
         assert_eq!(scan_includes(text), vec!["uvm_pkg.sv"]);
+    }
+
+    /// `scan_includes_with_spans` returns the filename plus the byte span
+    /// that covers exactly the filename text (excluding the delimiters), so
+    /// the document-link range underlines just the path.
+    #[test]
+    fn scan_includes_with_spans_locates_filename() {
+        let text = "module m;\n`include \"hdr/uvm_pkg.svh\"\nendmodule\n";
+        let spans = scan_includes_with_spans(text);
+        assert_eq!(spans.len(), 1);
+        let s = &spans[0];
+        assert_eq!(s.name, "hdr/uvm_pkg.svh");
+        // The span must slice back to the exact filename text.
+        assert_eq!(&text[s.start..s.end], "hdr/uvm_pkg.svh");
+    }
+
+    /// Multiple includes (quoted + angle) get distinct, in-order spans, and
+    /// directives inside comments are skipped.
+    #[test]
+    fn scan_includes_with_spans_skips_comments_and_keeps_order() {
+        let text = "`include \"a.svh\"\n// `include \"ignored.svh\"\n`include <b.svh>\n";
+        let spans = scan_includes_with_spans(text);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].name, "a.svh");
+        assert_eq!(spans[1].name, "b.svh");
+        assert_eq!(&text[spans[0].start..spans[0].end], "a.svh");
+        assert_eq!(&text[spans[1].start..spans[1].end], "b.svh");
     }
 
     /// Angle-bracket include returns the bare filename (no brackets).

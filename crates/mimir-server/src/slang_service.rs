@@ -149,6 +149,21 @@ impl SlangService {
             .unwrap_or_default()
     }
 
+    /// Return the project's `` `include `` search directories, in order.
+    ///
+    /// Used by `textDocument/documentLink` to resolve `` `include "..." ``
+    /// targets the same way slang's preprocessor would. Empty when no
+    /// project config is loaded (the document-link handler then only resolves
+    /// includes relative to the file's own directory).
+    pub(crate) async fn current_include_dirs(&self) -> Vec<PathBuf> {
+        self.project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.include_dirs.clone())
+            .unwrap_or_default()
+    }
+
     /// Return the current [`FormatterConfig`] from the resolved project config.
     ///
     /// Falls back to [`FormatterConfig::default`] when no project config is
