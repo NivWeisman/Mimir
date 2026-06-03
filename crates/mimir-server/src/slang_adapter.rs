@@ -12,10 +12,15 @@
 //! queries (goto-definition, completion, hover, etc.) without blocking on
 //! the next compile cycle.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use mimir_ast::{DiagSeverity, MimirAst, MimirDiag, MimirPos, MimirRange};
-use mimir_slang::{Diagnostic as SlangDiag, ElaborateParams, Severity as SlangSeverity};
+use mimir_core::Position as MPosition;
+use mimir_slang::{
+    Diagnostic as SlangDiag, ElaborateParams, ExpandMacroParams, ExpandMacroResult,
+    Severity as SlangSeverity,
+};
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::Url;
 use tracing::{debug, error, warn};
@@ -80,6 +85,27 @@ fn slang_diag_to_mimir(d: SlangDiag) -> (String, MimirDiag) {
 pub(crate) struct SlangAdapter {
     slang: Arc<SlangService>,
     cached_ast: Arc<RwLock<Option<Arc<MimirAst>>>>,
+    /// Per-document cache of recent macro expansions. Keyed by URL; the
+    /// stored `(version, entries)` is replaced wholesale when the document
+    /// version changes. Lets the hover footer and the panel command share a
+    /// single preprocessor run when both land on the same macro usage.
+    expansion_cache: Arc<RwLock<HashMap<Url, CachedExpansions>>>,
+}
+
+/// All cached expansions for one document at one version.
+struct CachedExpansions {
+    version: i32,
+    /// Each entry is one previously-expanded macro usage. Looked up by
+    /// testing whether a cursor falls inside `usage_range`.
+    entries: Vec<(MimirRange, ExpandMacroResult)>,
+}
+
+/// True when `pos` falls within `[range.start, range.end]` (inclusive),
+/// comparing in (line, character) order.
+fn range_contains(range: &MimirRange, pos: MPosition) -> bool {
+    let after_start = (pos.line, pos.character) >= (range.start.line, range.start.character);
+    let before_end = (pos.line, pos.character) <= (range.end.line, range.end.character);
+    after_start && before_end
 }
 
 impl SlangAdapter {
@@ -88,6 +114,7 @@ impl SlangAdapter {
         Self {
             slang,
             cached_ast: Arc::new(RwLock::new(None)),
+            expansion_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -163,6 +190,84 @@ impl SlangAdapter {
                 None
             }
         }
+    }
+
+    /// Expand the macro usage at `position` in the document `uri` (version
+    /// `version`), going through the cache.
+    ///
+    /// Returns:
+    /// * `Some(result)` — the sidecar answered. `result.found` distinguishes
+    ///   "expanded a macro" from "cursor wasn't on a macro usage".
+    /// * `None` — the sidecar was busy, errored, or isn't configured.
+    ///
+    /// On a cache hit (a previously-expanded usage at this URL+version whose
+    /// range covers `position`) no RPC is sent. On a miss, the RPC runs and a
+    /// successful (`found`) result is cached for the next lookup.
+    pub(crate) async fn expand_macro(
+        &self,
+        uri: &Url,
+        version: i32,
+        position: MPosition,
+        params: &ExpandMacroParams,
+    ) -> Option<ExpandMacroResult> {
+        mimir_core::time_scope!("slang.compile.adapter.expand_macro");
+
+        // Cache lookup: same URL + version, and the cursor falls inside a
+        // previously-expanded usage range.
+        {
+            let cache = self.expansion_cache.read().await;
+            if let Some(c) = cache.get(uri) {
+                if c.version == version {
+                    if let Some((_, hit)) =
+                        c.entries.iter().find(|(r, _)| range_contains(r, position))
+                    {
+                        debug!(uri = %uri, "macro expansion cache hit");
+                        return Some(hit.clone());
+                    }
+                }
+            }
+        }
+
+        let result = match self.slang.expand_macro(params).await {
+            Ok(r) => r,
+            Err(mimir_slang::ClientError::Busy) => {
+                debug!("sidecar busy during expand_macro");
+                return None;
+            }
+            Err(e) => {
+                error!(error = %e, "[SlangError] expand_macro RPC failed");
+                return None;
+            }
+        };
+
+        // Cache successful hits keyed by their usage range so a follow-up
+        // hover/command anywhere on the same macro reuses this compute.
+        if result.found {
+            if let Some(usage) = &result.usage_range {
+                let key_range = MimirRange {
+                    start: MimirPos {
+                        line: usage.start.line,
+                        character: usage.start.character,
+                    },
+                    end: MimirPos {
+                        line: usage.end.line,
+                        character: usage.end.character,
+                    },
+                };
+                let mut cache = self.expansion_cache.write().await;
+                let bucket = cache.entry(uri.clone()).or_insert_with(|| CachedExpansions {
+                    version,
+                    entries: Vec::new(),
+                });
+                if bucket.version != version {
+                    bucket.version = version;
+                    bucket.entries.clear();
+                }
+                bucket.entries.push((key_range, result.clone()));
+            }
+        }
+
+        Some(result)
     }
 
     /// Return the cached [`MimirAst`] from the last successful compile.

@@ -23,7 +23,7 @@
 //! adds a new diagnostic code doesn't require a coordinated Rust release.
 
 use mimir_ast::MimirAst;
-use mimir_core::Range;
+use mimir_core::{Position, Range};
 use serde::{Deserialize, Serialize};
 
 // --------------------------------------------------------------------------
@@ -41,6 +41,11 @@ pub mod methods {
     /// Politely ask the sidecar to exit. No params, no result.
     /// The client should still wait on the child after sending this.
     pub const SHUTDOWN: &str = "shutdown";
+
+    /// Recursively expand the macro under a cursor position and return the
+    /// expanded source text. Params: [`super::ExpandMacroParams`]; result:
+    /// [`super::ExpandMacroResult`].
+    pub const EXPAND_MACRO: &str = "expandMacro";
 }
 
 // --------------------------------------------------------------------------
@@ -223,6 +228,91 @@ pub struct CompileResult {
     /// The elaborated symbol table for all compiled files.
     pub ast: MimirAst,
     /// All diagnostics produced during compilation, flattened by file path.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+// --------------------------------------------------------------------------
+// `expandMacro` method
+// --------------------------------------------------------------------------
+
+/// Params for [`methods::EXPAND_MACRO`].
+///
+/// Carries the same preprocessor context as [`ElaborateParams`] (files,
+/// include dirs, defines, `single_unit`, `timescale`, `extra_args`) so the
+/// expansion sees exactly the macro state a compile would — critical for UVM,
+/// where the macros being expanded are defined in a header (`uvm_macros.svh`)
+/// included once near the top of the unit. Adds the cursor's file + position
+/// identifying which macro usage to expand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandMacroParams {
+    /// In-memory snapshot of every source file slang should see — same shape
+    /// and semantics as [`ElaborateParams::files`].
+    pub files: Vec<SourceFile>,
+
+    /// Directories searched for `` `include "..." ``.
+    #[serde(default)]
+    pub include_dirs: Vec<String>,
+
+    /// `+define+NAME[=VALUE]` macros to seed the preprocessor with.
+    #[serde(default)]
+    pub defines: Vec<MacroDefine>,
+
+    /// Long-tail libslang flags — see [`ElaborateParams::extra_args`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+
+    /// Single shared compilation unit — see [`ElaborateParams::single_unit`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_unit: bool,
+
+    /// Default timescale — see [`ElaborateParams::timescale`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timescale: Option<String>,
+
+    /// Path of the file whose macro usage we want expanded. Must match one of
+    /// the [`SourceFile::path`] strings in `files`.
+    pub target_path: String,
+
+    /// Cursor position (zero-based line, UTF-16 character) somewhere on the
+    /// macro usage to expand.
+    pub position: Position,
+}
+
+/// Result for [`methods::EXPAND_MACRO`].
+///
+/// `expanded_text` is the fully-recursive expansion of the macro usage. When
+/// the cursor isn't on a macro usage the sidecar returns
+/// [`ExpandMacroResult::found`] `= false` with the other fields at their
+/// defaults — the server turns that into a null LSP response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExpandMacroResult {
+    /// Whether a macro usage was found at the requested position.
+    #[serde(default)]
+    pub found: bool,
+
+    /// The fully-expanded source text. Empty when `found` is `false`, or when
+    /// the macro legitimately expands to nothing.
+    #[serde(default)]
+    pub expanded_text: String,
+
+    /// Name of the macro that was expanded (without the leading backtick),
+    /// e.g. `"uvm_component_utils_begin"`. Empty when `found` is `false`.
+    #[serde(default)]
+    pub macro_name: String,
+
+    /// Range of the macro usage in `target_path` that was expanded — the
+    /// editor can use this to anchor a hover or selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_range: Option<Range>,
+
+    /// Number of lines in `expanded_text`. Precomputed so the hover footer
+    /// can show "Expands to N lines" without the server re-counting.
+    #[serde(default)]
+    pub line_count: u32,
+
+    /// Diagnostics produced while preprocessing for the expansion (e.g. an
+    /// undefined nested macro). Usually empty.
+    #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -580,6 +670,103 @@ mod tests {
         assert!(r.target_type_str.is_none());
         assert!(r.target_params.is_empty());
         assert!(r.target_parent_class.is_none());
+    }
+
+    /// `ExpandMacroParams` round-trips, and the default context knobs
+    /// (`extra_args` / `single_unit` / `timescale`) are omitted from the
+    /// wire so an older sidecar never sees unknown fields.
+    #[test]
+    fn expand_macro_params_roundtrip_and_omits_defaults() {
+        let p = ExpandMacroParams {
+            files: vec![SourceFile {
+                path: "/proj/agent.sv".into(),
+                text: "`uvm_info(\"T\", \"hi\", UVM_LOW)".into(),
+                is_compilation_unit: true,
+            }],
+            include_dirs: vec!["/uvm/src".into()],
+            defines: vec![],
+            extra_args: vec![],
+            single_unit: false,
+            timescale: None,
+            target_path: "/proj/agent.sv".into(),
+            position: Position::new(0, 4),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("extra_args"), "default extra_args should be skipped: {s}");
+        assert!(!s.contains("single_unit"), "default single_unit should be skipped: {s}");
+        assert!(!s.contains("timescale"), "default timescale should be skipped: {s}");
+        assert!(s.contains("target_path"));
+        assert!(s.contains("position"));
+
+        let back: ExpandMacroParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_path, "/proj/agent.sv");
+        assert_eq!(back.position, Position::new(0, 4));
+        assert_eq!(back.include_dirs, vec!["/uvm/src".to_string()]);
+    }
+
+    /// `single_unit` and `timescale` survive the round-trip when set.
+    #[test]
+    fn expand_macro_params_carries_single_unit_and_timescale() {
+        let p = ExpandMacroParams {
+            files: vec![],
+            include_dirs: vec![],
+            defines: vec![],
+            extra_args: vec!["--allow-use-before-declare".into()],
+            single_unit: true,
+            timescale: Some("1ns/1ps".into()),
+            target_path: "/x.sv".into(),
+            position: Position::new(2, 1),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: ExpandMacroParams = serde_json::from_str(&s).unwrap();
+        assert!(back.single_unit);
+        assert_eq!(back.timescale.as_deref(), Some("1ns/1ps"));
+        assert_eq!(back.extra_args, vec!["--allow-use-before-declare".to_string()]);
+    }
+
+    /// A full `ExpandMacroResult` decodes intact from the wire shape the
+    /// sidecar emits on a hit.
+    #[test]
+    fn expand_macro_result_found_roundtrip() {
+        let payload = serde_json::json!({
+            "found": true,
+            "expanded_text": "function void build_phase();\n  super.build_phase();\nendfunction",
+            "macro_name": "uvm_component_utils_begin",
+            "usage_range": {"start": {"line": 10, "character": 2}, "end": {"line": 10, "character": 30}},
+            "line_count": 3,
+            "diagnostics": []
+        });
+        let r: ExpandMacroResult = serde_json::from_value(payload).expect("decode expand result");
+        assert!(r.found);
+        assert_eq!(r.macro_name, "uvm_component_utils_begin");
+        assert_eq!(r.line_count, 3);
+        assert!(r.expanded_text.contains("build_phase"));
+        let usage = r.usage_range.expect("usage_range present");
+        assert_eq!(usage.start.line, 10);
+
+        // Re-encode → decode to confirm stability.
+        let s = serde_json::to_string(&r).unwrap();
+        let back: ExpandMacroResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.macro_name, "uvm_component_utils_begin");
+    }
+
+    /// A "not on a macro" result decodes with `found = false` and empty
+    /// fields. The minimal wire form (just `{"found": false}`) must also
+    /// decode, since the sidecar skips empty/None fields.
+    #[test]
+    fn expand_macro_result_not_found_decodes_minimal() {
+        let r: ExpandMacroResult =
+            serde_json::from_str(r#"{"found": false}"#).expect("decode minimal");
+        assert!(!r.found);
+        assert!(r.expanded_text.is_empty());
+        assert!(r.macro_name.is_empty());
+        assert!(r.usage_range.is_none());
+        assert_eq!(r.line_count, 0);
+        assert!(r.diagnostics.is_empty());
+
+        // Default-constructed value is the same "not found" shape.
+        let d = ExpandMacroResult::default();
+        assert!(!d.found);
     }
 
     /// `Diagnostic` round-trips with a realistic-looking range.

@@ -19,6 +19,22 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "mimir.expandMacro",
+        "title": "Mimir: Expand Macro",
+        "category": "Mimir"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "mimir.expandMacro",
+          "when": "editorLangId == systemverilog || editorLangId == verilog",
+          "group": "navigation@99"
+        }
+      ]
+    },
     "languages": [
       {
         "id": "systemverilog",

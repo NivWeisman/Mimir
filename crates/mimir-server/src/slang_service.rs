@@ -20,7 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mimir_core::{Position as MPosition, Range as MRange};
-use mimir_slang::{Client as SlangClient, CompileResult, ElaborateParams, SourceFile};
+use mimir_slang::{
+    Client as SlangClient, CompileResult, ElaborateParams, ExpandMacroParams, ExpandMacroResult,
+    SourceFile,
+};
 use ropey::Rope;
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::{Position, Range};
@@ -279,6 +282,42 @@ impl SlangService {
         let slang = self.slang.read().await.clone()
             .expect("compile called without a configured sidecar");
         slang.compile(params).await
+    }
+
+    /// Assemble [`ExpandMacroParams`] for the macro usage at `position` in
+    /// `target_path`. Reuses the exact same file / include-dir / define
+    /// assembly as a compile (via [`Self::build_elaborate_params`]) so the
+    /// expansion sees identical preprocessor state — without that, a
+    /// `` `uvm_* `` macro defined in an earlier-included header would expand
+    /// differently (or not at all) than it elaborates.
+    ///
+    /// Returns `None` when slang isn't configured or no project is loaded.
+    pub(crate) async fn build_expand_macro_params(
+        &self,
+        target_path: String,
+        position: MPosition,
+    ) -> Option<ExpandMacroParams> {
+        let (ep, _urls) = self.build_elaborate_params().await?;
+        Some(ExpandMacroParams {
+            files: ep.files,
+            include_dirs: ep.include_dirs,
+            defines: ep.defines,
+            extra_args: ep.extra_args,
+            single_unit: ep.single_unit,
+            timescale: ep.timescale,
+            target_path,
+            position,
+        })
+    }
+
+    /// Forward an `expandMacro` request to the sidecar.
+    pub(crate) async fn expand_macro(&self, params: &ExpandMacroParams)
+    -> Result<ExpandMacroResult, mimir_slang::ClientError>
+    {
+        mimir_core::time_scope!("slang.expand_macro.service_total");
+        let slang = self.slang.read().await.clone()
+            .expect("expand_macro called without a configured sidecar");
+        slang.expand_macro(params).await
     }
 
 }

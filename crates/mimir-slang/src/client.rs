@@ -50,7 +50,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::protocol::{
-    methods, CompileResult, ElaborateParams, Request, Response, ResponseError,
+    methods, CompileResult, ElaborateParams, ExpandMacroParams, ExpandMacroResult, Request,
+    Response, ResponseError,
 };
 
 // --------------------------------------------------------------------------
@@ -311,6 +312,15 @@ where
         mimir_core::time_scope!("slang.compile.connection_total");
         self.request(methods::COMPILE, params).await
     }
+
+    /// Convenience wrapper for the [`methods::EXPAND_MACRO`] method.
+    pub async fn expand_macro(
+        &mut self,
+        params: &ExpandMacroParams,
+    ) -> Result<ExpandMacroResult, ConnectionError> {
+        mimir_core::time_scope!("slang.expand_macro.connection_total");
+        self.request(methods::EXPAND_MACRO, params).await
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -420,6 +430,25 @@ impl Client {
             self.connection.lock().await
         };
         Ok(conn.compile(params).await?)
+    }
+
+    /// Run an `expandMacro` request against the sidecar.
+    ///
+    /// Recursively expands the macro usage at `params.position` in
+    /// `params.target_path` and returns the expanded source text. Shares the
+    /// single connection mutex with [`Client::compile`], so a long background
+    /// elaborate will serialise this behind it (acceptable: expansion is a
+    /// user-initiated, on-demand action).
+    pub async fn expand_macro(
+        &self,
+        params: &ExpandMacroParams,
+    ) -> Result<ExpandMacroResult, ClientError> {
+        mimir_core::time_scope!("slang.expand_macro.client_total");
+        let mut conn = {
+            mimir_core::time_scope!("slang.expand_macro.client_lock_wait");
+            self.connection.lock().await
+        };
+        Ok(conn.expand_macro(params).await?)
     }
 
     /// Send the `shutdown` request, then wait for the child to exit.

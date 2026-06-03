@@ -836,6 +836,125 @@ fn make_input_edit(rope: &Rope, range: MRange, new_text: &str) -> Option<InputEd
 }
 
 // --------------------------------------------------------------------------
+// Inherent helpers used by the LanguageServer impl that aren't themselves
+// LSP requests (a trait impl can only hold trait methods).
+// --------------------------------------------------------------------------
+
+impl Backend {
+    /// Compute the base hover (symbol declaration / signature / built-in
+    /// docs). The `hover` trait method wraps this and appends a macro-
+    /// expansion footer when applicable. Kept as a separate method because
+    /// the wrapper needs a single result value, while this body has many
+    /// early returns across the slang / tree-sitter / builtin fallbacks.
+    async fn hover_impl(&self, params: &HoverParams) -> LspResult<Option<Hover>> {
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .clone();
+        let pos = params.text_document_position_params.position;
+        let target = MPosition::new(pos.line, pos.character);
+        let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
+
+        let Some((tree, index)) = self.cached_tree_and_index(&uri).await else {
+            debug!("hover: no cached parse for this URI");
+            return Ok(None);
+        };
+        let rope = {
+            let docs = self.documents.read().await;
+            match docs.get(&uri) {
+                Some(state) => Rope::from_str(&state.document.text()),
+                None => {
+                    debug!("hover: URI not in open-doc store");
+                    return Ok(None);
+                }
+            }
+        };
+
+        // AST path: use cached MimirAst for type info and docs.
+        if let Some(ast) = self.adapter.cached_ast().await {
+            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            if let Some(path) = file_path {
+                if let Some(hover) = ast_features::hover(&ast, &path, mimir_pos, &rope) {
+                    return Ok(Some(hover));
+                }
+            }
+        }
+
+        if let Some(hover) =
+            Box::pin(self.hover_via_tree_sitter(&uri, &tree, &rope, &index, target)).await
+        {
+            return Ok(Some(hover));
+        }
+
+        // Built-in SV method fallback: cursor on a method defined by the LRM
+        // (e.g. `push_back`, `rand_mode`, `len`) that the workspace index will
+        // never contain. Runs after the workspace lookup so user-defined methods
+        // with the same name always win.
+        if let Some(hover) = builtin_method_hover_at(&tree, &rope, target) {
+            return Ok(Some(hover));
+        }
+
+        // Final fallback: cursor on a reserved keyword or `$system_task`
+        // for which we have a static one-line LRM-grounded description
+        // (e.g. `always_ff`, `$display`). Runs after slang and the
+        // workspace-symbol lookup both miss so it never overrides
+        // user-defined symbols that happen to shadow a keyword.
+        let features = self.current_features().await;
+        if features.keyword_hover {
+            Ok(keyword_hover_at(&tree, &rope, target))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Handler for the custom `mimir/expandMacro` LSP request (registered in
+    /// `main.rs` via `LspService::build(...).custom_method(...)`).
+    ///
+    /// Recursively expands the macro usage under the cursor and returns its
+    /// expanded source text. Returns `Ok(None)` when slang isn't configured,
+    /// the cursor isn't on a macro usage, or the sidecar is unavailable —
+    /// the VS Code extension turns that into a friendly "not on a macro"
+    /// message.
+    pub(crate) async fn expand_macro(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> LspResult<Option<ExpandMacroResponse>> {
+        mimir_core::time_scope!("lsp.expand_macro");
+        let uri = params.text_document.uri;
+        let pos = params.position;
+        let target = MPosition::new(pos.line, pos.character);
+
+        let Some(target_path) =
+            uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned))
+        else {
+            return Ok(None);
+        };
+
+        let version = {
+            let docs = self.documents.read().await;
+            docs.get(&uri).map(|s| s.document.version())
+        }
+        .unwrap_or(i32::MIN);
+
+        let Some(eparams) =
+            self.slang.build_expand_macro_params(target_path, target).await
+        else {
+            return Ok(None); // slang not configured / no project
+        };
+
+        match self.adapter.expand_macro(&uri, version, target, &eparams).await {
+            Some(r) if r.found => Ok(Some(ExpandMacroResponse {
+                name: r.macro_name,
+                expansion: r.expanded_text,
+                line_count: r.line_count,
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // LanguageServer impl — wires LSP requests/notifications to our store.
 // --------------------------------------------------------------------------
 
@@ -2014,65 +2133,40 @@ impl LanguageServer for Backend {
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document_position_params.text_document.uri))]
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
         mimir_core::time_scope!("lsp.hover");
-        let uri = params
-            .text_document_position_params
-            .text_document
-            .uri
-            .clone();
+        // Base hover (symbol declaration / signature / keyword docs), then a
+        // macro-expansion footer when the cursor sits on a `` `macro `` usage
+        // and slang can expand it. The footer is gated by a cheap textual
+        // check so ordinary hovers never pay for a preprocessor round-trip.
+        let base = self.hover_impl(&params).await?;
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
-        let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
+        let uri = params.text_document_position_params.text_document.uri.clone();
 
-        let Some((tree, index)) = self.cached_tree_and_index(&uri).await else {
-            debug!("hover: no cached parse for this URI");
-            return Ok(None);
-        };
-        let rope = {
+        let (rope, version) = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
-                Some(state) => Rope::from_str(&state.document.text()),
-                None => {
-                    debug!("hover: URI not in open-doc store");
-                    return Ok(None);
-                }
+                Some(s) => (Rope::from_str(&s.document.text()), s.document.version()),
+                None => return Ok(base),
             }
         };
-
-        // AST path: use cached MimirAst for type info and docs.
-        if let Some(ast) = self.adapter.cached_ast().await {
-            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
-            if let Some(path) = file_path {
-                if let Some(hover) = ast_features::hover(&ast, &path, mimir_pos, &rope) {
-                    return Ok(Some(hover));
-                }
-            }
+        if !cursor_on_macro_usage(&rope, target) {
+            return Ok(base);
         }
-
-        if let Some(hover) =
-            Box::pin(self.hover_via_tree_sitter(&uri, &tree, &rope, &index, target)).await
-        {
-            return Ok(Some(hover));
-        }
-
-        // Built-in SV method fallback: cursor on a method defined by the LRM
-        // (e.g. `push_back`, `rand_mode`, `len`) that the workspace index will
-        // never contain. Runs after the workspace lookup so user-defined methods
-        // with the same name always win.
-        if let Some(hover) = builtin_method_hover_at(&tree, &rope, target) {
-            return Ok(Some(hover));
-        }
-
-        // Final fallback: cursor on a reserved keyword or `$system_task`
-        // for which we have a static one-line LRM-grounded description
-        // (e.g. `always_ff`, `$display`). Runs after slang and the
-        // workspace-symbol lookup both miss so it never overrides
-        // user-defined symbols that happen to shadow a keyword.
-        let features = self.current_features().await;
-        if features.keyword_hover {
-            Ok(keyword_hover_at(&tree, &rope, target))
-        } else {
-            Ok(None)
-        }
+        let Some(file_path) =
+            uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned))
+        else {
+            return Ok(base);
+        };
+        let Some(eparams) =
+            self.slang.build_expand_macro_params(file_path, target).await
+        else {
+            return Ok(base); // slang not configured / no project
+        };
+        let footer = match self.adapter.expand_macro(&uri, version, target, &eparams).await {
+            Some(r) if r.found => macro_footer_markdown(&r),
+            _ => return Ok(base),
+        };
+        Ok(Some(append_hover_footer(base, footer)))
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -3786,6 +3880,106 @@ fn hover_from_markdown(markdown: String) -> Hover {
             value: markdown,
         }),
         range: None,
+    }
+}
+
+// --------------------------------------------------------------------------
+// Macro-expansion: custom-request response + hover-footer helpers
+// --------------------------------------------------------------------------
+
+/// Response payload for the custom `mimir/expandMacro` request. Serialised
+/// camelCase so the VS Code extension reads `name` / `expansion` /
+/// `lineCount` directly.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExpandMacroResponse {
+    /// The expanded macro name (without the leading backtick).
+    pub name: String,
+    /// The fully-recursive expansion text.
+    pub expansion: String,
+    /// Number of lines in `expansion`.
+    pub line_count: u32,
+}
+
+/// Cheap textual gate: is the cursor sitting on a `` `macro `` usage? Used to
+/// avoid running the preprocessor on ordinary hovers — we only attempt a
+/// macro expansion when the identifier under the cursor is immediately
+/// preceded (after skipping the identifier's own characters leftward) by a
+/// backtick on the same line.
+fn cursor_on_macro_usage(rope: &Rope, pos: MPosition) -> bool {
+    if (pos.line as usize) >= rope.len_lines() {
+        return false;
+    }
+    let line = rope.line(pos.line as usize);
+
+    // Collect the line up to a generous bound and locate the cursor column
+    // in UTF-16 units (matching LSP coordinates).
+    let chars: Vec<char> = line.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    // Map the UTF-16 character offset to a char index.
+    let mut idx = 0usize;
+    let mut utf16 = 0u32;
+    for (i, c) in chars.iter().enumerate() {
+        if utf16 >= pos.character {
+            idx = i;
+            break;
+        }
+        utf16 += c.len_utf16() as u32;
+        idx = i + 1;
+    }
+    if idx > chars.len() {
+        return false;
+    }
+
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    // Walk left over identifier characters from the cursor.
+    let mut start = idx.min(chars.len());
+    while start > 0 && is_ident(chars[start - 1]) {
+        start -= 1;
+    }
+    // A macro usage is `<ident> preceded by a backtick.
+    start > 0 && chars[start - 1] == '`'
+}
+
+/// Build the hover footer markdown for an expansion result. Shows the line
+/// count, a short fenced preview (first few lines), and the command CTA.
+fn macro_footer_markdown(r: &mimir_slang::ExpandMacroResult) -> String {
+    const PREVIEW_LINES: usize = 6;
+    let total = r.line_count;
+    let preview: Vec<&str> = r.expanded_text.lines().take(PREVIEW_LINES).collect();
+    let truncated = (total as usize) > preview.len();
+    let mut body = preview.join("\n");
+    if truncated {
+        body.push_str("\n…");
+    }
+    format!(
+        "\n\n---\n\n▶ `` `{name} `` expands to **{total} line{plural}** — \
+         run **Mimir: Expand Macro** for the full expansion\n\n\
+         ```systemverilog\n{body}\n```",
+        name = r.macro_name,
+        plural = if total == 1 { "" } else { "s" },
+    )
+}
+
+/// Append the macro-expansion `footer` to an existing hover. When `base` is
+/// `None` (the base hover didn't resolve the macro — common for UVM macros
+/// the workspace index never indexed) a fresh markdown hover carrying just
+/// the footer is returned. When `base` is a markdown hover the footer is
+/// concatenated; otherwise the base is returned unchanged (we don't rewrite
+/// scalar/plaintext hovers).
+fn append_hover_footer(base: Option<Hover>, footer: String) -> Hover {
+    match base {
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }),
+            range,
+        }) => Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("{value}{footer}"),
+            }),
+            range,
+        },
+        Some(other) => other,
+        None => hover_from_markdown(footer.trim_start().to_string()),
     }
 }
 

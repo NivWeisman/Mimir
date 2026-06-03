@@ -87,7 +87,13 @@ async fn main() {
     // returns our `Backend`. The `Client` is how we send notifications back
     // to the editor (e.g. `publishDiagnostics`). We move the optional
     // slang client into the closure so it ends up owned by the `Backend`.
-    let (service, socket) = LspService::new(move |client| backend::Backend::new(client, slang));
+    // `build(...).custom_method(...)` registers the non-standard
+    // `mimir/expandMacro` request (rust-analyzer-style macro expansion)
+    // alongside the standard LSP surface. The VS Code extension sends it via
+    // `client.sendRequest("mimir/expandMacro", ...)`.
+    let (service, socket) = LspService::build(move |client| backend::Backend::new(client, slang))
+        .custom_method("mimir/expandMacro", backend::Backend::expand_macro)
+        .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 
     tracing::info!("mimir-server shutting down");

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -62,6 +63,7 @@
 #include <slang/text/SourceLocation.h>
 #include <slang/text/SourceManager.h>
 #include <slang/util/Bag.h>
+#include <slang/util/BumpAllocator.h>
 
 using json = nlohmann::json;
 
@@ -203,14 +205,22 @@ struct BuildCompilationResult {
 // `Compilation`) is the same pattern `elaborate` used pre-refactor; it
 // keeps unsaved buffer text reachable by `\`include` while not parsing
 // includee files standalone (which produces spurious diagnostics).
-static BuildCompilationResult build_compilation(const json& params) {
-    using namespace slang;
-    using namespace slang::ast;
-    using namespace slang::parsing;
-    using namespace slang::syntax;
+// Parsed preprocessor + compilation options for one request. Built once and
+// shared by `build_compilation` (which turns it into a `Compilation`) and
+// `handle_expand_macro` (which drives a bare `Preprocessor` with the same
+// option Bag). Keeping the option assembly in one place is load-bearing:
+// macro expansion MUST see the same defines / include paths / single-unit
+// state a compile sees, or `` `uvm_* `` macros defined in an earlier-included
+// header would expand differently (or not at all) than they elaborate.
+struct PreprocSetup {
+    slang::Bag options;                       // holds pp_opts + comp_opts
+    slang::ast::CompilationOptions comp_opts; // needed for the Compilation ctor
+    bool single_unit = false;
+};
 
-    BuildCompilationResult out;
-    out.sm = std::make_shared<SourceManager>();
+static PreprocSetup build_preproc_setup(const json& params) {
+    using namespace slang;
+    using namespace slang::parsing;
 
     // ── Step 1: baseline options from `extra_args` (parsed via slang's own
     //   Driver CLI parser so we don't catalog flags ourselves) ─────────────
@@ -272,11 +282,26 @@ static BuildCompilationResult build_compilation(const json& params) {
         }
     }
 
-    // ── Step 4: assemble the Bag and the Compilation ─────────────────────
     Bag options;
     options.set(pp_opts);
     options.set(comp_opts);
-    out.compilation = std::make_unique<Compilation>(comp_opts);
+    return PreprocSetup{std::move(options), comp_opts,
+                        params.value("single_unit", false)};
+}
+
+static BuildCompilationResult build_compilation(const json& params) {
+    using namespace slang;
+    using namespace slang::ast;
+    using namespace slang::parsing;
+    using namespace slang::syntax;
+
+    BuildCompilationResult out;
+    out.sm = std::make_shared<SourceManager>();
+
+    // Shared option assembly (extra_args → typed defines/include_dirs/timescale).
+    auto setup = build_preproc_setup(params);
+    Bag options = std::move(setup.options);
+    out.compilation = std::make_unique<Compilation>(setup.comp_opts);
 
     if (params.contains("files") && params["files"].is_array()) {
         struct PendingUnit {
@@ -1420,6 +1445,193 @@ static json handle_compile(const json& params) {
     return result;
 }
 
+// --- expandMacro handler -------------------------------------------------
+//
+// Recursively expand the macro usage under a cursor and return the expanded
+// source text. This is the verification analog of rust-analyzer's "Expand
+// macro recursively" — UVM code is unreadable without it.
+//
+// Algorithm: run slang's preprocessor over the same buffer sequence a compile
+// would (so `` `uvm_* `` macros defined in an earlier-included header are
+// visible), collecting the output token stream. A macro usage expands to a
+// *contiguous run* of tokens that all carry "macro locations" (slang marks
+// both macro-body and macro-argument tokens this way — verified against
+// `SourceManager::isMacroLocImpl`). For each such run we fold every token's
+// *outermost* expansion range (walked via `getExpansionRange` until it lands
+// in a real file buffer) into the run's bounds; for body tokens that range is
+// the whole `` `MACRO(...) `` invocation. We then pick the run whose bounds
+// cover the requested cursor position and concatenate its tokens' text.
+static json handle_expand_macro(const json& params) {
+    using namespace slang;
+    using namespace slang::parsing;
+
+    json result;
+    result["found"] = false;
+
+    const std::string target_path = params.value("target_path", std::string{});
+    if (target_path.empty()) return result;
+
+    uint32_t want_line = 0, want_char = 0;
+    if (params.contains("position") && params["position"].is_object()) {
+        want_line = params["position"].value("line", 0u);
+        want_char = params["position"].value("character", 0u);
+    }
+
+    auto sm = std::make_shared<SourceManager>();
+    auto setup = build_preproc_setup(params);
+
+    // Load every file into the SourceManager. Track the ordered list of
+    // compilation-unit buffers (for single-unit feeding) and the target
+    // buffer (the file whose macro we're expanding).
+    std::vector<SourceBuffer> cu_buffers;
+    std::optional<SourceBuffer> target_buffer;
+    if (params.contains("files") && params["files"].is_array()) {
+        for (const auto& f : params["files"]) {
+            const auto path = f.value("path", std::string{});
+            const auto text = f.value("text", std::string{});
+            const bool is_cu = f.value("is_compilation_unit", true);
+            SourceBuffer buffer;
+            try {
+                buffer = sm->assignText(path, text);
+            } catch (const std::exception&) {
+                continue; // duplicate path — already loaded via `include
+            }
+            if (path == target_path) target_buffer = buffer;
+            if (is_cu) cu_buffers.push_back(buffer);
+        }
+    }
+    if (!target_buffer) return result; // target not among the sent files
+    const BufferID target_bid = target_buffer->id;
+
+    // Which buffers to drive the preprocessor over:
+    //   * single_unit → all CU buffers in order (defines leak forward, so a
+    //     macro defined in file[0] is visible when expanding in file[5]);
+    //   * per-file    → just the target buffer (its own `` `include ``s pull
+    //     in whatever macros it needs).
+    std::vector<SourceBuffer> feed;
+    if (setup.single_unit && !cu_buffers.empty()) {
+        feed = cu_buffers;
+    } else {
+        feed.push_back(*target_buffer);
+    }
+
+    BumpAllocator alloc;
+    Diagnostics diags;
+    Preprocessor pp(*sm, alloc, diags, setup.options);
+    // pushSource is a stack — push in reverse so processing is in file order
+    // (mirrors `SyntaxTree::create`).
+    for (auto it = feed.rbegin(); it != feed.rend(); ++it) pp.pushSource(*it);
+
+    // One in-progress run of consecutive macro-loc tokens.
+    struct Run {
+        bool active = false;
+        bool has_target = false;
+        // LSP bounds of the run's mapped file range (target buffer only).
+        uint32_t lo_line = 0, lo_char = 0, hi_line = 0, hi_char = 0;
+        // SourceLocations for the usage_range output.
+        SourceLocation min_start;
+        SourceLocation max_end;
+        std::string text;
+        std::string macro_name;
+    };
+    std::vector<Run> runs;
+    Run cur;
+
+    auto close_run = [&]() {
+        if (cur.active && cur.has_target) runs.push_back(std::move(cur));
+        cur = Run{};
+    };
+
+    auto lsp_le = [](uint32_t l1, uint32_t c1, uint32_t l2, uint32_t c2) {
+        return l1 < l2 || (l1 == l2 && c1 <= c2);
+    };
+
+    while (true) {
+        Token tok = pp.next();
+        if (tok.kind == TokenKind::EndOfFile) break;
+        const SourceLocation loc = tok.location();
+        if (!loc.valid() || !sm->isMacroLoc(loc)) {
+            close_run();
+            continue;
+        }
+
+        if (!cur.active) cur.active = true;
+
+        // Walk to the outermost macro location (for the name) and the
+        // outermost *file* expansion range (for the bounds).
+        SourceLocation macro_loc = loc;
+        SourceRange exp = sm->getExpansionRange(loc);
+        while (sm->isMacroLoc(exp.start())) {
+            macro_loc = exp.start();
+            exp = sm->getExpansionRange(exp.start());
+        }
+
+        if (exp.start().buffer() == target_bid) {
+            LspPos s = to_lsp_pos(*sm, exp.start());
+            LspPos e = to_lsp_pos(*sm, exp.end());
+            if (!cur.has_target) {
+                cur.has_target = true;
+                cur.lo_line = s.line; cur.lo_char = s.character;
+                cur.hi_line = e.line; cur.hi_char = e.character;
+                cur.min_start = exp.start();
+                cur.max_end = exp.end();
+            } else {
+                if (lsp_le(s.line, s.character, cur.lo_line, cur.lo_char)) {
+                    cur.lo_line = s.line; cur.lo_char = s.character;
+                    cur.min_start = exp.start();
+                }
+                if (lsp_le(cur.hi_line, cur.hi_char, e.line, e.character)) {
+                    cur.hi_line = e.line; cur.hi_char = e.character;
+                    cur.max_end = exp.end();
+                }
+            }
+            if (cur.macro_name.empty()) {
+                std::string_view name = sm->getMacroName(macro_loc);
+                if (!name.empty()) {
+                    if (name.front() == '`') name.remove_prefix(1);
+                    cur.macro_name = std::string(name);
+                }
+            }
+        }
+
+        // toString() reproduces each token's leading trivia, so the
+        // concatenation preserves the macro body's own line breaks and
+        // indentation — important for readable UVM expansions.
+        cur.text += tok.toString();
+    }
+    close_run();
+
+    // Pick the run whose bounds contain the requested cursor position.
+    const Run* best = nullptr;
+    for (const auto& r : runs) {
+        const bool after_start = lsp_le(r.lo_line, r.lo_char, want_line, want_char);
+        const bool before_end  = lsp_le(want_line, want_char, r.hi_line, r.hi_char);
+        if (after_start && before_end) { best = &r; break; }
+    }
+    if (best == nullptr) return result;
+
+    // Trim surrounding whitespace the macro body's trivia introduced.
+    std::string text = best->text;
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    text.erase(text.begin(),
+               std::find_if(text.begin(), text.end(), not_space));
+    text.erase(std::find_if(text.rbegin(), text.rend(), not_space).base(),
+               text.end());
+
+    uint32_t line_count = text.empty()
+        ? 0
+        : 1 + static_cast<uint32_t>(std::count(text.begin(), text.end(), '\n'));
+
+    result["found"]         = true;
+    result["expanded_text"] = std::move(text);
+    result["macro_name"]    = best->macro_name;
+    result["usage_range"]   = make_mimir_range(
+        *sm, SourceRange{best->min_start, best->max_end});
+    result["line_count"]    = line_count;
+    result["diagnostics"]   = json::array();
+    return result;
+}
+
 // --- main loop -----------------------------------------------------------
 
 int main() {
@@ -1448,6 +1660,8 @@ int main() {
         try {
             if (method == "compile") {
                 resp["result"] = handle_compile(req.value("params", json::object()));
+            } else if (method == "expandMacro") {
+                resp["result"] = handle_expand_macro(req.value("params", json::object()));
             } else if (method == "shutdown") {
                 // Acknowledge, flush, exit. Keeps the client from seeing
                 // a "Closed" before its shutdown response lands.
