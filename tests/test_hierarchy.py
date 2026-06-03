@@ -408,6 +408,26 @@ class TypeHierarchyTest(unittest.TestCase):
             f"expected empty subtypes for leaf class 'derived', got {result}",
         )
 
+    # --- capability advertisement ---
+
+    def test_capability_registered_dynamically(self) -> None:
+        """The server advertises type hierarchy via
+        ``client/registerCapability`` (lsp-types 0.94.1 has no static
+        ``type_hierarchy_provider`` field, so dynamic registration is what
+        makes VS Code show the "Show Type Hierarchy" entry).
+
+        The registration is sent during ``initialized`` — captured by the
+        client during the setup handshake/diagnostics pump or pumped here.
+        """
+        found = self.lsp.wait_for_registration(
+            "textDocument/prepareTypeHierarchy", timeout=3.0
+        )
+        self.assertTrue(
+            found,
+            "server never registered textDocument/prepareTypeHierarchy via "
+            "client/registerCapability",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

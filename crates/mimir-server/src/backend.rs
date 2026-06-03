@@ -1222,12 +1222,14 @@ impl LanguageServer for Backend {
                 // every change — we don't yet implement the pull-based
                 // `textDocument/diagnostic` request from LSP 3.17.
                 //
-                // typeHierarchyProvider: lsp-types 0.95.1 omits this field (LSP
-                // 3.17 gap). Placed in `experimental` as a workaround; VS Code
-                // reads `typeHierarchyProvider` from the top-level capabilities
-                // object and will not see the value here until lsp-types gains
-                // the typed field — move it out of experimental at that point.
-                experimental: Some(serde_json::json!({"typeHierarchyProvider": true})),
+                // typeHierarchyProvider: lsp-types 0.94.1 (pinned via
+                // tower-lsp 0.20) has no `type_hierarchy_provider` field on
+                // `ServerCapabilities` — it arrived in lsp-types 0.95. Rather
+                // than smuggle it through `experimental` (which VS Code's
+                // language client does not read), we advertise the capability
+                // via `client/registerCapability` in `initialized`. Move it
+                // back to a static field here once tower-lsp/lsp-types is
+                // bumped past the gap.
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -1269,6 +1271,44 @@ impl LanguageServer for Backend {
             warn!(
                 error = %e,
                 "client refused didChangeWatchedFiles registration; external file edits won't reflect until restart",
+            );
+        }
+
+        // Dynamically register `textDocument/prepareTypeHierarchy`. The static
+        // `type_hierarchy_provider` capability field doesn't exist in the
+        // pinned lsp-types 0.94.1 (see the comment in `initialize`), and the
+        // `experimental` object VS Code ignores — so dynamic registration is
+        // the only way to surface the "Show Type Hierarchy" entry without a
+        // tower-lsp bump. The document selector scopes it to our languages.
+        let type_hierarchy_registration = Registration {
+            id: "mimir-type-hierarchy".into(),
+            method: "textDocument/prepareTypeHierarchy".into(),
+            register_options: serde_json::to_value(TypeHierarchyRegistrationOptions {
+                text_document_registration_options: TextDocumentRegistrationOptions {
+                    document_selector: Some(vec![
+                        DocumentFilter {
+                            language: Some("systemverilog".into()),
+                            scheme: Some("file".into()),
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some("verilog".into()),
+                            scheme: Some("file".into()),
+                            pattern: None,
+                        },
+                    ]),
+                },
+                type_hierarchy_options: TypeHierarchyOptions {
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                },
+                static_registration_options: StaticRegistrationOptions::default(),
+            })
+            .ok(),
+        };
+        if let Err(e) = self.client.register_capability(vec![type_hierarchy_registration]).await {
+            warn!(
+                error = %e,
+                "client refused typeHierarchy registration; \"Show Type Hierarchy\" won't appear until restart",
             );
         }
     }

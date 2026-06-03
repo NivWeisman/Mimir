@@ -74,6 +74,11 @@ class MimirLspClient:
         )
         self._next_id = 1
         self._notifications: list[tuple[str, dict]] = []
+        # Server-originated requests (e.g. `client/registerCapability`),
+        # captured as (method, params). We reply to each with a success
+        # result so the server's `register_capability().await` completes
+        # rather than hanging on a reply that never arrives.
+        self._server_requests: list[tuple[str, dict]] = []
         self._stderr_lines: list[str] = []
 
         # Drain stderr in a background thread — otherwise debug logs back
@@ -184,18 +189,66 @@ class MimirLspClient:
                     f"timed out waiting for response to {method!r} (id={msg_id})"
                 )
             msg = self._recv(timeout=remaining)
-            if msg.get("id") == msg_id:
+            if msg.get("id") == msg_id and "method" not in msg:
                 if "error" in msg:
                     raise LspError(f"{method} -> {msg['error']}")
                 return msg.get("result")
-            # Anything else is a server-originated notification; queue it.
-            if "method" in msg and "id" not in msg:
-                self._notifications.append((msg["method"], msg.get("params", {})))
-            # Responses to other requests shouldn't exist for this synchronous
-            # client; if they do, drop them.
+            # Anything else is server-originated; dispatch it (queues
+            # notifications, replies to + records requests).
+            self._handle_incoming(msg)
 
     def notify(self, method: str, params: Any) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _handle_incoming(self, msg: dict) -> None:
+        """Dispatch a server-originated message.
+
+        Notifications (method, no id) are queued; requests (method + id)
+        are recorded and acknowledged with a success result so the
+        server's request future resolves. Plain responses are dropped.
+        """
+        if "method" not in msg:
+            return
+        if "id" in msg:
+            self._server_requests.append((msg["method"], msg.get("params", {})))
+            self._send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+        else:
+            self._notifications.append((msg["method"], msg.get("params", {})))
+
+    def collected_server_requests(self, method: str | None = None) -> list[dict]:
+        if method is None:
+            return [p for _, p in self._server_requests]
+        return [p for m, p in self._server_requests if m == method]
+
+    def wait_for_registration(self, method: str, timeout: float = 3.0) -> bool:
+        """Block until the server sends a ``client/registerCapability``
+        whose registrations include ``method`` (e.g.
+        ``textDocument/prepareTypeHierarchy``), or timeout.
+
+        Searches already-captured requests first, then pumps the stream.
+        The server emits several separate registration requests, so we
+        match on the inner registration method, not just the outer
+        ``client/registerCapability`` envelope.
+        """
+        def _found() -> bool:
+            for p in self.collected_server_requests("client/registerCapability"):
+                if any(r.get("method") == method
+                       for r in p.get("registrations", [])):
+                    return True
+            return False
+
+        if _found():
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                msg = self._recv(timeout=deadline - time.monotonic())
+            except TimeoutError:
+                return False
+            self._handle_incoming(msg)
+            if _found():
+                return True
+        return False
 
     def collected_notifications(self, method: str | None = None) -> list[dict]:
         if method is None:
@@ -228,10 +281,9 @@ class MimirLspClient:
                 msg = self._recv(timeout=deadline - time.monotonic())
             except TimeoutError:
                 return None
-            if "method" in msg and "id" not in msg:
-                self._notifications.append((msg["method"], msg.get("params", {})))
-                if msg["method"] == method:
-                    return msg.get("params", {})
+            self._handle_incoming(msg)
+            if "method" in msg and "id" not in msg and msg["method"] == method:
+                return msg.get("params", {})
         return None
 
     def wait_for_fresh_diagnostics(
@@ -254,9 +306,9 @@ class MimirLspClient:
                 msg = self._recv(timeout=deadline - time.monotonic())
             except TimeoutError:
                 return None
+            self._handle_incoming(msg)
             if "method" in msg and "id" not in msg:
                 params = msg.get("params", {})
-                self._notifications.append((msg["method"], params))
                 if (msg["method"] == "textDocument/publishDiagnostics"
                         and params.get("uri") == uri):
                     return params
