@@ -353,7 +353,30 @@ extra_args   = ["--allow-use-before-declare"]
 # "name+type" — name and type:              a: int
 # Macro hints always show the parameter name regardless of this setting.
 method_hint  = "name"
+
+[diagnostics]
+# Quiet diagnostics for vendored code you can't (and won't) fix — UVM, IP,
+# generated files — without losing them. Patterns are matched as plain
+# SUBSTRINGS of each diagnostic's file path (not globs): "uvm-1.2" matches
+# every file whose path contains "uvm-1.2".
+#
+# Files matching `demote_paths` keep their diagnostics, but capped at
+# `demote_severity` — so a UVM elaboration error shows up as a faint hint
+# instead of a red error drowning out your own code in the Problems panel.
+demote_paths    = ["uvm-1.2"]
+demote_severity = "hint"     # error | warning | information | hint (default: hint)
+
+# Files matching `ignore_paths` have their diagnostics dropped entirely.
+# Takes precedence over `demote_paths` when a path matches both.
+ignore_paths    = []
 ```
+
+The `[diagnostics]` policy applies to **slang elaboration diagnostics** (the
+cross-file flood you get when a `` `include ``d UVM header elaborates with
+warnings). It's evaluated at publish time against the slang-reported file
+path, so it works on transitively-included files you never opened. An empty
+or omitted `[diagnostics]` table is a no-op — every diagnostic is published
+unchanged.
 
 Inline `files`, `include_dirs`, and `defines` are merged with whatever the
 filelist pulls in — inline values come first, filelist values after.

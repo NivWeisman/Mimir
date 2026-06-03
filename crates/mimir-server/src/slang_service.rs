@@ -149,6 +149,19 @@ impl SlangService {
             .unwrap_or_default()
     }
 
+    /// Return the project's path-based diagnostic policy (demote / ignore by
+    /// path). A no-op default when no project / no `[diagnostics]` table.
+    pub(crate) async fn current_diagnostic_policy(
+        &self,
+    ) -> crate::diag_policy::DiagnosticPolicy {
+        self.project
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.diagnostics.clone())
+            .unwrap_or_default()
+    }
+
     /// Return the project's `` `include `` search directories, in order.
     ///
     /// Used by `textDocument/documentLink` to resolve `` `include "..." ``
@@ -594,6 +607,7 @@ mod tests {
             slang_extra_args: vec![],
             single_unit: false,
             timescale: None,
+            diagnostics: crate::diag_policy::DiagnosticPolicy::default(),
         }
     }
 

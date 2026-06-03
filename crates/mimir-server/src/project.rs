@@ -161,6 +161,56 @@ pub struct ProjectConfig {
     /// ```
     #[serde(default)]
     pub inlay_hints: InlayHintsConfig,
+
+    /// Path-based diagnostic demote / ignore rules. Lets a workspace quiet
+    /// diagnostics for vendored code it can't fix (UVM, third-party IP)
+    /// without losing them entirely.
+    ///
+    /// ```toml
+    /// [diagnostics]
+    /// demote_paths    = ["uvm-1.2"]   # substring-match the file path
+    /// demote_severity = "hint"        # cap matching diags at this severity
+    /// ignore_paths    = []            # drop matching diags entirely
+    /// ```
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
+}
+
+/// `[diagnostics]` section of `.mimir.toml`. Controls per-path demote/ignore
+/// of slang elaboration diagnostics — see [`crate::diag_policy`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsConfig {
+    /// File paths (matched as substrings) whose diagnostics are capped at
+    /// [`Self::demote_severity`]. E.g. `["uvm-1.2"]` quiets the whole UVM
+    /// library.
+    #[serde(default)]
+    pub demote_paths: Vec<String>,
+
+    /// Severity floor applied to files matching [`Self::demote_paths`].
+    /// One of `error` / `warning` / `information` / `hint` (default `hint`).
+    /// An unrecognised value logs a warning and falls back to `hint`.
+    #[serde(default = "default_demote_severity")]
+    pub demote_severity: String,
+
+    /// File paths (matched as substrings) whose diagnostics are dropped
+    /// entirely. Takes precedence over `demote_paths`.
+    #[serde(default)]
+    pub ignore_paths: Vec<String>,
+}
+
+fn default_demote_severity() -> String {
+    "hint".to_string()
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            demote_paths: Vec::new(),
+            demote_severity: default_demote_severity(),
+            ignore_paths: Vec::new(),
+        }
+    }
 }
 
 /// `[features]` section of `.mimir.toml`. Each field gates one
@@ -555,6 +605,10 @@ pub struct ResolvedProject {
     /// Default timescale string forwarded to the sidecar (see
     /// [`SlangConfig::timescale`]). `None` when the project doesn't set one.
     pub timescale: Option<String>,
+    /// Path-based diagnostic demote/ignore policy (from `[diagnostics]` in
+    /// `.mimir.toml`). Applied to slang diagnostics at publish time. The
+    /// default is a no-op (publish everything unchanged).
+    pub diagnostics: crate::diag_policy::DiagnosticPolicy,
 }
 
 impl ResolvedProject {
@@ -681,6 +735,11 @@ impl ResolvedProject {
             slang_extra_args: cfg.slang.extra_args,
             single_unit: cfg.slang.single_unit,
             timescale: cfg.slang.timescale,
+            diagnostics: crate::diag_policy::DiagnosticPolicy::from_config(
+                cfg.diagnostics.demote_paths,
+                &cfg.diagnostics.demote_severity,
+                cfg.diagnostics.ignore_paths,
+            ),
         })
     }
 }
@@ -817,6 +876,46 @@ mod tests {
         let cfg2: ProjectConfig = toml::from_str("[slang]\n").unwrap();
         assert!(!cfg2.slang.single_unit);
         assert!(cfg2.slang.timescale.is_none());
+    }
+
+    /// `[diagnostics]` decodes its fields, and the resolved policy demotes a
+    /// matching path while leaving others alone.
+    #[test]
+    fn project_config_diagnostics_section_decodes_and_resolves() {
+        use crate::diag_policy::DiagAction;
+        use mimir_ast::DiagSeverity;
+
+        let toml_text = r#"
+            [diagnostics]
+            demote_paths    = ["uvm-1.2", "vendor/"]
+            demote_severity = "hint"
+            ignore_paths    = ["generated/"]
+        "#;
+        let cfg: ProjectConfig = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.diagnostics.demote_paths, vec!["uvm-1.2", "vendor/"]);
+        assert_eq!(cfg.diagnostics.demote_severity, "hint");
+        assert_eq!(cfg.diagnostics.ignore_paths, vec!["generated/"]);
+
+        let policy = crate::diag_policy::DiagnosticPolicy::from_config(
+            cfg.diagnostics.demote_paths,
+            &cfg.diagnostics.demote_severity,
+            cfg.diagnostics.ignore_paths,
+        );
+        assert!(matches!(
+            policy.action_for("/x/uvm-1.2/src/uvm_pkg.sv"),
+            DiagAction::DemoteFloor(DiagSeverity::Hint)
+        ));
+        assert_eq!(policy.action_for("/x/generated/a.sv"), DiagAction::Drop);
+        assert_eq!(policy.action_for("/x/rtl/my_dut.sv"), DiagAction::Keep);
+    }
+
+    /// An omitted `[diagnostics]` table decodes to the no-op default.
+    #[test]
+    fn project_config_diagnostics_defaults_to_noop() {
+        let cfg: ProjectConfig = toml::from_str("").unwrap();
+        assert!(cfg.diagnostics.demote_paths.is_empty());
+        assert!(cfg.diagnostics.ignore_paths.is_empty());
+        assert_eq!(cfg.diagnostics.demote_severity, "hint");
     }
 
     /// Unknown keys in `.mimir.toml` are an error, not silently ignored —

@@ -22,6 +22,7 @@ mod ast_features;
 mod backend;
 mod chain_resolve;
 mod completion_score;
+mod diag_policy;
 mod diagnostics;
 mod elaborate_service;
 mod filelist;

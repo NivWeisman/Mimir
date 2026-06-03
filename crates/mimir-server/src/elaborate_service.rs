@@ -37,6 +37,7 @@ use tower_lsp::lsp_types::{Diagnostic, Url};
 use tower_lsp::Client;
 use tracing::{debug, info, warn};
 
+use crate::diag_policy::{demoted_severity, DiagAction, DiagnosticPolicy};
 use crate::diagnostics::mimir_diag_to_lsp;
 use crate::slang_adapter::SlangAdapter;
 use crate::slang_service::{path_to_url, SlangService};
@@ -186,6 +187,7 @@ impl ElaborateService {
                         .map(|e| e.symbol.name.clone())
                         .collect()
                 };
+                let policy = adapter.slang().current_diagnostic_policy().await;
                 {
                     mimir_core::time_scope!("elaborate.publish_diagnostics");
                     publish_slang_result(
@@ -194,6 +196,7 @@ impl ElaborateService {
                         outcome.diagnostics,
                         &published,
                         &known_macros,
+                        &policy,
                     )
                     .await;
                 }
@@ -249,9 +252,11 @@ async fn publish_slang_result(
     diagnostics: Vec<(String, MimirDiag)>,
     slang_published: &Arc<RwLock<HashSet<Url>>>,
     known_macros: &HashSet<String>,
+    policy: &DiagnosticPolicy,
 ) {
     let prev_snapshot = slang_published.read().await.clone();
-    let plan = plan_slang_publishes(files_in_request, diagnostics, &prev_snapshot, known_macros);
+    let plan =
+        plan_slang_publishes(files_in_request, diagnostics, &prev_snapshot, known_macros, policy);
 
     for (url, diags) in &plan.publishes {
         lsp_client
@@ -289,11 +294,22 @@ fn plan_slang_publishes(
     diagnostics: Vec<(String, MimirDiag)>,
     previous_published: &HashSet<Url>,
     known_macros: &HashSet<String>,
+    policy: &DiagnosticPolicy,
 ) -> SlangPublishPlan {
     let mut by_url: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
-    for (path, d) in diagnostics {
+    for (path, mut d) in diagnostics {
         if suppressed_unknown_directive(&d, known_macros) {
             continue;
+        }
+        // Path-based demote / ignore (`[diagnostics]` in `.mimir.toml`): quiet
+        // diagnostics for vendored code (UVM, third-party IP) the user can't
+        // fix, without losing them. `path` is the slang-reported file path.
+        match policy.action_for(&path) {
+            DiagAction::Drop => continue,
+            DiagAction::DemoteFloor(floor) => {
+                d.severity = demoted_severity(d.severity, floor);
+            }
+            DiagAction::Keep => {}
         }
         let Some(url) = path_to_url(&path) else {
             warn!(path = %path, "could not map slang path back to a URL; dropping");
@@ -411,7 +427,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let url_b = Url::parse("file:///proj/b.sv").unwrap();
         let diags = vec![mimir_diag_at("/proj/a.sv", "X")];
-        let plan = plan_slang_publishes(&[url_a.clone(), url_b.clone()], diags, &HashSet::new(), &HashSet::new());
+        let plan = plan_slang_publishes(&[url_a.clone(), url_b.clone()], diags, &HashSet::new(), &HashSet::new(), &DiagnosticPolicy::default());
 
         assert_eq!(plan.publishes.len(), 2);
         let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
@@ -430,7 +446,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let prev = HashSet::from([url_dropped.clone()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev, &HashSet::new());
+        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev, &HashSet::new(), &DiagnosticPolicy::default());
 
         assert_eq!(plan.publishes.len(), 2);
         assert!(plan
@@ -451,7 +467,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let prev = HashSet::from([url_a.clone()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev, &HashSet::new());
+        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev, &HashSet::new(), &DiagnosticPolicy::default());
 
         assert_eq!(plan.publishes.len(), 1);
         assert!(plan.publishes[0].1.is_empty());
@@ -464,7 +480,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let diags = vec![mimir_diag_at("/proj/inc/uvm.svh", "X")];
 
-        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &HashSet::new());
+        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &HashSet::new(), &DiagnosticPolicy::default());
 
         assert_eq!(plan.publishes.len(), 2);
         let inc_url = Url::parse("file:///proj/inc/uvm.svh").unwrap();
@@ -497,7 +513,7 @@ mod tests {
         let diags = vec![unknown_directive_diag("/proj/a.sv", "uvm_field_utils_begin")];
         let known = HashSet::from(["uvm_field_utils_begin".to_string()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &known);
+        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &known, &DiagnosticPolicy::default());
 
         let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
         assert!(a_pub.1.is_empty(), "diagnostic should be suppressed");
@@ -511,7 +527,7 @@ mod tests {
         let diags = vec![unknown_directive_diag("/proj/a.sv", "truly_undefined_macro")];
         let known = HashSet::from(["uvm_field_utils_begin".to_string()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &known);
+        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &known, &DiagnosticPolicy::default());
 
         let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
         assert_eq!(a_pub.1.len(), 1, "unrecognized macro diagnostic should pass through");
