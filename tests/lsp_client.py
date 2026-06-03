@@ -286,6 +286,35 @@ class MimirLspClient:
                 return msg.get("params", {})
         return None
 
+    def wait_for_log(self, needle: str, timeout: float = 20.0) -> bool:
+        """Block until ``needle`` appears in the server's stderr, draining
+        stdout meanwhile so a full pipe can't stall the server.
+
+        The server publishes diagnostics (a stdout write) *before* it emits
+        some log markers; if we only polled stderr without reading stdout, a
+        large notification could fill the pipe, block the publish, and the
+        marker would never appear. Returns ``False`` on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        fd = self._proc.stdout.fileno()
+        while needle not in self.stderr_text:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Only enter `_recv` once a frame is actually arriving, then let
+            # it read the *whole* frame (generous timeout). Calling `_recv`
+            # with a tiny timeout risks interrupting it mid-header — the
+            # bytes it already consumed would be lost and the next read would
+            # desync the stream ("missing Content-Length").
+            ready, _, _ = select.select([fd], [], [], min(0.1, remaining))
+            if ready:
+                try:
+                    msg = self._recv(timeout=max(remaining, 5.0))
+                    self._handle_incoming(msg)
+                except TimeoutError:
+                    pass
+        return needle in self.stderr_text
+
     def wait_for_fresh_diagnostics(
         self, uri: str, timeout: float = 8.0
     ) -> dict | None:

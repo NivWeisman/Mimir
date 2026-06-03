@@ -40,6 +40,15 @@ def _wait_for_first_parse(lsp: MimirLspClient, settle_ms: int = 250) -> None:
     assert diag is not None, "server never published initial diagnostics"
 
 
+# Marker the server logs once the first slang elaborate finishes and the
+# AST / reference map are cached. Emitted by `ElaborateService` in
+# crates/mimir-server/src/elaborate_service.rs (the `info!` on the first
+# successful compile). Slang-dependent tests — e.g. cross-package
+# scoped-method hover — race this: until the reference map is cached the
+# ref-first hover path has nothing to resolve and returns None.
+_SLANG_INDEXED_MARKER = "indexed by startup slang compile"
+
+
 class ApbMonitorTest(unittest.TestCase):
     """All tests share one server instance — saves ~200ms per test on
     initialize.
@@ -49,12 +58,19 @@ class ApbMonitorTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         if not APB_MONITOR.exists():
             raise unittest.SkipTest(f"example not found: {APB_MONITOR}")
-        cls.lsp = MimirLspClient()
+        # `log_to_stderr=True` flips RUST_LOG to mimir=debug so we can
+        # detect when slang's first elaborate finishes (see below).
+        cls.lsp = MimirLspClient(log_to_stderr=True)
         cls.lsp.initialize(workspace_root=APB_DIR)
         cls.uri = file_uri(APB_MONITOR)
         cls.text = read_text(APB_MONITOR)
         cls.lsp.did_open(cls.uri, cls.text)
         _wait_for_first_parse(cls.lsp)
+        # Block until slang's first elaborate has cached the AST / reference
+        # map, so slang-dependent tests don't race it. Records readiness so
+        # those tests skip cleanly on a slang-less checkout instead of
+        # flaking. 30s is generous: a cold UVM elaborate is a few seconds.
+        cls.slang_ready = cls.lsp.wait_for_log(_SLANG_INDEXED_MARKER, timeout=30.0)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -310,7 +326,13 @@ class ApbMonitorTest(unittest.TestCase):
         params. (Previously XFAIL because duplicate per-instance refs at
         this position could win the post-hoc dedup with incomplete target
         info; the sidecar's canonical-body visit dedup now emits a single
-        ref from the canonical specialization with full signature data.)"""
+        ref from the canonical specialization with full signature data.)
+
+        Requires slang: the resolution comes purely from the reference map,
+        with no tree-sitter fallback. `setUpClass` waits for the elaborate
+        to finish; if no sidecar is configured we skip rather than fail."""
+        if not self.slang_ready:
+            self.skipTest("slang sidecar not available; reference map empty")
         # Line 56 raw: `         if (!uvm_config_db#(apb_vif)::get(this, "", "vif", tmp)) begin`
         # `get` starts at the position right after `::`.
         result = self._hover(55, 41)
