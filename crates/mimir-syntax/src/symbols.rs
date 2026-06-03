@@ -195,6 +195,16 @@ fn symbol_for(
     }
     let name_node = name_node_of(node)?;
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
+    // Don't index forward declarations — `typedef class Foo;`,
+    // `typedef interface class Foo;`, or the bare `typedef Foo;`. They
+    // announce that a name will be a type but carry none of the
+    // definition; the real `class Foo … endclass` declaration does. If we
+    // indexed the forward decl too, a name lookup (hover, goto, references)
+    // could return it and shadow the real class — surfacing
+    // "typedef class Foo;" instead of "class Foo extends Bar".
+    if matches!(kind, SymbolKind::Typedef) && is_forward_typedef(node, source, &name) {
+        return None;
+    }
     let params = extract_callable_params(node, source);
     let parent_class_name = if matches!(kind, SymbolKind::Class) {
         extract_class_extends_name(node, source)
@@ -221,6 +231,30 @@ fn symbol_for(
         return_type,
         decl_type,
     })
+}
+
+/// True when `node` is a *forward* type declaration rather than a real
+/// alias: `typedef class Foo;`, `typedef interface class Foo;`, or the
+/// bare `typedef Foo;`. A real alias (`typedef logic [31:0] addr_t;`,
+/// `typedef Foo bar;`) is not a forward declaration.
+///
+/// Detected the same way [`extract_typedef_base`] rejects forwards: the
+/// text between `typedef` and the alias name is empty or just a class
+/// keyword. Used by [`symbol_for`] to skip indexing forwards so they
+/// don't shadow the real declaration in name lookups.
+fn is_forward_typedef(node: Node<'_>, source: &str, name: &str) -> bool {
+    let Ok(text) = node.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    let Some(after) = text.strip_prefix("typedef") else {
+        return false;
+    };
+    let after = after.trim_start();
+    let Some(alias_pos) = after.rfind(name) else {
+        return false;
+    };
+    let base = after[..alias_pos].trim_end();
+    base.is_empty() || base == "class" || base == "interface class"
 }
 
 /// Extract the return type from a `function_body_declaration` or
@@ -2918,6 +2952,49 @@ mod _class_inheritance_indexing_tests {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "phase");
         assert_eq!(params[0].ty.as_deref(), Some("uvm_phase"));
+    }
+
+    /// A forward `typedef class Foo;` preceding the real `class Foo`
+    /// must NOT be indexed — otherwise a name lookup can return the
+    /// forward decl and hover/goto surface "typedef class Foo;" instead
+    /// of the real definition. The only `Foo` symbol must be the class.
+    #[test]
+    fn forward_class_typedef_is_not_indexed() {
+        let mut p = SyntaxParser::new().unwrap();
+        let t = p
+            .parse(
+                "typedef class apb_agent;\nclass apb_agent extends uvm_agent;\nendclass\n",
+                None,
+            )
+            .unwrap();
+        let rope = Rope::from_str(t.source());
+        let syms = index(&t, &rope);
+        let matches: Vec<&Symbol> = syms.iter().filter(|s| s.name == "apb_agent").collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one apb_agent symbol, got {matches:?}",
+        );
+        assert_eq!(matches[0].kind, SymbolKind::Class);
+        assert_eq!(matches[0].parent_class_name.as_deref(), Some("uvm_agent"));
+    }
+
+    /// A real typedef (non-forward) must still be indexed — the forward
+    /// guard only fires when the base is empty or a bare class keyword,
+    /// so a struct/enum/scalar alias is unaffected.
+    #[test]
+    fn real_typedef_is_still_indexed() {
+        let mut p = SyntaxParser::new().unwrap();
+        let t = p
+            .parse("typedef struct { int x; } my_s_t;\n", None)
+            .unwrap();
+        let rope = Rope::from_str(t.source());
+        let syms = index(&t, &rope);
+        let sym = syms
+            .iter()
+            .find(|s| s.name == "my_s_t")
+            .expect("real typedef still indexed");
+        assert_eq!(sym.kind, SymbolKind::Typedef);
     }
 
     // ------------------------------------------------------------------
