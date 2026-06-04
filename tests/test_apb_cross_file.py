@@ -51,6 +51,14 @@ def _wait_for_first_parse(lsp: MimirLspClient, settle_ms: int = 250) -> None:
     assert diag is not None, "server never published initial diagnostics"
 
 
+# Logged once the first slang elaborate finishes and the AST / reference map
+# are cached (crates/mimir-server/src/elaborate_service.rs). Every test here
+# is slang-backed (startup elaborate, macro-callsite goto-def, AST inlay
+# hints), so the suite must wait for this before issuing requests — otherwise
+# it races elaboration and fails intermittently under load.
+_SLANG_INDEXED_MARKER = "indexed by startup slang compile"
+
+
 class ApbMonitorCrossFileTest(unittest.TestCase):
     """``apb_monitor.sv`` is opened; ``apb_rw.sv`` is NOT. Each test
     asks the server about a capability that should work even though
@@ -61,12 +69,24 @@ class ApbMonitorCrossFileTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         if not APB_MONITOR.exists():
             raise unittest.SkipTest(f"example not found: {APB_MONITOR}")
-        cls.lsp = MimirLspClient()
+        # `log_to_stderr=True` flips RUST_LOG to mimir=debug so we can detect
+        # when slang's first elaborate finishes.
+        cls.lsp = MimirLspClient(log_to_stderr=True)
         cls.lsp.initialize(workspace_root=APB_DIR)
         cls.uri = file_uri(APB_MONITOR)
         cls.text = read_text(APB_MONITOR)
         cls.lsp.did_open(cls.uri, cls.text)
         _wait_for_first_parse(cls.lsp)
+        # Every test here is slang-backed. Wait for the startup elaborate to
+        # cache its AST so requests don't race it; skip the suite cleanly if
+        # no sidecar is configured (rather than failing on a slang-less
+        # checkout). 30s is generous — a cold UVM elaborate is a few seconds.
+        if not cls.lsp.wait_for_log(_SLANG_INDEXED_MARKER, timeout=30.0):
+            cls.lsp.close()
+            raise unittest.SkipTest(
+                "slang sidecar never logged 'indexed'; these cross-file "
+                "tests require a running slang sidecar"
+            )
 
     @classmethod
     def tearDownClass(cls) -> None:
