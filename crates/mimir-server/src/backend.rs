@@ -2848,6 +2848,8 @@ impl LanguageServer for Backend {
     )]
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         mimir_core::time_scope!("lsp.completion");
+        // All return paths funnel through `into_incomplete` so every response
+        // is `isIncomplete: true` — see that helper for why.
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let target = MPosition::new(pos.line, pos.character);
@@ -2863,7 +2865,9 @@ impl LanguageServer for Backend {
         // Route 1: `` ` `` trigger — macro-name completion.
         if let Some(rope) = &rope {
             if let Some(macro_prefix) = detect_macro_trigger(rope, target) {
-                return Ok(Box::pin(self.syntax_macro_completion(&uri, &macro_prefix)).await);
+                return Ok(Box::pin(self.syntax_macro_completion(&uri, &macro_prefix))
+                    .await
+                    .map(into_incomplete));
             }
         }
 
@@ -2885,7 +2889,7 @@ impl LanguageServer for Backend {
                     if let Some(resp) = ast_features::member_completion(
                         &ast, &path, mimir_pos, &receiver, is_pkg,
                     ) {
-                        return Ok(Some(resp));
+                        return Ok(Some(into_incomplete(resp)));
                     }
                 }
             }
@@ -2897,11 +2901,11 @@ impl LanguageServer for Backend {
                     let prefix = member_trigger.map(|(_, p)| p).unwrap_or_default();
                     let ws = self.workspace.read().await;
                     if let Some(resp) = syntax_member_completion(&ws.index, &tree, r, target, &prefix) {
-                        return Ok(Some(resp));
+                        return Ok(Some(into_incomplete(resp)));
                     }
                 }
             }
-            return Ok(Some(CompletionResponse::Array(vec![])));
+            return Ok(Some(into_incomplete(CompletionResponse::Array(vec![]))));
         }
 
         // Route 3: plain identifier — scope-aware completion.
@@ -2956,12 +2960,12 @@ impl LanguageServer for Backend {
                             items.push(keyword_completion_item(kw));
                         }
                     }
-                    return Ok(Some(CompletionResponse::Array(items)));
+                    return Ok(Some(into_incomplete(CompletionResponse::Array(items))));
                 }
             }
         }
 
-        Ok(Box::pin(self.syntax_completion(&uri, target)).await)
+        Ok(Box::pin(self.syntax_completion(&uri, target)).await.map(into_incomplete))
     }
 
     /// Lazily enrich a completion item with the declaration line as
@@ -4758,6 +4762,26 @@ fn range_contains(outer: MRange, inner: MRange) -> bool {
 /// lives in exactly one place across both the tree-sitter and slang paths.
 fn syntax_to_lsp_diagnostic(d: MDiagnostic) -> Diagnostic {
     crate::diagnostics::mimir_diag_to_lsp(&crate::diagnostics::syntax_diag_to_mimir(&d))
+}
+
+/// Normalize a completion response to `isIncomplete: true`.
+///
+/// With `isIncomplete: false` (the implicit meaning of
+/// [`CompletionResponse::Array`]), VS Code treats the returned list as the
+/// complete set for the current position: it caches the items and filters
+/// them client-side as the user types, and crucially **stops re-querying the
+/// server**. That breaks editing back into a member-access prefix — type
+/// `obj.a_some`, delete a char to `obj.a_som`, and no request is sent, so the
+/// suggestion list never re-pops. Marking every response incomplete makes the
+/// client re-query on each edit (including deletion), keeping completion live
+/// wherever the cursor lands. The server already recomputes candidates from
+/// the buffer on each call, so the extra round-trips are cheap.
+fn into_incomplete(resp: CompletionResponse) -> CompletionResponse {
+    let items = match resp {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    CompletionResponse::List(CompletionList { is_incomplete: true, items })
 }
 
 /// Merge tree-sitter and slang diagnostics for a single file into the LSP
