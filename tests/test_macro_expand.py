@@ -100,3 +100,136 @@ class MacroExpandTest(unittest.TestCase):
         # `module` keyword on line 2 — not a macro usage.
         result = self._expand(2, 0)
         self.assertIsNone(result)
+
+
+# A *multi-line* nested macro (the UVM-style case): `RECORD` expands to a
+# `FIELD` call plus a function, each macro body written with `\` line
+# continuations. The fully-recursive expansion must stay multi-line — the
+# preprocessor's per-token trivia carries the body's newlines — not collapse
+# to one line.
+_ML_FIXTURE = """\
+`define FIELD(n) \\
+  int n; \\
+  bit n``_valid;
+`define RECORD(r) \\
+  `FIELD(r) \\
+  function void show_``r(); \\
+  endfunction
+module m;
+  `RECORD(data)
+endmodule
+"""
+_ML_USAGE_LINE = 8
+_ML_USAGE_CHAR = 5
+
+
+class MacroExpandMultiLineTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        slang_path = _require_slang()
+        cls._tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(cls._tmp.name)
+        cls._sv = root / "top.sv"
+        cls._sv.write_text(_ML_FIXTURE)
+        (root / "files.f").write_text("top.sv\n")
+        (root / ".mimir.toml").write_text("[slang]\nfilelist = \"files.f\"\n")
+        cls.lsp = MimirLspClient(env={"MIMIR_SLANG_PATH": slang_path})
+        cls.lsp.initialize(workspace_root=root)
+        cls.uri = file_uri(cls._sv)
+        cls.lsp.did_open(cls.uri, _ML_FIXTURE)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.lsp.close()
+        cls._tmp.cleanup()
+
+    def test_multiline_nested_macro_stays_multiline(self) -> None:
+        result = self.lsp.request(
+            "mimir/expandMacro",
+            {
+                "textDocument": {"uri": self.uri},
+                "position": {"line": _ML_USAGE_LINE, "character": _ML_USAGE_CHAR},
+            },
+            timeout=30.0,
+        )
+        self.assertIsNotNone(result, "expected an expansion for `RECORD(data)")
+        self.assertEqual(result["name"], "RECORD")
+        expansion = result["expansion"]
+        # Must be multi-line, not collapsed to one line.
+        self.assertGreater(
+            result["lineCount"], 1,
+            f"multi-line macro collapsed to {result['lineCount']} line(s): {expansion!r}",
+        )
+        self.assertIn("\n", expansion, f"no newline in expansion: {expansion!r}")
+        # Inner `FIELD was recursively expanded (with token-paste applied).
+        compact = "".join(expansion.split())
+        self.assertIn("intdata;", compact, f"inner FIELD not expanded: {expansion!r}")
+        self.assertIn("bitdata_valid;", compact, f"token-paste lost: {expansion!r}")
+
+
+# The common UVM layout: the macro is defined in a package file, which then
+# `` `include ``s the component file. The component is NOT a filelist member —
+# it's reached only via the include and relies on the package having defined
+# the macro first. Opening the component and expanding the macro must work
+# even though, preprocessed standalone, the macro would be undefined.
+_PKG = """\
+`define MK(T) \\
+  typedef int T; \\
+  function void T``_f(); \\
+  endfunction
+`include "comp.sv"
+"""
+_COMP = """\
+module comp;
+  `MK(widget)
+endmodule
+"""
+_COMP_USAGE_LINE = 1
+_COMP_USAGE_CHAR = 4
+
+
+class MacroExpandIncludeMemberTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        slang_path = _require_slang()
+        cls._tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(cls._tmp.name)
+        cls._pkg = root / "pkg.sv"
+        cls._comp = root / "comp.sv"
+        cls._pkg.write_text(_PKG)
+        cls._comp.write_text(_COMP)
+        # Only pkg.sv is in the filelist; comp.sv is pulled in via `include.
+        (root / "files.f").write_text("pkg.sv\n")
+        (root / ".mimir.toml").write_text(
+            "[slang]\nfilelist = \"files.f\"\ninclude_dirs = [\".\"]\n"
+        )
+        cls.lsp = MimirLspClient(env={"MIMIR_SLANG_PATH": slang_path})
+        cls.lsp.initialize(workspace_root=root)
+        # Open the *include-member* component file, not the package.
+        cls.uri = file_uri(cls._comp)
+        cls.lsp.did_open(cls.uri, _COMP)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.lsp.close()
+        cls._tmp.cleanup()
+
+    def test_expand_macro_in_include_member_file(self) -> None:
+        result = self.lsp.request(
+            "mimir/expandMacro",
+            {
+                "textDocument": {"uri": self.uri},
+                "position": {"line": _COMP_USAGE_LINE, "character": _COMP_USAGE_CHAR},
+            },
+            timeout=30.0,
+        )
+        self.assertIsNotNone(
+            result,
+            "expand returned None for a macro in an `include-member file "
+            "(the macro is defined by the package that includes it)",
+        )
+        self.assertEqual(result["name"], "MK")
+        self.assertGreater(result["lineCount"], 1, f"got: {result['expansion']!r}")
+        compact = "".join(result["expansion"].split())
+        self.assertIn("typedefintwidget;", compact, f"got: {result['expansion']!r}")
+        self.assertIn("widget_f", compact, f"token-paste lost: {result['expansion']!r}")

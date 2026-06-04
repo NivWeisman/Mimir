@@ -1485,6 +1485,7 @@ static json handle_expand_macro(const json& params) {
     // buffer (the file whose macro we're expanding).
     std::vector<SourceBuffer> cu_buffers;
     std::optional<SourceBuffer> target_buffer;
+    bool target_is_cu = false;
     if (params.contains("files") && params["files"].is_array()) {
         for (const auto& f : params["files"]) {
             const auto path = f.value("path", std::string{});
@@ -1496,20 +1497,34 @@ static json handle_expand_macro(const json& params) {
             } catch (const std::exception&) {
                 continue; // duplicate path — already loaded via `include
             }
-            if (path == target_path) target_buffer = buffer;
+            if (path == target_path) {
+                target_buffer = buffer;
+                target_is_cu = is_cu;
+            }
             if (is_cu) cu_buffers.push_back(buffer);
         }
     }
     if (!target_buffer) return result; // target not among the sent files
-    const BufferID target_bid = target_buffer->id;
+
+    // Canonical path of the target file. We attribute a macro run to the
+    // target by *path*, not buffer id: when the target is reached through a
+    // `` `include `` its tokens live in a fresh include-instance buffer, not
+    // the standalone buffer we assigned above.
+    std::error_code path_ec;
+    const std::filesystem::path target_canon =
+        std::filesystem::weakly_canonical(sm->getFullPath(target_buffer->id), path_ec);
 
     // Which buffers to drive the preprocessor over:
-    //   * single_unit → all CU buffers in order (defines leak forward, so a
-    //     macro defined in file[0] is visible when expanding in file[5]);
-    //   * per-file    → just the target buffer (its own `` `include ``s pull
-    //     in whatever macros it needs).
+    //   * single_unit, or the target isn't itself a compilation-unit member
+    //     (it's pulled in via `` `include `` — e.g. a UVM component included
+    //     by its package) → feed all CU buffers so the including context
+    //     defines the macros the target uses (`` `uvm_* `` live in a header
+    //     the package includes *before* the component);
+    //   * otherwise (a self-contained CU member) → just the target buffer,
+    //     which is cheaper than re-preprocessing the whole unit.
+    const bool need_cu_context = setup.single_unit || !target_is_cu;
     std::vector<SourceBuffer> feed;
-    if (setup.single_unit && !cu_buffers.empty()) {
+    if (need_cu_context && !cu_buffers.empty()) {
         feed = cu_buffers;
     } else {
         feed.push_back(*target_buffer);
@@ -1546,6 +1561,15 @@ static json handle_expand_macro(const json& params) {
         return l1 < l2 || (l1 == l2 && c1 <= c2);
     };
 
+    // True when `bid`'s file is the target file. Compared by canonical path so
+    // an include-instance buffer (distinct id, same file) still matches.
+    auto is_target_file = [&](slang::BufferID bid) {
+        std::error_code ec;
+        const std::filesystem::path p =
+            std::filesystem::weakly_canonical(sm->getFullPath(bid), ec);
+        return !ec && !p.empty() && p == target_canon;
+    };
+
     while (true) {
         Token tok = pp.next();
         if (tok.kind == TokenKind::EndOfFile) break;
@@ -1566,7 +1590,7 @@ static json handle_expand_macro(const json& params) {
             exp = sm->getExpansionRange(exp.start());
         }
 
-        if (exp.start().buffer() == target_bid) {
+        if (is_target_file(exp.start().buffer())) {
             LspPos s = to_lsp_pos(*sm, exp.start());
             LspPos e = to_lsp_pos(*sm, exp.end());
             if (!cur.has_target) {
