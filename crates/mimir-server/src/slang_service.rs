@@ -364,7 +364,9 @@ impl SlangService {
         })
     }
 
-    /// Forward an `expandMacro` request to the sidecar.
+    /// Forward an `expandMacro` request to the sidecar, blocking on the
+    /// connection if a compile is in flight. Used by the explicit "Expand
+    /// Macro" command.
     pub(crate) async fn expand_macro(&self, params: &ExpandMacroParams)
     -> Result<ExpandMacroResult, mimir_slang::ClientError>
     {
@@ -372,6 +374,19 @@ impl SlangService {
         let slang = self.slang.read().await.clone()
             .expect("expand_macro called without a configured sidecar");
         slang.expand_macro(params).await
+    }
+
+    /// Non-blocking `expandMacro` for the opportunistic hover footer: returns
+    /// [`mimir_slang::ClientError::Busy`] without queuing when the sidecar
+    /// connection is occupied by a background elaborate, so a hover never
+    /// stalls behind a slow compile.
+    pub(crate) async fn expand_macro_if_idle(&self, params: &ExpandMacroParams)
+    -> Result<ExpandMacroResult, mimir_slang::ClientError>
+    {
+        mimir_core::time_scope!("slang.expand_macro.service_total");
+        let slang = self.slang.read().await.clone()
+            .expect("expand_macro_if_idle called without a configured sidecar");
+        slang.try_expand_macro(params).await
     }
 
 }

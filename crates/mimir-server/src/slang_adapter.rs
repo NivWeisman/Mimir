@@ -212,20 +212,9 @@ impl SlangAdapter {
     ) -> Option<ExpandMacroResult> {
         mimir_core::time_scope!("slang.compile.adapter.expand_macro");
 
-        // Cache lookup: same URL + version, and the cursor falls inside a
-        // previously-expanded usage range.
-        {
-            let cache = self.expansion_cache.read().await;
-            if let Some(c) = cache.get(uri) {
-                if c.version == version {
-                    if let Some((_, hit)) =
-                        c.entries.iter().find(|(r, _)| range_contains(r, position))
-                    {
-                        debug!(uri = %uri, "macro expansion cache hit");
-                        return Some(hit.clone());
-                    }
-                }
-            }
+        if let Some(hit) = self.cached_expansion(uri, version, position).await {
+            debug!(uri = %uri, "macro expansion cache hit");
+            return Some(hit);
         }
 
         let result = match self.slang.expand_macro(params).await {
@@ -240,34 +229,101 @@ impl SlangAdapter {
             }
         };
 
-        // Cache successful hits keyed by their usage range so a follow-up
-        // hover/command anywhere on the same macro reuses this compute.
         if result.found {
-            if let Some(usage) = &result.usage_range {
-                let key_range = MimirRange {
-                    start: MimirPos {
-                        line: usage.start.line,
-                        character: usage.start.character,
-                    },
-                    end: MimirPos {
-                        line: usage.end.line,
-                        character: usage.end.character,
-                    },
-                };
-                let mut cache = self.expansion_cache.write().await;
-                let bucket = cache.entry(uri.clone()).or_insert_with(|| CachedExpansions {
-                    version,
-                    entries: Vec::new(),
-                });
-                if bucket.version != version {
-                    bucket.version = version;
-                    bucket.entries.clear();
-                }
-                bucket.entries.push((key_range, result.clone()));
-            }
+            self.store_expansion(uri, version, &result).await;
+        }
+        Some(result)
+    }
+
+    /// Non-blocking counterpart to [`Self::expand_macro`] for the
+    /// opportunistic hover footer.
+    ///
+    /// Identical caching, but on a cache miss it routes through
+    /// [`SlangService::expand_macro_if_idle`], which returns immediately when
+    /// the sidecar connection is busy with a background elaborate. A hover must
+    /// never block on a multi-second compile; when the sidecar is occupied this
+    /// returns `None` and the hover simply omits the expansion footer (the next
+    /// idle hover fills it in, and the result is then cached for instant reuse).
+    pub(crate) async fn expand_macro_if_idle(
+        &self,
+        uri: &Url,
+        version: i32,
+        position: MPosition,
+        params: &ExpandMacroParams,
+    ) -> Option<ExpandMacroResult> {
+        mimir_core::time_scope!("slang.compile.adapter.expand_macro");
+
+        if let Some(hit) = self.cached_expansion(uri, version, position).await {
+            debug!(uri = %uri, "macro expansion cache hit");
+            return Some(hit);
         }
 
+        let result = match self.slang.expand_macro_if_idle(params).await {
+            Ok(r) => r,
+            Err(mimir_slang::ClientError::Busy) => {
+                debug!("sidecar busy; skipping opportunistic hover macro footer");
+                return None;
+            }
+            Err(e) => {
+                error!(error = %e, "[SlangError] expand_macro RPC failed");
+                return None;
+            }
+        };
+
+        if result.found {
+            self.store_expansion(uri, version, &result).await;
+        }
         Some(result)
+    }
+
+    /// Look up a previously-expanded usage at this `uri` + `version` whose
+    /// cached range covers `position`. Returns `None` on a version mismatch
+    /// (the document was edited) or when no cached usage contains the cursor.
+    async fn cached_expansion(
+        &self,
+        uri: &Url,
+        version: i32,
+        position: MPosition,
+    ) -> Option<ExpandMacroResult> {
+        let cache = self.expansion_cache.read().await;
+        let bucket = cache.get(uri)?;
+        if bucket.version != version {
+            return None;
+        }
+        bucket
+            .entries
+            .iter()
+            .find(|(r, _)| range_contains(r, position))
+            .map(|(_, hit)| hit.clone())
+    }
+
+    /// Cache a successful expansion keyed by its usage range so a follow-up
+    /// hover/command anywhere on the same macro reuses this preprocessor run.
+    /// A version bump replaces the document's whole bucket.
+    async fn store_expansion(&self, uri: &Url, version: i32, result: &ExpandMacroResult) {
+        let Some(usage) = &result.usage_range else {
+            return;
+        };
+        let key_range = MimirRange {
+            start: MimirPos {
+                line: usage.start.line,
+                character: usage.start.character,
+            },
+            end: MimirPos {
+                line: usage.end.line,
+                character: usage.end.character,
+            },
+        };
+        let mut cache = self.expansion_cache.write().await;
+        let bucket = cache.entry(uri.clone()).or_insert_with(|| CachedExpansions {
+            version,
+            entries: Vec::new(),
+        });
+        if bucket.version != version {
+            bucket.version = version;
+            bucket.entries.clear();
+        }
+        bucket.entries.push((key_range, result.clone()));
     }
 
     /// Return the cached [`MimirAst`] from the last successful compile.
@@ -286,5 +342,78 @@ impl SlangAdapter {
     pub(crate) async fn invalidate(&self) {
         *self.cached_ast.write().await = None;
         debug!("cached MimirAst invalidated");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimir_core::Range as CoreRange;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    /// An adapter with no configured sidecar — enough to exercise the
+    /// expansion cache, which never touches the connection.
+    fn adapter() -> SlangAdapter {
+        let docs = Arc::new(RwLock::new(HashMap::new()));
+        SlangAdapter::new(Arc::new(SlangService::new(docs, None)))
+    }
+
+    /// A `found` expansion whose usage spans `[start, end]` (line, character).
+    fn result_spanning(start: (u32, u32), end: (u32, u32)) -> ExpandMacroResult {
+        ExpandMacroResult {
+            found: true,
+            expanded_text: "((x)+1)".into(),
+            macro_name: "B".into(),
+            usage_range: Some(CoreRange::new(
+                MPosition::new(start.0, start.1),
+                MPosition::new(end.0, end.1),
+            )),
+            line_count: 1,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// A stored expansion is served back for any cursor inside its usage
+    /// range and missed for one outside it.
+    #[tokio::test]
+    async fn cached_expansion_round_trips_within_usage_range() {
+        let a = adapter();
+        let uri = Url::parse("file:///x.sv").unwrap();
+        a.store_expansion(&uri, 1, &result_spanning((3, 10), (3, 16))).await;
+
+        let hit = a.cached_expansion(&uri, 1, MPosition::new(3, 12)).await;
+        assert_eq!(hit.expect("cursor inside range should hit").macro_name, "B");
+
+        assert!(
+            a.cached_expansion(&uri, 1, MPosition::new(4, 0)).await.is_none(),
+            "cursor outside the usage range must miss"
+        );
+    }
+
+    /// A document edit (version bump) invalidates the whole bucket so a stale
+    /// expansion is never served against newer text.
+    #[tokio::test]
+    async fn cached_expansion_invalidated_by_version_bump() {
+        let a = adapter();
+        let uri = Url::parse("file:///x.sv").unwrap();
+        a.store_expansion(&uri, 1, &result_spanning((0, 4), (0, 10))).await;
+
+        assert!(
+            a.cached_expansion(&uri, 2, MPosition::new(0, 6)).await.is_none(),
+            "a newer version must not see the version-1 cache entry"
+        );
+    }
+
+    /// A result with no `usage_range` can't be keyed, so it's not cached.
+    #[tokio::test]
+    async fn store_expansion_without_usage_range_is_noop() {
+        let a = adapter();
+        let uri = Url::parse("file:///x.sv").unwrap();
+        let mut r = result_spanning((0, 0), (0, 1));
+        r.usage_range = None;
+        a.store_expansion(&uri, 1, &r).await;
+
+        assert!(a.cached_expansion(&uri, 1, MPosition::new(0, 0)).await.is_none());
     }
 }

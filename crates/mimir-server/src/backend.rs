@@ -2254,7 +2254,12 @@ impl LanguageServer for Backend {
         else {
             return Ok(base); // slang not configured / no project
         };
-        let footer = match self.adapter.expand_macro(&uri, version, target, &eparams).await {
+        // Opportunistic, non-blocking: if a background elaborate is holding the
+        // sidecar connection, skip the footer rather than stall the hover on a
+        // multi-second compile (which would leave VS Code showing "Loading…"
+        // until the compile finished). The base hover already shows the macro's
+        // `define; the expansion footer fills in on the next idle hover.
+        let footer = match self.adapter.expand_macro_if_idle(&uri, version, target, &eparams).await {
             Some(r) if r.found => macro_footer_markdown(&r),
             _ => return Ok(base),
         };

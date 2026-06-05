@@ -85,17 +85,26 @@ function registerMacroExpansion(context: vscode.ExtensionContext): void {
       if (!editor || !client) {
         return;
       }
+      // Run inside a progress notification: the server may block briefly
+      // behind an in-flight background elaborate (they share one sidecar
+      // connection), and a silent wait reads as "the command did nothing".
+      // The spinner makes it clear the expansion is being computed.
       let result: ExpandMacroResponse | null;
       try {
-        result = await client.sendRequest<ExpandMacroResponse | null>(
-          "mimir/expandMacro",
+        result = await vscode.window.withProgress(
           {
-            textDocument: { uri: editor.document.uri.toString() },
-            position: {
-              line: editor.selection.active.line,
-              character: editor.selection.active.character,
-            },
+            location: vscode.ProgressLocation.Notification,
+            title: "Mimir: expanding macro…",
+            cancellable: false,
           },
+          () =>
+            client!.sendRequest<ExpandMacroResponse | null>("mimir/expandMacro", {
+              textDocument: { uri: editor.document.uri.toString() },
+              position: {
+                line: editor.selection.active.line,
+                character: editor.selection.active.character,
+              },
+            }),
         );
       } catch (err) {
         void vscode.window.showErrorMessage(`Mimir: macro expansion failed: ${err}`);

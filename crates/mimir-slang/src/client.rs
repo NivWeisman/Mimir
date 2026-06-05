@@ -432,13 +432,16 @@ impl Client {
         Ok(conn.compile(params).await?)
     }
 
-    /// Run an `expandMacro` request against the sidecar.
+    /// Run an `expandMacro` request against the sidecar, **blocking** on the
+    /// connection mutex.
     ///
-    /// Recursively expands the macro usage at `params.position` in
-    /// `params.target_path` and returns the expanded source text. Shares the
-    /// single connection mutex with [`Client::compile`], so a long background
-    /// elaborate will serialise this behind it (acceptable: expansion is a
-    /// user-initiated, on-demand action).
+    /// Shares the single connection mutex with [`Client::compile`], so a long
+    /// background elaborate serialises this behind it. Reserved for the
+    /// *explicit* "Expand Macro" command, where the user has asked for the
+    /// expansion and waiting for an in-flight compile to finish is acceptable
+    /// (the command surfaces progress while it waits). The opportunistic hover
+    /// footer must use [`Client::try_expand_macro`] instead so a slow compile
+    /// can never stall a hover.
     pub async fn expand_macro(
         &self,
         params: &ExpandMacroParams,
@@ -447,6 +450,27 @@ impl Client {
         let mut conn = {
             mimir_core::time_scope!("slang.expand_macro.client_lock_wait");
             self.connection.lock().await
+        };
+        Ok(conn.expand_macro(params).await?)
+    }
+
+    /// Non-blocking variant of [`Client::expand_macro`].
+    ///
+    /// If the single connection mutex is currently held — typically by a
+    /// background elaborate — returns [`ClientError::Busy`] immediately
+    /// instead of queuing behind it. This is what the hover macro-expansion
+    /// *footer* uses: a hover is high-frequency and latency-sensitive, so it
+    /// must never block waiting on a multi-second compile. When busy, the
+    /// caller simply omits the footer (the cursor's macro still has its
+    /// `define` shown by the base hover) and the next idle hover fills it in.
+    pub async fn try_expand_macro(
+        &self,
+        params: &ExpandMacroParams,
+    ) -> Result<ExpandMacroResult, ClientError> {
+        mimir_core::time_scope!("slang.expand_macro.client_total");
+        let mut conn = match self.connection.try_lock() {
+            Ok(conn) => conn,
+            Err(_) => return Err(ClientError::Busy),
         };
         Ok(conn.expand_macro(params).await?)
     }
