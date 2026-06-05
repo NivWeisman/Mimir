@@ -87,7 +87,7 @@ integration: $(RELEASE_BIN)
 
 # Lint with clippy
 clippy:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # Clean build artifacts
 clean:

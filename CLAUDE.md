@@ -51,7 +51,7 @@ Don't introduce cycles; don't pull `tower-lsp` or `tokio` into the lower crates.
 ```bash
 cargo check  --workspace
 cargo test   --workspace                   # 436 unit tests today
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings   # lints test code too
 cargo build  --release                     # produces target/release/mimir-server
 ```
 
