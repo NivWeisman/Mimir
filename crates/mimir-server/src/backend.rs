@@ -2244,6 +2244,15 @@ impl LanguageServer for Backend {
         if !cursor_on_macro_usage(&rope, target) {
             return Ok(base);
         }
+
+        // 1. Fresh cache hit — same document version. Costs nothing: skips the
+        //    elaborate-param assembly and the sidecar round-trip entirely.
+        if let Some(r) = self.adapter.cached_expansion(&uri, version, target).await {
+            if r.found {
+                return Ok(Some(append_hover_footer(base, macro_footer_markdown(&r, false))));
+            }
+        }
+
         let Some(file_path) =
             uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned))
         else {
@@ -2254,16 +2263,31 @@ impl LanguageServer for Backend {
         else {
             return Ok(base); // slang not configured / no project
         };
-        // Opportunistic, non-blocking: if a background elaborate is holding the
-        // sidecar connection, skip the footer rather than stall the hover on a
-        // multi-second compile (which would leave VS Code showing "Loading…"
-        // until the compile finished). The base hover already shows the macro's
-        // `define; the expansion footer fills in on the next idle hover.
-        let footer = match self.adapter.expand_macro_if_idle(&uri, version, target, &eparams).await {
-            Some(r) if r.found => macro_footer_markdown(&r),
-            _ => return Ok(base),
-        };
-        Ok(Some(append_hover_footer(base, footer)))
+
+        // 2. Opportunistic, non-blocking: if a background elaborate is holding
+        //    the sidecar connection, this returns `None` rather than stalling
+        //    the hover on a multi-second compile (which would leave VS Code
+        //    showing "Loading…" until the compile finished). A `Some(found)`
+        //    result is rendered fresh; `Some(!found)` means slang says the
+        //    cursor isn't on a macro usage, so we show no footer.
+        match self.adapter.expand_macro_if_idle(&uri, version, target, &eparams).await {
+            Some(r) if r.found => {
+                return Ok(Some(append_hover_footer(base, macro_footer_markdown(&r, false))));
+            }
+            Some(_) => return Ok(base),
+            None => {}
+        }
+
+        // 3. Sidecar busy/unresponsive: fall back to the last-good expansion for
+        //    this usage if we have one, clearly marked stale. Keeps the footer
+        //    visible while slang re-elaborates instead of flickering away on
+        //    every edit. The base hover already shows the up-to-date `define.
+        if let Some(r) = self.adapter.stale_expansion(&uri, target).await {
+            if r.found {
+                return Ok(Some(append_hover_footer(base, macro_footer_markdown(&r, true))));
+            }
+        }
+        Ok(base)
     }
 
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
@@ -4163,7 +4187,11 @@ fn cursor_on_macro_usage(rope: &Rope, pos: MPosition) -> bool {
 
 /// Build the hover footer markdown for an expansion result. Shows the line
 /// count, a short fenced preview (first few lines), and the command CTA.
-fn macro_footer_markdown(r: &mimir_slang::ExpandMacroResult) -> String {
+///
+/// When `stale` is set the expansion came from the cache while the sidecar was
+/// busy/unresponsive (see [`SlangAdapter::stale_expansion`]); the footer says
+/// so, since the macro may have changed since it was last expanded.
+fn macro_footer_markdown(r: &mimir_slang::ExpandMacroResult, stale: bool) -> String {
     const PREVIEW_LINES: usize = 6;
     let total = r.line_count;
     let preview: Vec<&str> = r.expanded_text.lines().take(PREVIEW_LINES).collect();
@@ -4172,8 +4200,13 @@ fn macro_footer_markdown(r: &mimir_slang::ExpandMacroResult) -> String {
     if truncated {
         body.push_str("\n…");
     }
+    let note = if stale {
+        " _(cached — may be stale while slang re-elaborates)_"
+    } else {
+        ""
+    };
     format!(
-        "\n\n---\n\n▶ `` `{name} `` expands to **{total} line{plural}** — \
+        "\n\n---\n\n▶ `` `{name} `` expands to **{total} line{plural}**{note} — \
          run **Mimir: Expand Macro** for the full expansion\n\n\
          ```systemverilog\n{body}\n```",
         name = r.macro_name,
@@ -4835,6 +4868,37 @@ mod tests {
             severity: sev,
             code: "syntax",
         }
+    }
+
+    /// Helper: a `found` expansion result with the given name/text.
+    fn expansion(name: &str, text: &str) -> mimir_slang::ExpandMacroResult {
+        mimir_slang::ExpandMacroResult {
+            found: true,
+            expanded_text: text.to_string(),
+            macro_name: name.to_string(),
+            usage_range: None,
+            line_count: text.lines().count().max(1) as u32,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// A fresh footer shows the macro name and a preview but carries no
+    /// staleness note.
+    #[test]
+    fn macro_footer_fresh_has_no_stale_note() {
+        let md = macro_footer_markdown(&expansion("A", "(((k)+1)*2)"), false);
+        assert!(md.contains("`A `"), "footer should name the macro: {md}");
+        assert!(md.contains("(((k)+1)*2)"), "footer should preview the expansion");
+        assert!(!md.contains("may be stale"), "fresh footer must not be marked stale");
+    }
+
+    /// A stale footer (served from cache while slang is busy) is explicitly
+    /// marked so the user knows it may be out of date.
+    #[test]
+    fn macro_footer_stale_is_marked() {
+        let md = macro_footer_markdown(&expansion("A", "(((k)+1)*2)"), true);
+        assert!(md.contains("may be stale"), "stale footer must be marked: {md}");
+        assert!(md.contains("(((k)+1)*2)"), "stale footer still previews the expansion");
     }
 
     /// tree-sitter → LSP conversion preserves all the fields the editor needs.

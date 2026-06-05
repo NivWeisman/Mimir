@@ -85,19 +85,35 @@ fn slang_diag_to_mimir(d: SlangDiag) -> (String, MimirDiag) {
 pub(crate) struct SlangAdapter {
     slang: Arc<SlangService>,
     cached_ast: Arc<RwLock<Option<Arc<MimirAst>>>>,
-    /// Per-document cache of recent macro expansions. Keyed by URL; the
-    /// stored `(version, entries)` is replaced wholesale when the document
-    /// version changes. Lets the hover footer and the panel command share a
-    /// single preprocessor run when both land on the same macro usage.
+    /// Per-document cache of recent macro expansions, keyed by URL. Unlike the
+    /// AST cache this is *not* wiped on every edit: entries from older document
+    /// versions are retained (up to [`MAX_EXPANSIONS_PER_DOC`]) so a hover
+    /// during a busy or stuck elaborate can fall back to the last-good
+    /// expansion. Lets the hover footer and the panel command share a single
+    /// preprocessor run when both land on the same macro usage.
     expansion_cache: Arc<RwLock<HashMap<Url, CachedExpansions>>>,
 }
 
-/// All cached expansions for one document at one version.
+/// Max expansions retained per document. Bounds memory while keeping enough
+/// history that a stale-fallback lookup almost always still covers the macro
+/// the user is hovering. Oldest entries are evicted first.
+const MAX_EXPANSIONS_PER_DOC: usize = 64;
+
+/// Recent macro expansions for one document, oldest first.
 struct CachedExpansions {
+    entries: Vec<CachedExpansion>,
+}
+
+/// One previously-expanded macro usage, tagged with the document version it
+/// was computed against so a lookup can distinguish a *fresh* hit (same
+/// version) from a *stale* fallback (any version).
+struct CachedExpansion {
+    /// Document version this expansion was computed against.
     version: i32,
-    /// Each entry is one previously-expanded macro usage. Looked up by
-    /// testing whether a cursor falls inside `usage_range`.
-    entries: Vec<(MimirRange, ExpandMacroResult)>,
+    /// Macro-usage range, in `version`'s coordinates, used to match a cursor.
+    range: MimirRange,
+    /// The expansion result.
+    result: ExpandMacroResult,
 }
 
 /// True when `pos` falls within `[range.start, range.end]` (inclusive),
@@ -276,10 +292,11 @@ impl SlangAdapter {
         Some(result)
     }
 
-    /// Look up a previously-expanded usage at this `uri` + `version` whose
-    /// cached range covers `position`. Returns `None` on a version mismatch
-    /// (the document was edited) or when no cached usage contains the cursor.
-    async fn cached_expansion(
+    /// Look up a **fresh** previously-expanded usage: same `uri`, same document
+    /// `version`, and a cached range covering `position`. Returns `None` on a
+    /// version mismatch (the document was edited) or when no current-version
+    /// usage contains the cursor. Newest matching entry wins.
+    pub(crate) async fn cached_expansion(
         &self,
         uri: &Url,
         version: i32,
@@ -287,19 +304,46 @@ impl SlangAdapter {
     ) -> Option<ExpandMacroResult> {
         let cache = self.expansion_cache.read().await;
         let bucket = cache.get(uri)?;
-        if bucket.version != version {
-            return None;
-        }
         bucket
             .entries
             .iter()
-            .find(|(r, _)| range_contains(r, position))
-            .map(|(_, hit)| hit.clone())
+            .rev()
+            .find(|e| e.version == version && range_contains(&e.range, position))
+            .map(|e| e.result.clone())
+    }
+
+    /// Best-effort **stale** fallback for when the sidecar can't produce a
+    /// fresh expansion (busy with an elaborate, or unresponsive): return the
+    /// most recent cached expansion whose usage range still covers `position`,
+    /// *regardless of document version*. The expansion may be out of date if
+    /// the macro — or a macro it expands to — changed since it was computed, so
+    /// callers must mark it as possibly-stale. Returns `None` when nothing in
+    /// the cache covers the cursor (e.g. the macro moved after an edit above
+    /// it, or it was never expanded this session).
+    pub(crate) async fn stale_expansion(
+        &self,
+        uri: &Url,
+        position: MPosition,
+    ) -> Option<ExpandMacroResult> {
+        let cache = self.expansion_cache.read().await;
+        let bucket = cache.get(uri)?;
+        bucket
+            .entries
+            .iter()
+            .rev()
+            .find(|e| range_contains(&e.range, position))
+            .map(|e| e.result.clone())
     }
 
     /// Cache a successful expansion keyed by its usage range so a follow-up
-    /// hover/command anywhere on the same macro reuses this preprocessor run.
-    /// A version bump replaces the document's whole bucket.
+    /// hover/command on the same macro reuses this preprocessor run.
+    ///
+    /// Unlike the AST cache, this does **not** clear on a version bump: prior
+    /// entries are kept so [`Self::stale_expansion`] can serve a last-good
+    /// result while a new elaborate is in flight. A re-expansion at the same
+    /// range replaces the old entry (so the newest result for a usage wins and
+    /// duplicates don't accumulate); the bucket is capped at
+    /// [`MAX_EXPANSIONS_PER_DOC`], evicting oldest-first.
     async fn store_expansion(&self, uri: &Url, version: i32, result: &ExpandMacroResult) {
         let Some(usage) = &result.usage_range else {
             return;
@@ -315,15 +359,21 @@ impl SlangAdapter {
             },
         };
         let mut cache = self.expansion_cache.write().await;
-        let bucket = cache.entry(uri.clone()).or_insert_with(|| CachedExpansions {
+        let bucket = cache
+            .entry(uri.clone())
+            .or_insert_with(|| CachedExpansions { entries: Vec::new() });
+        // One entry per usage range: drop any prior expansion at the same range
+        // (from this or an earlier version) and append the newest.
+        bucket.entries.retain(|e| e.range != key_range);
+        bucket.entries.push(CachedExpansion {
             version,
-            entries: Vec::new(),
+            range: key_range,
+            result: result.clone(),
         });
-        if bucket.version != version {
-            bucket.version = version;
-            bucket.entries.clear();
+        let len = bucket.entries.len();
+        if len > MAX_EXPANSIONS_PER_DOC {
+            bucket.entries.drain(0..len - MAX_EXPANSIONS_PER_DOC);
         }
-        bucket.entries.push((key_range, result.clone()));
     }
 
     /// Return the cached [`MimirAst`] from the last successful compile.
@@ -361,9 +411,15 @@ mod tests {
 
     /// A `found` expansion whose usage spans `[start, end]` (line, character).
     fn result_spanning(start: (u32, u32), end: (u32, u32)) -> ExpandMacroResult {
+        result_spanning_text(start, end, "((x)+1)")
+    }
+
+    /// Like [`result_spanning`] but with a caller-chosen `expanded_text`, so a
+    /// test can tell two expansions at the same range apart.
+    fn result_spanning_text(start: (u32, u32), end: (u32, u32), text: &str) -> ExpandMacroResult {
         ExpandMacroResult {
             found: true,
-            expanded_text: "((x)+1)".into(),
+            expanded_text: text.into(),
             macro_name: "B".into(),
             usage_range: Some(CoreRange::new(
                 MPosition::new(start.0, start.1),
@@ -391,17 +447,84 @@ mod tests {
         );
     }
 
-    /// A document edit (version bump) invalidates the whole bucket so a stale
-    /// expansion is never served against newer text.
+    /// A document edit (version bump) makes the *fresh* lookup miss — it only
+    /// matches the current version — even though the entry is retained for the
+    /// stale fallback.
     #[tokio::test]
-    async fn cached_expansion_invalidated_by_version_bump() {
+    async fn cached_expansion_misses_on_version_bump() {
         let a = adapter();
         let uri = Url::parse("file:///x.sv").unwrap();
         a.store_expansion(&uri, 1, &result_spanning((0, 4), (0, 10))).await;
 
         assert!(
             a.cached_expansion(&uri, 2, MPosition::new(0, 6)).await.is_none(),
-            "a newer version must not see the version-1 cache entry"
+            "a newer version must not see the version-1 entry as fresh"
+        );
+    }
+
+    /// The stale fallback serves a prior-version expansion (the fresh lookup
+    /// can't), so the hover footer survives an edit while slang re-elaborates.
+    #[tokio::test]
+    async fn stale_expansion_serves_across_version_bump() {
+        let a = adapter();
+        let uri = Url::parse("file:///x.sv").unwrap();
+        a.store_expansion(&uri, 1, &result_spanning((3, 10), (3, 16))).await;
+
+        assert!(
+            a.cached_expansion(&uri, 2, MPosition::new(3, 12)).await.is_none(),
+            "fresh lookup must miss at the newer version"
+        );
+        let stale = a.stale_expansion(&uri, MPosition::new(3, 12)).await;
+        assert_eq!(
+            stale.expect("stale fallback should serve the version-1 entry").macro_name,
+            "B"
+        );
+    }
+
+    /// The stale fallback still respects the usage range — a cursor outside any
+    /// cached range gets nothing.
+    #[tokio::test]
+    async fn stale_expansion_misses_outside_range() {
+        let a = adapter();
+        let uri = Url::parse("file:///x.sv").unwrap();
+        a.store_expansion(&uri, 1, &result_spanning((3, 10), (3, 16))).await;
+
+        assert!(a.stale_expansion(&uri, MPosition::new(9, 0)).await.is_none());
+    }
+
+    /// Re-expanding the same usage range replaces the prior entry (no
+    /// duplicate accumulation); the newest result wins.
+    #[tokio::test]
+    async fn store_expansion_dedups_same_range_keeping_newest() {
+        let a = adapter();
+        let uri = Url::parse("file:///x.sv").unwrap();
+        a.store_expansion(&uri, 1, &result_spanning_text((0, 4), (0, 10), "OLD")).await;
+        a.store_expansion(&uri, 2, &result_spanning_text((0, 4), (0, 10), "NEW")).await;
+
+        let r = a.stale_expansion(&uri, MPosition::new(0, 6)).await.unwrap();
+        assert_eq!(r.expanded_text, "NEW", "newest expansion for a range must win");
+    }
+
+    /// The per-document cap evicts oldest-first so the cache can't grow without
+    /// bound under many distinct usages.
+    #[tokio::test]
+    async fn store_expansion_caps_entries_evicting_oldest() {
+        let a = adapter();
+        let uri = Url::parse("file:///x.sv").unwrap();
+        // Oldest entry, on line 0.
+        a.store_expansion(&uri, 1, &result_spanning((0, 0), (0, 4))).await;
+        // Fill exactly to the cap with distinct ranges on later lines, pushing
+        // the line-0 entry out.
+        for line in 1..=(MAX_EXPANSIONS_PER_DOC as u32) {
+            a.store_expansion(&uri, 1, &result_spanning((line, 0), (line, 4))).await;
+        }
+        assert!(
+            a.stale_expansion(&uri, MPosition::new(0, 2)).await.is_none(),
+            "the oldest entry should have been evicted past the cap"
+        );
+        assert!(
+            a.stale_expansion(&uri, MPosition::new(MAX_EXPANSIONS_PER_DOC as u32, 2)).await.is_some(),
+            "the newest entry should still be present"
         );
     }
 
@@ -415,5 +538,6 @@ mod tests {
         a.store_expansion(&uri, 1, &r).await;
 
         assert!(a.cached_expansion(&uri, 1, MPosition::new(0, 0)).await.is_none());
+        assert!(a.stale_expansion(&uri, MPosition::new(0, 0)).await.is_none());
     }
 }
