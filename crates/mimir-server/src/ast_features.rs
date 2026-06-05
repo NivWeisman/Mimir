@@ -1291,7 +1291,7 @@ mod tests {
     fn hover_renders_from_ref_target_metadata() {
         let ast = Arc::new(ast_with_method_ref());
         // Cursor inside the ref's use_range (line 30, characters 8..17).
-        let rope = Rope::from_str(&"\n".repeat(31)); // cheap rope so word_at_rope returns None? Actually word_at_rope needs an identifier at the position.
+        let _rope = Rope::from_str(&"\n".repeat(31)); // cheap rope so word_at_rope returns None? Actually word_at_rope needs an identifier at the position.
         // We need the rope to have an identifier at pos (30, 10) so
         // word_at_rope returns it as the hover-display name. Build a
         // line whose chars 8..17 spell "configure".

@@ -2664,13 +2664,6 @@ endmodule
     // find_variable_type_at / normalize_type_name
     // ------------------------------------------------------------------
 
-    fn parse(src: &str) -> (SyntaxTree, Rope) {
-        let mut parser = crate::SyntaxParser::new().unwrap();
-        let tree = parser.parse(src, None).unwrap();
-        let rope = Rope::from_str(src);
-        (tree, rope)
-    }
-
     #[test]
     fn find_variable_type_finds_class_field() {
         let src = "\

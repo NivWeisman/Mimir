@@ -597,8 +597,7 @@ async fn drain_sidecar_stderr(stderr: tokio::process::ChildStderr) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Diagnostic, Severity, SourceFile};
-    use mimir_core::{Position, Range};
+    use crate::protocol::SourceFile;
     use pretty_assertions::assert_eq;
     use tokio::io::{duplex, AsyncWriteExt, BufReader};
 

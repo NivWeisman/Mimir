@@ -3555,25 +3555,6 @@ fn synth_method_symbol(
     }
 }
 
-/// Look up a method named `method_name` declared inside the body of the
-/// class named `class_name`, walking up the inheritance chain via each
-/// class's recorded [`Symbol::parent_class_name`] when the method isn't
-/// found in the class itself.
-///
-/// Used by `inlay_hint` to resolve `super.X(...)` calls without slang:
-/// the AST gives us the parent class name from the `extends` clause; this
-/// helper bridges that to the parent's (or grandparent's, …) method
-/// symbols via the index — so `super.run_phase(phase)` from a class
-/// extending `uvm_monitor` finds `uvm_component::run_phase` two levels up.
-///
-/// Strategy per inheritance step:
-///   1. Find the workspace entry for the current class (kind=Class).
-///      Multiple matches across files are possible — pick the first.
-///   2. Among entries for `method_name`, pick the one whose URL matches the
-///      class's URL *and* whose `full_range` is inside the class's
-///      `full_range`. That's the method declared in that class body.
-///   3. If no match, recurse on the parent class name. Capped at 16 hops
-///      to prevent runaway searches if the index has a cycle.
 // --------------------------------------------------------------------------
 // Syntax-only member completion (AST fallback for `super.` / `this.` / `obj.` / chains)
 // --------------------------------------------------------------------------
@@ -5627,7 +5608,7 @@ mod tests {
     #[test]
     fn workspace_symbol_empty_query_returns_all_visible_kinds() {
         let u = url("file:///a.sv");
-        let entries = vec![
+        let entries = [
             entry(&u, sym("my_module", MSymbolKind::Module, 0)),
             entry(&u, sym("my_class", MSymbolKind::Class, 1)),
         ];
@@ -5640,7 +5621,7 @@ mod tests {
     #[test]
     fn workspace_symbol_fuzzy_matches_subsequence() {
         let u = url("file:///a.sv");
-        let entries = vec![
+        let entries = [
             entry(&u, sym("uvm_foo_bar", MSymbolKind::Class, 0)),
             entry(&u, sym("unrelated", MSymbolKind::Module, 1)),
         ];
@@ -5655,7 +5636,7 @@ mod tests {
     #[test]
     fn workspace_symbol_excludes_noisy_kinds() {
         let u = url("file:///a.sv");
-        let entries = vec![
+        let entries = [
             entry(&u, sym("clk", MSymbolKind::Port, 0)),
             entry(&u, sym("counter", MSymbolKind::Variable, 1)),
             entry(&u, sym("WIDTH", MSymbolKind::Parameter, 2)),
@@ -5674,7 +5655,7 @@ mod tests {
     fn workspace_symbol_same_name_in_two_files_yields_two_results() {
         let a = url("file:///a.sv");
         let b = url("file:///b.sv");
-        let entries = vec![
+        let entries = [
             entry(&a, sym("twin", MSymbolKind::Class, 0)),
             entry(&b, sym("twin", MSymbolKind::Class, 0)),
         ];
@@ -5707,7 +5688,7 @@ mod tests {
         let u = url("file:///a.sv");
         let mut method = sym("do_thing", MSymbolKind::Method, 0);
         method.parent_class_name = Some("my_class".into());
-        let entries = vec![
+        let entries = [
             entry(&u, method),
             entry(&u, sym("free_func", MSymbolKind::Function, 1)),
         ];
@@ -5726,7 +5707,7 @@ mod tests {
     #[test]
     fn workspace_symbol_sorts_by_score_descending() {
         let u = url("file:///a.sv");
-        let entries = vec![
+        let entries = [
             entry(&u, sym("my_class", MSymbolKind::Class, 0)),
             entry(&u, sym("class", MSymbolKind::Class, 1)),
         ];

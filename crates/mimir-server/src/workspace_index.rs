@@ -463,7 +463,7 @@ mod tests {
         ]);
 
         let result = hydrate_from_paths(
-            &[umbrella.clone()],
+            std::slice::from_ref(&umbrella),
             &[PathBuf::from("/uvm/src")],
             &mut parser,
             |p| texts.get(p).cloned(),

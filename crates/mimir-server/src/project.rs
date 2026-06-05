@@ -950,7 +950,7 @@ mod tests {
         fs::write(&f, "+incdir+${MY_INC}\n").unwrap();
         fs::write(
             dir.path().join(".mimir.toml"),
-            &format!(
+            format!(
                 "[env]\nMY_INC = \"{}\"\n\n[slang]\nfilelist = \"project.f\"\n",
                 dir.path().join("verif").display()
             ),

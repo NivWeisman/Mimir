@@ -446,7 +446,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let prev = HashSet::from([url_dropped.clone()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev, &HashSet::new(), &DiagnosticPolicy::default());
+        let plan = plan_slang_publishes(std::slice::from_ref(&url_a), vec![], &prev, &HashSet::new(), &DiagnosticPolicy::default());
 
         assert_eq!(plan.publishes.len(), 2);
         assert!(plan
@@ -467,7 +467,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let prev = HashSet::from([url_a.clone()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], vec![], &prev, &HashSet::new(), &DiagnosticPolicy::default());
+        let plan = plan_slang_publishes(std::slice::from_ref(&url_a), vec![], &prev, &HashSet::new(), &DiagnosticPolicy::default());
 
         assert_eq!(plan.publishes.len(), 1);
         assert!(plan.publishes[0].1.is_empty());
@@ -480,7 +480,7 @@ mod tests {
         let url_a = Url::parse("file:///proj/a.sv").unwrap();
         let diags = vec![mimir_diag_at("/proj/inc/uvm.svh", "X")];
 
-        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &HashSet::new(), &DiagnosticPolicy::default());
+        let plan = plan_slang_publishes(std::slice::from_ref(&url_a), diags, &HashSet::new(), &HashSet::new(), &DiagnosticPolicy::default());
 
         assert_eq!(plan.publishes.len(), 2);
         let inc_url = Url::parse("file:///proj/inc/uvm.svh").unwrap();
@@ -513,7 +513,7 @@ mod tests {
         let diags = vec![unknown_directive_diag("/proj/a.sv", "uvm_field_utils_begin")];
         let known = HashSet::from(["uvm_field_utils_begin".to_string()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &known, &DiagnosticPolicy::default());
+        let plan = plan_slang_publishes(std::slice::from_ref(&url_a), diags, &HashSet::new(), &known, &DiagnosticPolicy::default());
 
         let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
         assert!(a_pub.1.is_empty(), "diagnostic should be suppressed");
@@ -527,7 +527,7 @@ mod tests {
         let diags = vec![unknown_directive_diag("/proj/a.sv", "truly_undefined_macro")];
         let known = HashSet::from(["uvm_field_utils_begin".to_string()]);
 
-        let plan = plan_slang_publishes(&[url_a.clone()], diags, &HashSet::new(), &known, &DiagnosticPolicy::default());
+        let plan = plan_slang_publishes(std::slice::from_ref(&url_a), diags, &HashSet::new(), &known, &DiagnosticPolicy::default());
 
         let a_pub = plan.publishes.iter().find(|(u, _)| u == &url_a).unwrap();
         assert_eq!(a_pub.1.len(), 1, "unrecognized macro diagnostic should pass through");

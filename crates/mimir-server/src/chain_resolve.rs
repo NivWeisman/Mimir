@@ -457,6 +457,9 @@ mod tests {
     use mimir_core::{Position as MPosition, Range as MRange};
     use mimir_syntax::SymbolKind as MSymbolKind;
 
+    // A test builder mirroring every field a `Symbol` needs; the arg count is
+    // inherent to the struct, not a design smell.
+    #[allow(clippy::too_many_arguments)]
     fn make_sym(
         name: &str,
         kind: MSymbolKind,
