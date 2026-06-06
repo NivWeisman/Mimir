@@ -324,34 +324,58 @@ where
 }
 
 // --------------------------------------------------------------------------
-// Client — owns the sidecar process
+// Client — owns the sidecar processes
 // --------------------------------------------------------------------------
 
-/// Owns a running slang sidecar process and a [`Connection`] over its stdio.
+/// The concrete [`Connection`] type over one sidecar child's piped stdio.
+type SidecarConnection = Connection<BufReader<ChildStdout>, ChildStdin>;
+
+/// What [`Client::spawn_one`] hands back: a framed connection, the child
+/// process, and the task draining its stderr.
+type SpawnedSidecar = (SidecarConnection, Child, JoinHandle<()>);
+
+/// Owns **two** running slang sidecar processes — one for heavy
+/// `compile`/elaborate round-trips, one dedicated to on-demand `expandMacro` —
+/// each with its own [`Connection`] over its stdio.
 ///
-/// Drop semantics: dropping the `Client` drops the [`Child`], which sends
-/// SIGKILL on Unix. For a graceful shutdown call [`Client::shutdown`]
-/// first, which sends the protocol-level `shutdown` request and then waits
-/// on the child.
+/// Why two: the wire protocol is single-flight, so a [`Connection`] serialises
+/// all its callers behind one in-flight request. A real-project elaborate can
+/// hold the compile connection for many seconds (or hang outright), and macro
+/// expansion is interactive — a hover footer or the explicit "Expand Macro"
+/// command must not queue behind it. Giving expansion its own process and
+/// connection decouples the two completely. The expand sidecar only ever runs
+/// the preprocessor (never builds the elaborated design), so its steady-state
+/// memory stays small.
+///
+/// Drop semantics: dropping the `Client` drops both [`Child`]ren, which sends
+/// SIGKILL on Unix. For a graceful shutdown call [`Client::shutdown`] first,
+/// which sends the protocol-level `shutdown` request to each and waits on both.
 pub struct Client {
-    /// Wrapped in a `Mutex` because [`Connection::request`] needs `&mut`
-    /// access. The lock is uncontended in the typical "one elaborate per
-    /// idle period" pattern; if that changes we'd switch to a request
-    /// dispatcher with a per-request channel and free `&self` callers.
-    connection: Mutex<Connection<BufReader<ChildStdout>, ChildStdin>>,
-    /// The child process. Held under a `Mutex` so `shutdown` can `wait`
-    /// without competing with anyone else; `drop` doesn't need the lock
-    /// (Mutex's `drop` is fine even if we never lock it).
+    /// Connection for `compile`/elaborate. Wrapped in a `Mutex` because
+    /// [`Connection::request`] needs `&mut` access.
+    connection: Mutex<SidecarConnection>,
+    /// Dedicated connection (and process) for `expandMacro`, so an interactive
+    /// expansion never queues behind — or stalls on — a long/stuck elaborate
+    /// holding `connection`.
+    expand_connection: Mutex<SidecarConnection>,
+    /// The compile sidecar process. Held under a `Mutex` so `shutdown` can
+    /// `wait` without competing with anyone else; `drop` doesn't need the lock.
     child: Mutex<Child>,
-    /// Background task that drains the sidecar's stderr line-by-line and
-    /// re-emits each line through `tracing`. Held to keep the task alive
-    /// for the lifetime of the client; aborted on drop.
+    /// The expand sidecar process.
+    expand_child: Mutex<Child>,
+    /// Background tasks draining each sidecar's stderr line-by-line and
+    /// re-emitting it through `tracing`. Held to keep the tasks alive for the
+    /// lifetime of the client; aborted on drop.
     stderr_pump: Option<JoinHandle<()>>,
+    expand_stderr_pump: Option<JoinHandle<()>>,
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
         if let Some(h) = self.stderr_pump.take() {
+            h.abort();
+        }
+        if let Some(h) = self.expand_stderr_pump.take() {
             h.abort();
         }
     }
@@ -376,7 +400,30 @@ impl Client {
         S: AsRef<std::ffi::OsStr>,
     {
         let program_ref = program.as_ref();
-        let mut command = Command::new(program_ref);
+        // Materialise the args so both sidecars launch with identical command
+        // lines (an `IntoIterator` can only be consumed once).
+        let args: Vec<std::ffi::OsString> =
+            args.into_iter().map(|s| s.as_ref().to_os_string()).collect();
+
+        let (connection, child, stderr_pump) = Self::spawn_one(program_ref, &args)?;
+        let (expand_connection, expand_child, expand_stderr_pump) =
+            Self::spawn_one(program_ref, &args)?;
+        debug!("slang sidecars spawned (compile + expand)");
+        Ok(Self {
+            connection: Mutex::new(connection),
+            expand_connection: Mutex::new(expand_connection),
+            child: Mutex::new(child),
+            expand_child: Mutex::new(expand_child),
+            stderr_pump: Some(stderr_pump),
+            expand_stderr_pump: Some(expand_stderr_pump),
+        })
+    }
+
+    /// Spawn one sidecar process and wire its stdio into a [`Connection`] plus
+    /// a background stderr-draining task. Shared by the compile and expand
+    /// sidecars so they are launched identically.
+    fn spawn_one(program: &Path, args: &[std::ffi::OsString]) -> Result<SpawnedSidecar, ClientError> {
+        let mut command = Command::new(program);
         command
             .args(args)
             .stdin(Stdio::piped())
@@ -388,7 +435,7 @@ impl Client {
             .kill_on_drop(true);
 
         let mut child = command.spawn().map_err(|source| ClientError::Spawn {
-            program: program_ref.display().to_string(),
+            program: program.display().to_string(),
             source,
         })?;
 
@@ -406,14 +453,8 @@ impl Client {
             .ok_or(ClientError::MissingStdio { which: "stderr" })?;
 
         let stderr_pump = tokio::spawn(drain_sidecar_stderr(stderr));
-
         let connection = Connection::new(BufReader::new(stdout), stdin);
-        debug!("sidecar spawned");
-        Ok(Self {
-            connection: Mutex::new(connection),
-            child: Mutex::new(child),
-            stderr_pump: Some(stderr_pump),
-        })
+        Ok((connection, child, stderr_pump))
     }
 
     /// Run a `compile` request against the sidecar.
@@ -432,16 +473,15 @@ impl Client {
         Ok(conn.compile(params).await?)
     }
 
-    /// Run an `expandMacro` request against the sidecar, **blocking** on the
-    /// connection mutex.
+    /// Run an `expandMacro` request against the **dedicated expand sidecar**,
+    /// blocking on its connection mutex.
     ///
-    /// Shares the single connection mutex with [`Client::compile`], so a long
-    /// background elaborate serialises this behind it. Reserved for the
-    /// *explicit* "Expand Macro" command, where the user has asked for the
-    /// expansion and waiting for an in-flight compile to finish is acceptable
-    /// (the command surfaces progress while it waits). The opportunistic hover
-    /// footer must use [`Client::try_expand_macro`] instead so a slow compile
-    /// can never stall a hover.
+    /// Because expansion has its own process and connection
+    /// ([`Self::expand_connection`]), this no longer serialises behind a
+    /// `compile` on the main connection — a long or stuck elaborate can't stall
+    /// it. It only waits behind another in-flight expansion (sub-second), so
+    /// the explicit "Expand Macro" command can safely block on it. Used by the
+    /// command; the hover footer uses [`Client::try_expand_macro`].
     pub async fn expand_macro(
         &self,
         params: &ExpandMacroParams,
@@ -449,61 +489,69 @@ impl Client {
         mimir_core::time_scope!("slang.expand_macro.client_total");
         let mut conn = {
             mimir_core::time_scope!("slang.expand_macro.client_lock_wait");
-            self.connection.lock().await
+            self.expand_connection.lock().await
         };
         Ok(conn.expand_macro(params).await?)
     }
 
     /// Non-blocking variant of [`Client::expand_macro`].
     ///
-    /// If the single connection mutex is currently held — typically by a
-    /// background elaborate — returns [`ClientError::Busy`] immediately
-    /// instead of queuing behind it. This is what the hover macro-expansion
-    /// *footer* uses: a hover is high-frequency and latency-sensitive, so it
-    /// must never block waiting on a multi-second compile. When busy, the
-    /// caller simply omits the footer (the cursor's macro still has its
-    /// `define` shown by the base hover) and the next idle hover fills it in.
+    /// If the dedicated expand connection is momentarily held by another
+    /// expansion, returns [`ClientError::Busy`] immediately instead of queuing.
+    /// This is what the hover macro-expansion *footer* uses: a hover is
+    /// high-frequency and latency-sensitive, so it must never block. When busy,
+    /// the caller omits the footer (the cursor's macro still has its `define`
+    /// shown by the base hover) and the next idle hover fills it in. With the
+    /// dedicated connection this rarely happens — it's no longer contended by
+    /// elaborate — but staying non-blocking keeps hovers cheap.
     pub async fn try_expand_macro(
         &self,
         params: &ExpandMacroParams,
     ) -> Result<ExpandMacroResult, ClientError> {
         mimir_core::time_scope!("slang.expand_macro.client_total");
-        let mut conn = match self.connection.try_lock() {
+        let mut conn = match self.expand_connection.try_lock() {
             Ok(conn) => conn,
             Err(_) => return Err(ClientError::Busy),
         };
         Ok(conn.expand_macro(params).await?)
     }
 
-    /// Send the `shutdown` request, then wait for the child to exit.
+    /// Send the `shutdown` request to **both** sidecars, then wait for each
+    /// child to exit.
     ///
     /// We swallow a "sidecar already gone" error from the request itself
     /// (the sidecar might exit before flushing a response) but propagate
     /// other failures. Caller takes ownership so the type system enforces
     /// "you can't use this client after shutdown."
     pub async fn shutdown(self) -> Result<(), ClientError> {
-        // We only care whether the request *got out*; the sidecar is
-        // allowed to drop the connection without responding to `shutdown`.
-        {
-            let mut conn = self.connection.lock().await;
-            let res: Result<serde_json::Value, _> =
-                conn.request(methods::SHUTDOWN, &serde_json::Value::Null).await;
-            if let Err(e) = res {
-                // `Closed` is the expected outcome. Anything else is worth
-                // a warn so we notice misbehaving sidecars.
-                match e {
-                    ConnectionError::Closed | ConnectionError::Io(_) => {
-                        debug!(error = %e, "sidecar closed during shutdown (expected)");
-                    }
-                    other => warn!(error = %other, "unexpected error during shutdown"),
+        // We only care whether the request *got out*; each sidecar is allowed
+        // to drop its connection without responding to `shutdown`.
+        Self::send_shutdown(&self.connection).await;
+        Self::send_shutdown(&self.expand_connection).await;
+
+        let status = self.child.lock().await.wait().await?;
+        debug!(?status, "compile sidecar exited");
+        let expand_status = self.expand_child.lock().await.wait().await?;
+        debug!(?expand_status, "expand sidecar exited");
+        Ok(())
+    }
+
+    /// Send a `shutdown` request over one connection, logging (but not
+    /// propagating) the expected "connection closed" outcome.
+    async fn send_shutdown(connection: &Mutex<SidecarConnection>) {
+        let mut conn = connection.lock().await;
+        let res: Result<serde_json::Value, _> =
+            conn.request(methods::SHUTDOWN, &serde_json::Value::Null).await;
+        if let Err(e) = res {
+            // `Closed` is the expected outcome. Anything else is worth a warn
+            // so we notice misbehaving sidecars.
+            match e {
+                ConnectionError::Closed | ConnectionError::Io(_) => {
+                    debug!(error = %e, "sidecar closed during shutdown (expected)");
                 }
+                other => warn!(error = %other, "unexpected error during shutdown"),
             }
         }
-
-        let mut child = self.child.lock().await;
-        let status = child.wait().await?;
-        debug!(?status, "sidecar exited");
-        Ok(())
     }
 }
 

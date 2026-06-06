@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import pathlib
 import tempfile
+import time
 import unittest
 
 from .lsp_client import MimirLspClient, file_uri
@@ -233,3 +234,99 @@ class MacroExpandIncludeMemberTest(unittest.TestCase):
         compact = "".join(result["expansion"].split())
         self.assertIn("typedefintwidget;", compact, f"got: {result['expansion']!r}")
         self.assertIn("widget_f", compact, f"token-paste lost: {result['expansion']!r}")
+
+
+# Regression guard for the "Expand Macro does nothing / hover footer never
+# appears" bug: expansion shares NO connection with the heavy elaborate, so a
+# long (or stuck) background compile must not stall it. The project below has a
+# tiny target file plus several large sibling files, so the elaborate holds its
+# (separate) connection for many seconds — far longer than the bound asserted
+# here. Before the dedicated expand sidecar, the command blocked on the compile
+# connection for the *whole* elaborate (the user saw it "do nothing").
+_BUSY_TARGET = "`define A(x) (`B(x)*2)\n`define B(x) ((x)+1)\nmodule top; int y = `A(k); endmodule\n"
+_BUSY_USAGE_LINE = 2
+_BUSY_USAGE_CHAR = 21  # on the `A identifier
+# Big enough that the elaborate runs for well over _MAX_LATENCY_S even on fast
+# hardware; the compile never finishes during the test (the client closes
+# first), so test wall-time stays small regardless.
+_BUSY_SIBLINGS = 8
+_BUSY_MODULES_PER_SIBLING = 6000
+_MAX_LATENCY_S = 8.0
+
+
+class MacroExpandDuringCompileTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        slang_path = _require_slang()
+        cls._tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(cls._tmp.name)
+        (root / "top.sv").write_text(_BUSY_TARGET)
+        files = ["top.sv"]
+        for n in range(_BUSY_SIBLINGS):
+            body = "".join(
+                f"module big{n}_{i}; int z{i}; endmodule\n"
+                for i in range(_BUSY_MODULES_PER_SIBLING)
+            )
+            (root / f"big{n}.sv").write_text(body)
+            files.append(f"big{n}.sv")
+        (root / "files.f").write_text("\n".join(files) + "\n")
+        # debounce_ms = 0 so the elaborate starts immediately on did_open.
+        (root / ".mimir.toml").write_text(
+            '[slang]\nfilelist = "files.f"\ndebounce_ms = 0\n'
+        )
+        cls.lsp = MimirLspClient(env={"MIMIR_SLANG_PATH": slang_path})
+        cls.lsp.initialize(workspace_root=root)
+        cls.uri = file_uri(root / "top.sv")
+        cls.lsp.did_open(cls.uri, _BUSY_TARGET)
+        # Give the background elaborate a moment to acquire its connection.
+        time.sleep(0.3)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.lsp.close()
+        cls._tmp.cleanup()
+
+    def test_command_expands_while_elaborate_is_in_flight(self) -> None:
+        worst = 0.0
+        for _ in range(5):
+            start = time.monotonic()
+            result = self.lsp.request(
+                "mimir/expandMacro",
+                {
+                    "textDocument": {"uri": self.uri},
+                    "position": {"line": _BUSY_USAGE_LINE, "character": _BUSY_USAGE_CHAR},
+                },
+                timeout=30.0,
+            )
+            worst = max(worst, time.monotonic() - start)
+            self.assertIsNotNone(
+                result, "Expand Macro returned nothing while a compile was running"
+            )
+            self.assertEqual(result["name"], "A")
+            self.assertEqual("".join(result["expansion"].split()), "(((k)+1)*2)")
+        # If expansion still shared the compile connection it would have blocked
+        # for the whole multi-second elaborate; the dedicated connection keeps it
+        # well under the bound.
+        self.assertLess(
+            worst,
+            _MAX_LATENCY_S,
+            f"expand blocked {worst:.1f}s — is it still queuing behind elaborate?",
+        )
+
+    def test_hover_footer_appears_while_elaborate_is_in_flight(self) -> None:
+        # The opportunistic hover footer must also reach the (uncontended) expand
+        # connection, not silently drop because the compile connection is busy.
+        result = self.lsp.request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": self.uri},
+                "position": {"line": _BUSY_USAGE_LINE, "character": _BUSY_USAGE_CHAR},
+            },
+            timeout=30.0,
+        )
+        self.assertIsNotNone(result)
+        self.assertIn(
+            "expands to",
+            str(result),
+            "hover footer missing during compile (expand connection contended?)",
+        )
