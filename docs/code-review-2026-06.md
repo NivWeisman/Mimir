@@ -1,5 +1,14 @@
 # Mimir code review — June 2026
 
+> **Status: all findings addressed** in v0.7.36–v0.7.41 (commits
+> `b91b5f6`…`99b8ec0`): A1–A4 + B1–B3 + C1/C3 in v0.7.36, C2/C4/C5 in
+> v0.7.37, D1/D4/D5/D7/D8 in v0.7.38, D2/D3/D6 in v0.7.39, F1–F5 in
+> v0.7.40 (F6 reviewed, intentionally left — env-var names are already
+> unique per test), E1 in v0.7.41. Two deliberate scope notes: the
+> formatting/range_formatting skeleton merge (D7) was skipped because the
+> handlers diverge after the A1 fix, and B1 ships deadlines + framing
+> resync but not sidecar respawn-on-hang (tracked as follow-up).
+
 Full-workspace review: every crate read (`backend.rs`, all `mimir-server`
 services and feature modules, `mimir-syntax` parser/symbols/calls/semantic
 tokens, `mimir-slang` client + protocol, `mimir-ast`, `mimir-core`), plus a
