@@ -87,34 +87,16 @@ pub(crate) fn override_lenses(
 
 /// Walk from `start_class` up the inheritance chain looking for a method named
 /// `method_name`. Returns `(declaring_class, file_url, method_symbol)` of the
-/// nearest ancestor that declares it. Caps at 16 hops and cycle-detects.
+/// nearest ancestor that declares it. Delegates to the shared inheritance
+/// walker in [`crate::chain_resolve`].
 fn find_override(
     wi: &WorkspaceIndex,
     start_class: &str,
     method_name: &str,
 ) -> Option<(String, Url, Symbol)> {
-    let mut current = start_class.to_string();
-    let mut visited = std::collections::HashSet::new();
-    for _ in 0..16 {
-        if !visited.insert(current.clone()) {
-            return None; // inheritance cycle
-        }
-        let class_entry = wi
-            .lookup(&current)
-            .iter()
-            .find(|e| e.symbol.kind == SymbolKind::Class)
-            .cloned()?;
-        let hit = wi.lookup(method_name).iter().find(|e| {
-            e.url == class_entry.url
-                && e.symbol.kind == SymbolKind::Method
-                && class_entry.symbol.full_range.contains_range(e.symbol.full_range)
-        });
-        if let Some(entry) = hit {
-            return Some((current, entry.url.clone(), entry.symbol.clone()));
-        }
-        current = class_entry.symbol.parent_class_name.clone()?;
-    }
-    None
+    crate::chain_resolve::find_member_in_class_chain(wi, start_class, method_name, "override", |k| {
+        k == SymbolKind::Method
+    })
 }
 
 /// Build a CodeLens at `method`'s name pointing at the overridden `target`.

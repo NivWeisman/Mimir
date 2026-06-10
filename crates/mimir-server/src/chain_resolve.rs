@@ -33,22 +33,32 @@ use crate::workspace_index::WorkspaceIndex;
 // (moved from backend.rs; signatures upgraded to return the file URL)
 // --------------------------------------------------------------------------
 
-/// Look up `method_name` declared inside the body of `class_name`, walking
-/// up the inheritance chain via [`Symbol::parent_class_name`].
+/// Maximum number of `extends` hops any inheritance walk will follow.
+/// Real UVM hierarchies are 5–8 deep; 16 catches runaway chains long
+/// before the walk gets expensive.
+const MAX_INHERITANCE_HOPS: usize = 16;
+
+/// Shared inheritance-walk core behind [`find_method_in_class`],
+/// [`find_field_in_class`], and the code-lens override lookup: starting at
+/// `class_name`, look for `member_name` declared inside each class body
+/// (filtered by `kind_matches`), ascending via
+/// [`Symbol::parent_class_name`] on a miss.
 ///
-/// Returns `(file_url, symbol)` so callers can navigate to the declaration
-/// without a separate URL lookup.  Caps at 16 inheritance hops and
-/// cycle-detects via a visited set.
-pub(crate) fn find_method_in_class(
+/// Returns `(declaring_class, file_url, symbol)` of the nearest match.
+/// Caps at [`MAX_INHERITANCE_HOPS`] and cycle-detects via a visited set.
+/// `what` is a label for the trace logs ("method" / "field" / "override").
+pub(crate) fn find_member_in_class_chain(
     wi: &WorkspaceIndex,
     class_name: &str,
-    method_name: &str,
-) -> Option<(Url, Symbol)> {
+    member_name: &str,
+    what: &'static str,
+    kind_matches: impl Fn(MSymbolKind) -> bool,
+) -> Option<(String, Url, Symbol)> {
     let mut current = class_name.to_string();
     let mut visited = std::collections::HashSet::new();
-    for hop in 0..16 {
+    for hop in 0..MAX_INHERITANCE_HOPS {
         if !visited.insert(current.clone()) {
-            debug!(class = %current, hop, "find_method_in_class: inheritance cycle detected");
+            debug!(class = %current, hop, what, "member lookup: inheritance cycle detected");
             return None;
         }
         let class_entry = match wi
@@ -61,62 +71,77 @@ pub(crate) fn find_method_in_class(
             None => {
                 debug!(
                     class = %current,
-                    method = %method_name,
+                    member = %member_name,
                     hop,
-                    "find_method_in_class: class not in workspace index",
+                    what,
+                    "member lookup: class not in workspace index",
                 );
                 return None;
             }
         };
-        let candidates = wi.lookup(method_name);
-        trace!(
-            class = %current,
-            method = %method_name,
-            hop,
-            candidate_count = candidates.len(),
-            "find_method_in_class: scanning method candidates",
-        );
-        if let Some(entry) = candidates
-            .iter()
-            .find(|e| {
-                e.url == class_entry.url
-                    && class_entry.symbol.full_range.contains_range(e.symbol.full_range)
-                    && e.symbol.kind == MSymbolKind::Method
-            })
-        {
+        if let Some(entry) = wi.lookup(member_name).iter().find(|e| {
+            e.url == class_entry.url
+                && class_entry.symbol.full_range.contains_range(e.symbol.full_range)
+                && kind_matches(e.symbol.kind)
+        }) {
             debug!(
                 class = %current,
-                method = %method_name,
+                member = %member_name,
                 hop,
+                what,
                 url = %entry.url,
-                "find_method_in_class: hit",
+                kind = ?entry.symbol.kind,
+                "member lookup: hit",
             );
-            return Some((entry.url.clone(), entry.symbol.clone()));
+            return Some((current, entry.url.clone(), entry.symbol.clone()));
         }
         match class_entry.symbol.parent_class_name {
             Some(parent) => {
                 trace!(
                     from = %current,
                     parent = %parent,
-                    method = %method_name,
+                    member = %member_name,
                     hop,
-                    "find_method_in_class: miss in class — ascending to parent",
+                    what,
+                    "member lookup: miss in class — ascending to parent",
                 );
                 current = parent;
             }
             None => {
                 debug!(
                     class = %current,
-                    method = %method_name,
+                    member = %member_name,
                     hop,
-                    "find_method_in_class: no match and no parent — giving up",
+                    what,
+                    "member lookup: no match and no parent — giving up",
                 );
                 return None;
             }
         }
     }
-    debug!(class = %class_name, method = %method_name, "find_method_in_class: exceeded 16-hop limit");
+    debug!(
+        class = %class_name,
+        member = %member_name,
+        what,
+        "member lookup: exceeded inheritance-hop limit",
+    );
     None
+}
+
+/// Look up `method_name` declared inside the body of `class_name`, walking
+/// up the inheritance chain via [`Symbol::parent_class_name`].
+///
+/// Returns `(file_url, symbol)` so callers can navigate to the declaration
+/// without a separate URL lookup.
+pub(crate) fn find_method_in_class(
+    wi: &WorkspaceIndex,
+    class_name: &str,
+    method_name: &str,
+) -> Option<(Url, Symbol)> {
+    find_member_in_class_chain(wi, class_name, method_name, "method", |k| {
+        k == MSymbolKind::Method
+    })
+    .map(|(_, url, sym)| (url, sym))
 }
 
 /// Variant of [`find_method_in_class`] that matches `Variable`, `Port`, and
@@ -126,76 +151,13 @@ pub(crate) fn find_field_in_class(
     class_name: &str,
     field_name: &str,
 ) -> Option<(Url, Symbol)> {
-    let mut current = class_name.to_string();
-    let mut visited = std::collections::HashSet::new();
-    for hop in 0..16 {
-        if !visited.insert(current.clone()) {
-            debug!(class = %current, hop, "find_field_in_class: inheritance cycle detected");
-            return None;
-        }
-        let class_entry = match wi
-            .lookup(&current)
-            .iter()
-            .find(|e| e.symbol.kind == MSymbolKind::Class)
-            .cloned()
-        {
-            Some(e) => e,
-            None => {
-                debug!(
-                    class = %current,
-                    field = %field_name,
-                    hop,
-                    "find_field_in_class: class not in workspace index",
-                );
-                return None;
-            }
-        };
-        if let Some(entry) = wi
-            .lookup(field_name)
-            .iter()
-            .find(|e| {
-                e.url == class_entry.url
-                    && class_entry.symbol.full_range.contains_range(e.symbol.full_range)
-                    && matches!(
-                        e.symbol.kind,
-                        MSymbolKind::Variable | MSymbolKind::Port | MSymbolKind::Parameter
-                    )
-            })
-        {
-            debug!(
-                class = %current,
-                field = %field_name,
-                hop,
-                url = %entry.url,
-                kind = ?entry.symbol.kind,
-                "find_field_in_class: hit",
-            );
-            return Some((entry.url.clone(), entry.symbol.clone()));
-        }
-        match class_entry.symbol.parent_class_name {
-            Some(parent) => {
-                trace!(
-                    from = %current,
-                    parent = %parent,
-                    field = %field_name,
-                    hop,
-                    "find_field_in_class: miss in class — ascending to parent",
-                );
-                current = parent;
-            }
-            None => {
-                debug!(
-                    class = %current,
-                    field = %field_name,
-                    hop,
-                    "find_field_in_class: no match and no parent — giving up",
-                );
-                return None;
-            }
-        }
-    }
-    debug!(class = %class_name, field = %field_name, "find_field_in_class: exceeded 16-hop limit");
-    None
+    find_member_in_class_chain(wi, class_name, field_name, "field", |k| {
+        matches!(
+            k,
+            MSymbolKind::Variable | MSymbolKind::Port | MSymbolKind::Parameter
+        )
+    })
+    .map(|(_, url, sym)| (url, sym))
 }
 
 // --------------------------------------------------------------------------

@@ -330,6 +330,78 @@ impl Backend {
         self.syntax.cached_tree_and_index(uri).await
     }
 
+    /// Find every occurrence of `name` across the workspace: the cursor
+    /// file (scope-aware), all *other* open-buffer trees, and the
+    /// workspace-cached closed-file trees pre-filtered by the
+    /// identifier-presence index. The shared engine behind `references`
+    /// and `rename`, which scan exactly the same tree set.
+    ///
+    /// Lock discipline: the documents read lock is taken and released
+    /// first; one workspace read-lock hold then covers the closed-tree
+    /// collection and the index lookup inside `collect_references`. The
+    /// two locks are never held together.
+    async fn collect_workspace_references(
+        &self,
+        uri: &Url,
+        cursor_tree: &SyntaxTree,
+        cursor_rope: &Rope,
+        target: MPosition,
+        name: &str,
+        include_declaration: bool,
+    ) -> Vec<Location> {
+        // Snapshot the open-doc trees (excluding the cursor file) under a
+        // single read lock. We clone the trees — `SyntaxTree` is cheap to
+        // clone (`tree_sitter::Tree` is internally `Arc`).
+        let other_open: Vec<(Url, SyntaxTree)> = {
+            let docs = self.documents.read().await;
+            docs.iter()
+                .filter(|(other_uri, _)| *other_uri != uri)
+                .filter_map(|(other_uri, state)| {
+                    state.tree.as_ref().map(|t| (other_uri.clone(), t.clone()))
+                })
+                .collect()
+        };
+
+        // Closed-file trees: all URLs in the workspace tree cache that
+        // aren't the cursor file and aren't already covered by the open
+        // store. Open files are authoritative; closed-file trees carry the
+        // last successfully parsed content from disk.
+        let open_urls: HashSet<&Url> = other_open
+            .iter()
+            .map(|(u, _)| u)
+            .chain(std::iter::once(uri))
+            .collect();
+        let ws = self.workspace.read().await;
+        let closed_trees: Vec<(Url, SyntaxTree)> = {
+            // Pre-filter by identifier presence: skip files that definitely
+            // do not contain `name` as any token. O(1) check per file URL.
+            let candidates = ws.files_containing(name);
+            ws.trees
+                .iter()
+                .filter(|(url, _)| !open_urls.contains(url))
+                .filter(|(url, _)| candidates.is_some_and(|s| s.contains(url)))
+                .map(|(url, tree)| (url.clone(), tree.clone()))
+                .collect()
+        };
+
+        // Merge: open-buffer trees first (the scope-aware cursor file is
+        // handled separately inside collect_references), then closed-file
+        // trees. All are scanned with occurrences_of_scoped.
+        let all_other_trees: Vec<(Url, SyntaxTree)> =
+            other_open.into_iter().chain(closed_trees).collect();
+
+        collect_references(
+            name,
+            uri,
+            cursor_tree,
+            cursor_rope,
+            target,
+            &all_other_trees,
+            &ws.index,
+            include_declaration,
+        )
+    }
+
 
     /// Re-discover the project from `dir` and re-hydrate the workspace symbol
     /// index from the resulting filelist.
@@ -2031,61 +2103,16 @@ impl LanguageServer for Backend {
         };
         let name = name.to_owned();
 
-        // Snapshot the open-doc trees (excluding the cursor file) under a
-        // single read lock, then drop the lock before holding the
-        // workspace-index lock. We clone the trees — `SyntaxTree` is
-        // cheap to clone (`tree_sitter::Tree` is internally `Arc`).
-        let other_open: Vec<(Url, SyntaxTree)> = {
-            let docs = self.documents.read().await;
-            docs.iter()
-                .filter(|(other_uri, _)| **other_uri != uri)
-                .filter_map(|(other_uri, state)| {
-                    state.tree.as_ref().map(|t| (other_uri.clone(), t.clone()))
-                })
-                .collect()
-        };
-
-        // Collect closed-file trees from the workspace tree cache: all
-        // URLs present in the cache that aren't the cursor file and aren't
-        // already covered by the open-document store. Open files are
-        // authoritative; closed-file trees carry the last successfully
-        // parsed content from disk.
-        let open_urls: HashSet<&Url> = other_open
-            .iter()
-            .map(|(u, _)| u)
-            .chain(std::iter::once(&uri))
-            .collect();
-        // One read-lock hold covers both the closed-tree collection and the
-        // index lookup inside collect_references below.
-        let ws = self.workspace.read().await;
-        let closed_trees: Vec<(Url, SyntaxTree)> = {
-            // Pre-filter by identifier presence: skip files that definitely
-            // do not contain `name` as any token. O(1) check per file URL.
-            let candidates = ws.files_containing(&name);
-            ws.trees
-                .iter()
-                .filter(|(url, _)| !open_urls.contains(url))
-                .filter(|(url, _)| candidates.is_some_and(|s| s.contains(url)))
-                .map(|(url, tree)| (url.clone(), tree.clone()))
-                .collect()
-        };
-
-        // Merge: open-buffer trees first (scope-aware cursor file is
-        // handled separately inside collect_references), then closed-file
-        // trees. All are scanned with occurrences_of_scoped.
-        let all_other_trees: Vec<(Url, SyntaxTree)> =
-            other_open.into_iter().chain(closed_trees).collect();
-
-        let locations = collect_references(
-            &name,
-            &uri,
-            &cursor_tree,
-            &cursor_rope,
-            target,
-            &all_other_trees,
-            &ws.index,
-            include_declaration,
-        );
+        let locations = self
+            .collect_workspace_references(
+                &uri,
+                &cursor_tree,
+                &cursor_rope,
+                target,
+                &name,
+                include_declaration,
+            )
+            .await;
         debug!(count = locations.len(), name = %name, "references returned");
         Ok(Some(locations))
     }
@@ -2164,51 +2191,16 @@ impl LanguageServer for Backend {
         };
         let name = name.to_owned();
 
-        // Snapshot open-buffer trees (excluding cursor file) under one lock,
-        // then drop the lock before acquiring the workspace lock.
-        let other_open: Vec<(Url, SyntaxTree)> = {
-            let docs = self.documents.read().await;
-            docs.iter()
-                .filter(|(other_uri, _)| **other_uri != uri)
-                .filter_map(|(other_uri, state)| {
-                    state.tree.as_ref().map(|t| (other_uri.clone(), t.clone()))
-                })
-                .collect()
-        };
-
-        // Collect closed-file trees from the workspace tree cache, pre-filtered
-        // by identifier presence (same pattern as `references`).
-        let open_urls: HashSet<&Url> = other_open
-            .iter()
-            .map(|(u, _)| u)
-            .chain(std::iter::once(&uri))
-            .collect();
-        let closed_trees: Vec<(Url, SyntaxTree)> = {
-            let ws = self.workspace.read().await;
-            let candidates = ws.files_containing(&name);
-            ws.trees
-                .iter()
-                .filter(|(url, _)| !open_urls.contains(url))
-                .filter(|(url, _)| candidates.is_some_and(|s| s.contains(url)))
-                .map(|(url, tree)| (url.clone(), tree.clone()))
-                .collect()
-        };
-
-        let all_other_trees: Vec<(Url, SyntaxTree)> =
-            other_open.into_iter().chain(closed_trees).collect();
-
-        let ws = self.workspace.read().await;
-        let locations = collect_references(
-            &name,
-            &uri,
-            &cursor_tree,
-            &cursor_rope,
-            target,
-            &all_other_trees,
-            &ws.index,
-            true, // always include the declaration site in a rename
-        );
-        drop(ws);
+        let locations = self
+            .collect_workspace_references(
+                &uri,
+                &cursor_tree,
+                &cursor_rope,
+                target,
+                &name,
+                true, // always include the declaration site in a rename
+            )
+            .await;
 
         if locations.is_empty() {
             debug!(name = %name, "rename: no occurrences found");
@@ -3549,106 +3541,37 @@ fn synth_method_symbol(
 // Syntax-only member completion (AST fallback for `super.` / `this.` / `obj.` / chains)
 // --------------------------------------------------------------------------
 
-/// Extract the plain identifier immediately before the `.` trigger.
+/// Parse the receiver chain immediately before the `.` trigger.
 ///
-/// Given `super.` at cursor, returns `"super"`. Given `obj.fo` at cursor
-/// (partial prefix), returns `"obj"`. Returns `None` when the trigger is
-/// `::` (package scope) or when nothing plain sits left of the dot (e.g. a
-/// closing `)` from a chained call like `get_obj().`).
+/// For `a.b.` at cursor returns `["a", "b"]`; for `obj.` returns `["obj"]`;
+/// for `super.fo` (partial prefix typed) returns `["super"]`. Returns
+/// `None` when the trigger is `::` (package scope) or when a
+/// non-identifier character (e.g. `)` from a chained call like
+/// `get_obj().`) sits left of a dot.
 ///
-/// Single-segment variant kept for tests; [`receiver_chain_before_dot`] is
-/// the production path used by [`syntax_member_completion`].
-#[cfg(test)]
-fn receiver_ident_before_dot(rope: &Rope, pos: MPosition) -> Option<String> {
-    if (pos.line as usize) >= rope.len_lines() {
-        return None;
-    }
-    let line = rope.line(pos.line as usize);
-
-    let mut buf = String::new();
-    let mut utf16: u32 = 0;
-    for ch in line.chars() {
-        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
-            break;
-        }
-        buf.push(ch);
-        utf16 += ch.len_utf16() as u32;
-    }
-
-    let chars: Vec<char> = buf.chars().collect();
-    let mut i = chars.len();
-
-    // Strip the completion prefix (e.g. "fo" in "obj.fo").
-    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
-        i -= 1;
-    }
-
-    // Only handle `.` — not `::`.
-    if i == 0 || chars[i - 1] != '.' {
-        return None;
-    }
-    i -= 1; // skip the `.`
-
-    // Read the receiver identifier backwards.
-    let end = i;
-    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
-        i -= 1;
-    }
-    if i == end {
-        return None;
-    }
-    Some(chars[i..end].iter().collect())
-}
-
-/// Extend [`receiver_ident_before_dot`] to handle multi-hop chains.
-///
-/// For `a.b.` at cursor returns `["a", "b"]`; for `obj.` returns `["obj"]`.
-/// Returns `None` when the trigger is `::`, or when a non-identifier character
-/// (e.g. `)` from a call return) sits left of the dot.
+/// Built on the shared cursor-context scanners in
+/// [`mimir_syntax::symbols`] (`line_prefix_at` / `trailing_ident_start`).
 fn receiver_chain_before_dot(rope: &Rope, pos: MPosition) -> Option<Vec<String>> {
-    if (pos.line as usize) >= rope.len_lines() {
+    let buf = mimir_syntax::symbols::line_prefix_at(rope, pos)?;
+
+    // Strip the completion prefix (e.g. "fo" in "obj.fo"); only handle a
+    // `.` trigger — `::` is package scope, handled elsewhere.
+    let mut rest = &buf[..mimir_syntax::symbols::trailing_ident_start(&buf)];
+    if !rest.ends_with('.') {
         return None;
     }
-    let line = rope.line(pos.line as usize);
-
-    let mut buf = String::new();
-    let mut utf16: u32 = 0;
-    for ch in line.chars() {
-        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
-            break;
-        }
-        buf.push(ch);
-        utf16 += ch.len_utf16() as u32;
-    }
-
-    let chars: Vec<char> = buf.chars().collect();
-    let mut i = chars.len();
-
-    // Strip the completion prefix.
-    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
-        i -= 1;
-    }
-
-    // Only handle `.` — not `::`.
-    if i == 0 || chars[i - 1] != '.' {
-        return None;
-    }
-    i -= 1; // skip the `.`
 
     // Read segments backwards, stopping at a non-identifier non-dot char.
     let mut segments: Vec<String> = Vec::new();
     loop {
-        let end = i;
-        while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
-            i -= 1;
-        }
-        if i == end {
+        rest = &rest[..rest.len() - 1]; // consume the `.`
+        let start = mimir_syntax::symbols::trailing_ident_start(rest);
+        if start == rest.len() {
             return None; // non-identifier char (e.g. `)`) — bail
         }
-        segments.push(chars[i..end].iter().collect());
-        if i > 0 && chars[i - 1] == '.' {
-            i -= 1; // consume the `.` and read the next segment
-        } else {
+        segments.push(rest[start..].to_owned());
+        rest = &rest[..start];
+        if !rest.ends_with('.') {
             break;
         }
     }
@@ -6347,37 +6270,43 @@ mod tests {
     // syntax_member_completion helpers
     // ----------------------------------------------------------------------
 
-    /// `receiver_ident_before_dot` extracts the identifier left of the `.`.
+    /// `receiver_chain_before_dot` extracts the identifier(s) left of the `.`.
     #[test]
-    fn receiver_ident_before_dot_super() {
+    fn receiver_chain_before_dot_super() {
         let rope = Rope::from_str("    super.");
         // cursor after the dot (col 10)
         let pos = MPosition::new(0, 10);
-        assert_eq!(receiver_ident_before_dot(&rope, pos).as_deref(), Some("super"));
+        assert_eq!(
+            receiver_chain_before_dot(&rope, pos),
+            Some(vec!["super".to_string()]),
+        );
     }
 
     #[test]
-    fn receiver_ident_before_dot_with_prefix() {
+    fn receiver_chain_before_dot_with_prefix() {
         // partial prefix: "obj.fo" — cursor at end
         let rope = Rope::from_str("obj.fo");
         let pos = MPosition::new(0, 6);
-        assert_eq!(receiver_ident_before_dot(&rope, pos).as_deref(), Some("obj"));
+        assert_eq!(
+            receiver_chain_before_dot(&rope, pos),
+            Some(vec!["obj".to_string()]),
+        );
     }
 
     #[test]
-    fn receiver_ident_before_dot_chained_call_returns_none() {
+    fn receiver_chain_before_dot_chained_call_returns_none() {
         // "get_obj()." — nothing plain before the dot
         let rope = Rope::from_str("get_obj().");
         let pos = MPosition::new(0, 10);
-        assert!(receiver_ident_before_dot(&rope, pos).is_none());
+        assert!(receiver_chain_before_dot(&rope, pos).is_none());
     }
 
     #[test]
-    fn receiver_ident_before_dot_scope_trigger_returns_none() {
+    fn receiver_chain_before_dot_scope_trigger_returns_none() {
         // "::" is not a `.` trigger
         let rope = Rope::from_str("pkg::");
         let pos = MPosition::new(0, 5);
-        assert!(receiver_ident_before_dot(&rope, pos).is_none());
+        assert!(receiver_chain_before_dot(&rope, pos).is_none());
     }
 
     /// `collect_class_members` returns all symbols inside a class body,

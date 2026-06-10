@@ -1869,12 +1869,25 @@ fn walk_for_occurrences_scoped(
 /// is out of bounds.
 #[must_use]
 pub fn prefix_at(rope: &Rope, pos: Position) -> Option<String> {
+    let buf = line_prefix_at(rope, pos)?;
+    let start = trailing_ident_start(&buf);
+    Some(buf[start..].to_owned())
+}
+
+/// Collect the characters of `pos.line` strictly before the UTF-16 column
+/// `pos.character` — "what sits left of the cursor on this line".
+///
+/// The shared first step of every cursor-context scanner (completion
+/// prefix, `.`/`::`/`` ` `` trigger detection, receiver-chain parsing).
+/// Respects surrogate-pair widths when advancing the UTF-16 column.
+/// Returns `None` only when `pos.line` is out of bounds.
+#[must_use]
+pub fn line_prefix_at(rope: &Rope, pos: Position) -> Option<String> {
     if (pos.line as usize) >= rope.len_lines() {
         return None;
     }
     let line_slice = rope.line(pos.line as usize);
 
-    // Collect chars up to the UTF-16 column, respecting surrogate-pair widths.
     let mut buf = String::new();
     let mut utf16: u32 = 0;
     for ch in line_slice.chars() {
@@ -1884,18 +1897,22 @@ pub fn prefix_at(rope: &Rope, pos: Position) -> Option<String> {
         buf.push(ch);
         utf16 += ch.len_utf16() as u32;
     }
+    Some(buf)
+}
 
-    // Extract the trailing [A-Za-z0-9_$]* suffix from `buf`.
-    // Walk char_indices in reverse; stop at the first non-identifier char.
-    let start = buf
-        .char_indices()
+/// Byte index in `s` where its trailing identifier run (`[A-Za-z0-9_$]*`)
+/// begins; `s.len()` when `s` ends in a non-identifier character.
+///
+/// The shared second step of the cursor-context scanners: everything from
+/// the returned index is the partial identifier being typed, and the text
+/// before it is where a trigger (`.`, `::`, `` ` ``) would sit.
+#[must_use]
+pub fn trailing_ident_start(s: &str) -> usize {
+    s.char_indices()
         .rev()
         .take_while(|(_, ch)| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$'))
         .last()
-        .map(|(i, _)| i)
-        .unwrap_or(buf.len());
-
-    Some(buf[start..].to_owned())
+        .map_or(s.len(), |(i, _)| i)
 }
 
 // --------------------------------------------------------------------------

@@ -429,34 +429,15 @@ pub(crate) fn m_range_to_lsp(r: MRange) -> Range {
 /// cursor. `is_package_scope` is `true` for `::`, `false` for `.`.
 /// Returns `None` when no trigger is found.
 pub(crate) fn detect_member_access(rope: &Rope, pos: MPosition) -> Option<(bool, String)> {
-    if (pos.line as usize) >= rope.len_lines() {
-        return None;
-    }
-    let line = rope.line(pos.line as usize);
+    let buf = mimir_syntax::symbols::line_prefix_at(rope, pos)?;
+    let start = mimir_syntax::symbols::trailing_ident_start(&buf);
+    let (before, prefix) = buf.split_at(start);
 
-    let mut buf = String::new();
-    let mut utf16: u32 = 0;
-    for ch in line.chars() {
-        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
-            break;
-        }
-        buf.push(ch);
-        utf16 += ch.len_utf16() as u32;
+    if before.ends_with('.') {
+        return Some((false, prefix.to_owned()));
     }
-
-    let chars: Vec<char> = buf.chars().collect();
-    let mut i = chars.len();
-
-    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$') {
-        i -= 1;
-    }
-    let prefix: String = chars[i..].iter().collect();
-
-    if i > 0 && chars[i - 1] == '.' {
-        return Some((false, prefix));
-    }
-    if i >= 2 && chars[i - 2] == ':' && chars[i - 1] == ':' {
-        return Some((true, prefix));
+    if before.ends_with("::") {
+        return Some((true, prefix.to_owned()));
     }
 
     None
@@ -467,31 +448,16 @@ pub(crate) fn detect_member_access(rope: &Rope, pos: MPosition) -> Option<(bool,
 /// Returns `Some(prefix)` when the identifier (or empty string) immediately
 /// before the cursor is preceded by a backtick. Returns `None` otherwise.
 pub(crate) fn detect_macro_trigger(rope: &Rope, pos: MPosition) -> Option<String> {
-    if (pos.line as usize) >= rope.len_lines() {
-        return None;
-    }
-    let line = rope.line(pos.line as usize);
+    let buf = mimir_syntax::symbols::line_prefix_at(rope, pos)?;
+    // `trailing_ident_start` includes `$` in its identifier set; macro names
+    // can't contain `$`, but a `$` directly after a backtick isn't valid SV
+    // either way, so sharing the scanner only changes behaviour on input
+    // that never completes to anything.
+    let start = mimir_syntax::symbols::trailing_ident_start(&buf);
+    let (before, prefix) = buf.split_at(start);
 
-    let mut buf = String::new();
-    let mut utf16: u32 = 0;
-    for ch in line.chars() {
-        if matches!(ch, '\n' | '\r') || utf16 >= pos.character {
-            break;
-        }
-        buf.push(ch);
-        utf16 += ch.len_utf16() as u32;
-    }
-
-    let chars: Vec<char> = buf.chars().collect();
-    let mut i = chars.len();
-
-    while i > 0 && matches!(chars[i - 1], 'A'..='Z' | 'a'..='z' | '0'..='9' | '_') {
-        i -= 1;
-    }
-    let prefix: String = chars[i..].iter().collect();
-
-    if i > 0 && chars[i - 1] == '`' {
-        return Some(prefix);
+    if before.ends_with('`') {
+        return Some(prefix.to_owned());
     }
 
     None
