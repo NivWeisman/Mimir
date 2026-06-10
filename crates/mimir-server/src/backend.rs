@@ -905,7 +905,7 @@ impl Backend {
         let rope = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
-                Some(state) => Rope::from_str(&state.document.text()),
+                Some(state) => state.document.rope().clone(),
                 None => {
                     debug!("hover: URI not in open-doc store");
                     return Ok(None);
@@ -1496,6 +1496,10 @@ impl LanguageServer for Backend {
         // user may have changed it via another editor since we last read it,
         // so drop the entire cache rather than risk serving stale text.
         self.slang.clear_closed_file_cache().await;
+        // Closed documents can't be hovered, so their macro-expansion
+        // history is dead weight — drop it or the map grows unbounded
+        // across a long session.
+        self.adapter.evict_expansions(&uri).await;
         // LSP spec: clear diagnostics for closed docs by publishing empty.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
@@ -1598,7 +1602,7 @@ impl LanguageServer for Backend {
         if let Some(ast) = self.adapter.cached_ast().await {
             let rope = {
                 let docs = self.documents.read().await;
-                docs.get(&uri).map(|s| Rope::from_str(&s.document.text()))
+                docs.get(&uri).map(|s| s.document.rope().clone())
             };
             let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
             if let (Some(rope), Some(path)) = (rope, file_path) {
@@ -1631,7 +1635,7 @@ impl LanguageServer for Backend {
         if let Some(ast) = self.adapter.cached_ast().await {
             let rope = {
                 let docs = self.documents.read().await;
-                docs.get(&uri).map(|s| Rope::from_str(&s.document.text()))
+                docs.get(&uri).map(|s| s.document.rope().clone())
             };
             let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
             if let (Some(rope), Some(path)) = (rope, file_path) {
@@ -1663,7 +1667,7 @@ impl LanguageServer for Backend {
         if let Some(ast) = self.adapter.cached_ast().await {
             let rope = {
                 let docs = self.documents.read().await;
-                docs.get(&uri).map(|s| Rope::from_str(&s.document.text()))
+                docs.get(&uri).map(|s| s.document.rope().clone())
             };
             let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
             if let (Some(rope), Some(path)) = (rope, file_path) {
@@ -2051,8 +2055,10 @@ impl LanguageServer for Backend {
             .map(|(u, _)| u)
             .chain(std::iter::once(&uri))
             .collect();
+        // One read-lock hold covers both the closed-tree collection and the
+        // index lookup inside collect_references below.
+        let ws = self.workspace.read().await;
         let closed_trees: Vec<(Url, SyntaxTree)> = {
-            let ws = self.workspace.read().await;
             // Pre-filter by identifier presence: skip files that definitely
             // do not contain `name` as any token. O(1) check per file URL.
             let candidates = ws.files_containing(&name);
@@ -2070,7 +2076,6 @@ impl LanguageServer for Backend {
         let all_other_trees: Vec<(Url, SyntaxTree)> =
             other_open.into_iter().chain(closed_trees).collect();
 
-        let ws = self.workspace.read().await;
         let locations = collect_references(
             &name,
             &uri,
@@ -2260,7 +2265,7 @@ impl LanguageServer for Backend {
         let (rope, version) = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
-                Some(s) => (Rope::from_str(&s.document.text()), s.document.version()),
+                Some(s) => (s.document.rope().clone(), s.document.version()),
                 None => return Ok(base),
             }
         };
@@ -2528,7 +2533,7 @@ impl LanguageServer for Backend {
         let rope = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
-                Some(state) => Rope::from_str(&state.document.text()),
+                Some(state) => state.document.rope().clone(),
                 None => {
                     debug!("semantic_tokens_full: URI not in open-doc store");
                     return Ok(None);
@@ -2573,7 +2578,7 @@ impl LanguageServer for Backend {
         let rope = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
-                Some(state) => Rope::from_str(&state.document.text()),
+                Some(state) => state.document.rope().clone(),
                 None => {
                     debug!("semantic_tokens_range: URI not in open-doc store");
                     return Ok(None);
@@ -2624,7 +2629,7 @@ impl LanguageServer for Backend {
         if let Some(ast) = self.adapter.cached_ast().await {
             let rope = {
                 let docs = self.documents.read().await;
-                docs.get(&uri).map(|s| Rope::from_str(&s.document.text()))
+                docs.get(&uri).map(|s| s.document.rope().clone())
             };
             let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
             if let (Some(rope), Some(path)) = (rope, file_path) {
@@ -3039,17 +3044,16 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         let cfg = self.current_formatter_config().await;
-        let source = {
+        let (source, rope) = {
             let docs = self.documents.read().await;
             match docs.get(&params.text_document.uri) {
-                Some(state) => state.document.text().to_owned(),
+                Some(state) => (state.document.text(), state.document.rope().clone()),
                 None => {
                     debug!("formatting: URI not in open-doc store");
                     return Ok(None);
                 }
             }
         };
-        let rope = ropey::Rope::from_str(&source);
         let wrapped = if cfg.wrap_ifdefs {
             let w = wrap_ifdefs(&source);
             if w.has_ifdefs {
@@ -3117,17 +3121,16 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         let cfg = self.current_formatter_config().await;
-        let source = {
+        let (source, rope) = {
             let docs = self.documents.read().await;
             match docs.get(&params.text_document.uri) {
-                Some(state) => state.document.text().to_owned(),
+                Some(state) => (state.document.text(), state.document.rope().clone()),
                 None => {
                     debug!("range_formatting: URI not in open-doc store");
                     return Ok(None);
                 }
             }
         };
-        let rope = ropey::Rope::from_str(&source);
         let wrapped = if cfg.wrap_ifdefs {
             let w = wrap_ifdefs(&source);
             if w.has_ifdefs {
@@ -3210,8 +3213,7 @@ impl LanguageServer for Backend {
         let line_text: Option<String> = {
             let docs = self.documents.read().await;
             docs.get(&resolve.url).and_then(|state| {
-                let rope = Rope::from_str(&state.document.text());
-                read_line_trimmed(&rope, resolve.line)
+                read_line_trimmed(state.document.rope(), resolve.line)
             })
         }
         .or_else(|| {
@@ -3914,7 +3916,7 @@ fn hover_for_symbol(
 ) -> Option<Hover> {
     let rope_from_doc: Option<Rope> = docs
         .get(sym_url)
-        .map(|s| Rope::from_str(&s.document.text()));
+        .map(|s| s.document.rope().clone());
 
     // 1. Callable signatures (function/task/method/macro).
     if let Some(sig) = mimir_syntax::signature::signature_for(sym) {

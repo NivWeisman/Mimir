@@ -392,6 +392,17 @@ impl SlangAdapter {
         *self.cached_ast.write().await = None;
         debug!("cached MimirAst invalidated");
     }
+
+    /// Drop the expansion cache for one document.
+    ///
+    /// Called from `did_close` — the per-document bucket is capped, but the
+    /// map itself would otherwise grow one bucket per URL ever hovered and
+    /// never shrink across a long session.
+    pub(crate) async fn evict_expansions(&self, uri: &Url) {
+        if self.expansion_cache.write().await.remove(uri).is_some() {
+            debug!(uri = %uri, "expansion cache: evicted closed document");
+        }
+    }
 }
 
 #[cfg(test)]
