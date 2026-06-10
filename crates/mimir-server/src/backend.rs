@@ -128,7 +128,7 @@ pub(crate) struct Backend {
     /// assembly helper.
     slang: Arc<SlangService>,
 
-    /// Drives the `compile` RPC and caches the resulting [`MimirAst`].
+    /// Drives the `compile` RPC and caches the resulting `MimirAst`.
     /// LSP feature handlers read `adapter.cached_ast()` to answer queries
     /// without waiting for the next background compile cycle.
     adapter: Arc<SlangAdapter>,
@@ -165,11 +165,7 @@ impl Backend {
         let slang = Arc::new(SlangService::new(documents.clone(), slang));
         let adapter = Arc::new(SlangAdapter::new(slang.clone()));
         Self {
-            syntax: SyntaxService::new(
-                documents.clone(),
-                ts.clone(),
-                workspace.clone(),
-            ),
+            syntax: SyntaxService::new(documents.clone(), ts.clone()),
             elaborate: ElaborateService::new(adapter.clone(), client.clone(), workspace.clone()),
             slang,
             adapter,
@@ -2058,13 +2054,13 @@ impl LanguageServer for Backend {
     /// cursor. Tree-sitter only — the slang sidecar doesn't yet expose a
     /// `references` RPC. v1 shape:
     ///
-    /// 1. **Same file**: scope-aware via [`occurrences_of_at`]. Two `phase`
+    /// 1. **Same file**: scope-aware via `occurrences_of_at`. Two `phase`
     ///    locals in different methods don't bleed into each other; a
     ///    free-standing reference whose declaration isn't visible
     ///    (`super.x`) falls back to whole-file matching, matching what
     ///    `documentHighlight` does.
     /// 2. **Other open buffers**: whole-file lexical match via
-    ///    [`occurrences_of`]. Parse trees for open docs are already cached
+    ///    `occurrences_of`. Parse trees for open docs are already cached
     ///    in [`Backend::documents`], so this is essentially free.
     /// 3. **Closed filelist-hydrated files**: the workspace index only
     ///    retains `Symbol` (name + ranges), not parse trees, so we
@@ -2235,7 +2231,6 @@ impl LanguageServer for Backend {
     /// for macros. Receiver-aware for `this.X` / `super.X` / `obj.X` /
     /// multi-hop chains — uses `chain_resolve` for class-member lookup.
     ///
-    /// Slang-first when configured: routes through
     /// Slang-first when configured: calls `slang.definition` and reads the
     /// declaration line at the resolved location. On transport error or
     /// an empty slang result, falls through to the tree-sitter path —
@@ -2978,13 +2973,11 @@ impl LanguageServer for Backend {
         Ok(Box::pin(self.syntax_completion(&uri, target)).await.map(into_incomplete))
     }
 
-    /// Lazily enrich a completion item with the declaration line as
-    /// markdown documentation. Items without a [`CompletionResolveData`]
-    /// payload (keywords, slang-sourced items) are returned unchanged.
-    ///
-    /// Cheap path: one rope slice on the document text — no parser run,
-    /// no workspace scan. If the document isn't open and isn't on disk,
-    /// the documentation is left empty.
+    /// Whole-file formatting via `verible-verilog-format`. Wraps
+    /// `` `ifdef `` blocks in format-off pragmas first (when enabled) so
+    /// Verible can parse the rest, strips them from the output, and
+    /// returns a single whole-document edit. Returns `None` when the
+    /// feature is toggled off, the document isn't open, or Verible fails.
     #[instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn formatting(
         &self,
@@ -3146,6 +3139,13 @@ impl LanguageServer for Backend {
         }
     }
 
+    /// Lazily enrich a completion item with the declaration line as
+    /// markdown documentation. Items without a [`CompletionResolveData`]
+    /// payload (keywords, slang-sourced items) are returned unchanged.
+    ///
+    /// Cheap path: one rope slice on the document text — no parser run,
+    /// no workspace scan. If the document isn't open and isn't on disk,
+    /// the documentation is left empty.
     #[instrument(level = "debug", skip_all, fields(label = %item.label))]
     async fn completion_resolve(&self, item: CompletionItem) -> LspResult<CompletionItem> {
         mimir_core::time_scope!("lsp.completion_resolve");
@@ -3935,7 +3935,7 @@ fn hover_markdown(line: &str) -> Hover {
 /// Hover for IEEE 1800-2017 built-in methods (`push_back`, `rand_mode`,
 /// `len`, `toupper`, `exists`, …).
 ///
-/// Runs after [`hover_via_tree_sitter`] returns `None` so any user-defined
+/// Runs after `hover_via_tree_sitter` returns `None` so any user-defined
 /// method with the same name shadows the built-in entry. The fallback chain:
 ///
 /// * `this` / `super` receiver → universal methods only.

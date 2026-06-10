@@ -7,7 +7,7 @@
 //!
 //! Verible always outputs the entire file even when `--lines` restricts which
 //! lines it rewrites; callers therefore replace the whole document with a
-//! single [`lsp_types::TextEdit`].
+//! single `lsp_types::TextEdit`.
 //!
 //! ## Preprocessor handling
 //!

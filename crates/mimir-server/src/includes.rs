@@ -6,7 +6,7 @@
 //!
 //! 1. [`crate::workspace_index`] — so tree-sitter symbol indexing follows
 //!    `` `include`` chains and not just the explicit filelist.
-//! 2. [`crate::backend::assemble_elaborate_params`] — so unsaved edits in
+//! 2. [`crate::slang_service::assemble_elaborate_params`] — so unsaved edits in
 //!    `` `include`` d files reach slang via the `files` array (instead of
 //!    relying on slang's own on-disk lookup, which never sees in-memory
 //!    edits).

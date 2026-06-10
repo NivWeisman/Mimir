@@ -3,7 +3,7 @@
 //! Given a [`Symbol`] that has a `params` list, [`signature_for`] formats
 //! the function/task/method/macro signature into a string label and records
 //! the byte offsets of each parameter within that label. The server crate
-//! converts these into [`lsp_types::SignatureInformation`] / [`lsp_types::ParameterInformation`]
+//! converts these into `lsp_types::SignatureInformation` / `lsp_types::ParameterInformation`
 //! at the boundary.
 //!
 //! ## Label format

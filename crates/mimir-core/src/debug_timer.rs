@@ -1,6 +1,6 @@
 //! Debug-only scope timing.
 //!
-//! Drop a [`ScopeTimer::new`] call (or the [`time_scope!`] macro, which
+//! Drop a [`ScopeTimer::new`] call (or the [`time_scope!`](crate::time_scope) macro, which
 //! is just a one-liner wrapper) at the top of any function or block.
 //! When `MIMIR_DEBUG_TIMING=1` is set in the server environment, an
 //! info-level `tracing` event fires on scope exit with the elapsed

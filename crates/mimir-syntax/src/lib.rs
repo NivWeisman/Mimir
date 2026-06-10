@@ -1,6 +1,6 @@
 //! # `mimir-syntax` — SystemVerilog parsing for Mimir
 //!
-//! This crate is a thin wrapper around [`tree-sitter`] and the
+//! This crate is a thin wrapper around `tree-sitter` and the
 //! `tree-sitter-verilog` grammar. It owns three responsibilities:
 //!
 //! 1. **Construct parsers.** [`SyntaxParser`] holds a `tree_sitter::Parser`

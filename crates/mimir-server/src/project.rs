@@ -78,7 +78,7 @@ pub enum ProjectError {
     FilelistTooDeep {
         /// The filelist that pushed us over the limit.
         path: PathBuf,
-        /// The configured limit (i.e. [`FILELIST_MAX_DEPTH`]).
+        /// The configured limit (i.e. `FILELIST_MAX_DEPTH` in `filelist.rs`).
         limit: usize,
     },
 
@@ -672,15 +672,10 @@ impl Default for FormatterConfig {
 /// A `.mimir.toml` plus its expanded filelist, with all paths absolutised
 /// and `+define+`s parsed into structured [`MacroDefine`]s.
 ///
-/// This is what Stage 3 consumes to build the `ElaborateParams` for each
-/// elaborate call. The `files` list is the *on-disk* set; the call site is
-/// expected to swap in any in-memory document text for files the user is
-/// editing (so unsaved changes participate in elaboration).
-//
-// `dead_code` is silenced because Stage 3 hasn't started reading these
-// fields yet; the struct is constructed and held by the backend but not
-// otherwise consumed.
-#[allow(dead_code)]
+/// This is what `SlangService` consumes to build the `ElaborateParams` for
+/// each elaborate call. The `files` list is the *on-disk* set; the call
+/// site is expected to swap in any in-memory document text for files the
+/// user is editing (so unsaved changes participate in elaboration).
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedProject {
     /// Directory the `.mimir.toml` lives in. Used as the base for any
@@ -713,7 +708,7 @@ pub struct ResolvedProject {
     /// Inlay-hint label mode for method / function / task calls. Parsed from
     /// `[inlay_hints] method_hint` in `.mimir.toml`; defaults to `Name`.
     pub method_hint_mode: mimir_syntax::MethodHintMode,
-    /// Raw flags forwarded to [`ElaborateParams::extra_args`] on each compile.
+    /// Raw flags forwarded to `ElaborateParams::extra_args` on each compile.
     /// Set from `[slang] extra_args` in `.mimir.toml`.
     pub slang_extra_args: Vec<String>,
     /// When `true`, the sidecar parses every `is_compilation_unit: true`

@@ -236,7 +236,7 @@ impl ElaborateService {
         pending_guard.insert(trigger_uri, (generation, handle));
     }
 
-    /// Reset the input hash so the next [`schedule`] call always runs the
+    /// Reset the input hash so the next [`Self::schedule`] call always runs the
     /// sidecar, even if the file contents haven't changed.
     ///
     /// Call this after a project reload where the filelist or include dirs

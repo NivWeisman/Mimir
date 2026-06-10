@@ -71,7 +71,7 @@ pub enum SymbolKind {
     /// `function … foo(); … endfunction` declared at file/module/package scope.
     Function,
     /// `function`/`task` declared inside a `class` body. Distinguished
-    /// from [`Function`]/[`Task`] so the editor's outline view (and
+    /// from [`Self::Function`]/[`Self::Task`] so the editor's outline view (and
     /// future call-hierarchy work) can present class members as methods.
     Method,
     /// `typedef … foo;` (struct, enum, alias).
@@ -1664,7 +1664,7 @@ fn walk_for_occurrences(
 /// non-shadowed occurrences file-wide — suitable for cross-file reference
 /// scanning where there is no cursor anchor.
 ///
-/// Calls [`walk_for_occurrences_scoped`] from the file root so any nested
+/// Calls `walk_for_occurrences_scoped` from the file root so any nested
 /// scope that introduces its own binding for `name` is pruned: a local
 /// `int foo;` inside `function bar` will not pollute results when the
 /// caller is searching for a module-level `foo`.

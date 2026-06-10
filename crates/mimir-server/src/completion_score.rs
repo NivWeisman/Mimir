@@ -9,7 +9,7 @@
 //! lets us swap in a different scorer later without touching the LSP
 //! routing layer.
 
-use nucleo_matcher::{pattern::CaseMatching, Config, Matcher, Utf32Str};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Build a fresh [`Matcher`] suitable for one completion call.
 ///
@@ -27,10 +27,9 @@ pub fn matcher() -> Matcher {
 ///   0..1500 for typical SV identifiers).
 /// * Returns `None` for a non-match.
 ///
-/// `_case` matches case-insensitively, matching today's `starts_with`
-/// behaviour for SV (which is case-sensitive but identifiers are usually
-/// lowercase, and editors often type in mixed case).
-#[allow(unused)]
+/// Matching is case-insensitive via `Config::DEFAULT`'s smart-case
+/// handling — SV is case-sensitive but identifiers are usually lowercase,
+/// and editors often type in mixed case.
 pub fn score(matcher: &mut Matcher, prefix: &str, candidate: &str) -> Option<u32> {
     if prefix.is_empty() {
         return Some(0);
@@ -62,14 +61,6 @@ pub const SAME_FILE_BOOST: u32 = 10_000;
 /// Applied as `score / KEYWORD_DIVIDE` then no boost — even a perfect
 /// keyword score lands well below any user symbol.
 pub const KEYWORD_DIVIDE: u32 = 4;
-
-// CaseMatching is unused right now (we rely on Config::DEFAULT's case
-// handling). Leave the import live so a future case-policy change has a
-// single grep target.
-#[allow(dead_code)]
-fn _case_marker() -> CaseMatching {
-    CaseMatching::Smart
-}
 
 #[cfg(test)]
 mod tests {

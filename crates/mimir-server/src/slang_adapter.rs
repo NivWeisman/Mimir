@@ -8,7 +8,7 @@
 //! [`crate::elaborate_service::ElaborateService`] can use for diagnostic
 //! publishing.
 //!
-//! [`Backend`] reads [`SlangAdapter::cached_ast`] to answer LSP feature
+//! [`crate::backend::Backend`] reads [`SlangAdapter::cached_ast`] to answer LSP feature
 //! queries (goto-definition, completion, hover, etc.) without blocking on
 //! the next compile cycle.
 

@@ -11,7 +11,7 @@
 //! also uses `(line, character)` ranges) but pulls in a lot of unrelated
 //! request/response shapes and ties this crate to the LSP version
 //! `tower-lsp` happens to ship. We mirror just the shapes the sidecar
-//! actually emits and convert at the [`mimir-server`] boundary, the same
+//! actually emits and convert at the `mimir-server` boundary, the same
 //! pattern `mimir-syntax` follows for its own [`Diagnostic`].
 //!
 //! ## Why our own enum and not slang's diagnostic codes?
@@ -79,7 +79,7 @@ pub struct Response {
     /// Echo of the originating [`Request::id`].
     pub id: u64,
     /// Set on success. Method-specific shape; the client decodes it into
-    /// e.g. [`ElaborateResult`].
+    /// e.g. [`CompileResult`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     /// Set on failure.
@@ -104,7 +104,8 @@ pub struct ResponseError {
 // `elaborate` method
 // --------------------------------------------------------------------------
 
-/// Params for [`methods::ELABORATE`].
+/// Params for [`methods::COMPILE`]. (The name predates the `elaborate` →
+/// `compile` method rename; the wire shape is unchanged.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElaborateParams {
     /// In-memory snapshot of every source file slang should see. The
@@ -208,21 +209,12 @@ pub struct MacroDefine {
     pub value: Option<String>,
 }
 
-/// Result for [`methods::ELABORATE`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ElaborateResult {
-    /// All diagnostics produced during preprocessing, parsing, and
-    /// elaboration, flattened across every file in the request. Empty
-    /// vector means "elaboration succeeded with no warnings or errors."
-    pub diagnostics: Vec<Diagnostic>,
-}
-
 /// Result for [`methods::COMPILE`].
 ///
 /// Returned by the sidecar's `compile` RPC: the elaborated symbol table in
 /// Mimir's backend-agnostic format, plus the flat diagnostics list used to
 /// drive LSP `publishDiagnostics` (same items as `ast.files[].diagnostics`
-/// but in the path-keyed shape used by [`ElaborateResult`]).
+/// but flattened and keyed by file path).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileResult {
     /// The elaborated symbol table for all compiled files.

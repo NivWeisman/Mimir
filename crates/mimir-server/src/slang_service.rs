@@ -1,14 +1,16 @@
 //! Slang sidecar service layer: project config, connection management,
 //! closed-file disk cache, and all IPC helpers.
 //!
-//! This module owns the three pieces of state that were previously scattered
-//! across [`crate::backend::Backend`]:
+//! This module owns the state that was previously scattered across
+//! [`crate::backend::Backend`]:
 //!
 //! * The optional [`mimir_slang::Client`] connection to the sidecar binary.
 //! * The resolved [`crate::project::ResolvedProject`] config (filelist,
 //!   include dirs, defines, debounce, feature toggles, formatter config).
 //! * The [`ClosedFileDiskCache`] that memoises on-disk reads for files not
 //!   currently open in the editor.
+//! * A shared (borrowed) handle to the live document store, read to
+//!   snapshot open-buffer texts when assembling sidecar requests.
 //!
 //! [`SlangService`] exposes a coarse-grained async API so `Backend` only
 //! needs to call named methods rather than holding locks directly.
@@ -168,7 +170,7 @@ impl SlangService {
     }
 
     /// Return the project's resolved UVM-lint settings (from `[diagnostics]`).
-    /// Falls back to [`UvmLintConfig::default`] (check on, `warning`, the
+    /// Falls back to [`crate::project::UvmLintConfig::default`] (check on, `warning`, the
     /// common phases) when no project config is loaded.
     pub(crate) async fn current_uvm_lint_config(&self) -> crate::project::UvmLintConfig {
         self.project

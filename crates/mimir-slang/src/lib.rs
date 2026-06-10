@@ -36,7 +36,7 @@
 //! * It does **not** ship the sidecar binary or build slang. The C++ shim
 //!   lives in `slang-sidecar/` at the workspace root (Stage 1).
 //! * It does **not** read project config (`.f` filelists, `.mimir.toml`).
-//!   That's [`mimir-server`]'s job; this crate only knows how to send a
+//!   That's `mimir-server`'s job; this crate only knows how to send a
 //!   fully-resolved [`protocol::ElaborateParams`] over the wire (Stage 2).
 //! * It does **not** debounce or schedule re-elaboration. That belongs to
 //!   the server's diagnostic pipeline (Stage 3).
@@ -49,6 +49,6 @@ pub mod protocol;
 
 pub use client::{Client, ClientError, Connection, ConnectionError};
 pub use protocol::{
-    CompileResult, Diagnostic, ElaborateParams, ElaborateResult, ExpandMacroParams,
-    ExpandMacroResult, MacroDefine, Severity, SourceFile,
+    CompileResult, Diagnostic, ElaborateParams, ExpandMacroParams, ExpandMacroResult,
+    MacroDefine, Severity, SourceFile,
 };

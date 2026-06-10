@@ -1,13 +1,13 @@
-//! Syntax service layer: document store and workspace index access.
+//! Syntax service layer: document-store snapshot access.
 //!
-//! [`SyntaxService`] owns the document store and workspace Arcs and exposes
-//! two cached-snapshot methods used by every LSP feature handler that needs
+//! [`SyntaxService`] holds the shared document store and exposes two
+//! cached-snapshot methods used by every LSP feature handler that needs
 //! a parse tree: [`SyntaxService::cached_tree`] and
 //! [`SyntaxService::cached_tree_and_index`].
 //!
 //! Parse operations are delegated to [`crate::parse_provider::TreeSitterProvider`]
-//! so this module's single responsibility is document/workspace state access,
-//! not parsing.
+//! so this module's single responsibility is document state access, not
+//! parsing.
 //!
 //! # Relationship to `Backend`
 //!
@@ -24,7 +24,6 @@ use tower_lsp::lsp_types::Url;
 
 use crate::backend::DocumentState;
 use crate::parse_provider::TreeSitterProvider;
-use crate::workspace_index::WorkspaceState;
 
 /// Same-file vs cross-file syntax-side completion candidates.
 ///
@@ -38,7 +37,7 @@ pub(crate) struct SyntaxCandidates {
     pub(crate) cross_file: Vec<(Url, Symbol)>,
 }
 
-/// Thin service wrapper around the document store and workspace index.
+/// Thin service wrapper around the document store.
 ///
 /// Holds the same `Arc`s as [`crate::backend::Backend`] so no data is copied —
 /// all operations see the same live state. Parse operations are delegated to
@@ -49,11 +48,6 @@ pub(crate) struct SyntaxService {
     documents: Arc<RwLock<HashMap<Url, DocumentState>>>,
     /// Tree-sitter parse provider. Used for cache-miss fallback parses.
     ts: Arc<TreeSitterProvider>,
-    /// Workspace-wide symbol index and per-file tree cache. Read here for
-    /// cross-file resolution; written by `reparse_and_publish` and the
-    /// workspace hydration task.
-    #[allow(dead_code)]
-    workspace: Arc<RwLock<WorkspaceState>>,
 }
 
 impl SyntaxService {
@@ -64,13 +58,8 @@ impl SyntaxService {
     pub(crate) fn new(
         documents: Arc<RwLock<HashMap<Url, DocumentState>>>,
         ts: Arc<TreeSitterProvider>,
-        workspace: Arc<RwLock<WorkspaceState>>,
     ) -> Self {
-        Self {
-            documents,
-            ts,
-            workspace,
-        }
+        Self { documents, ts }
     }
 
     /// Snapshot the cached parse tree for `uri`.

@@ -20,7 +20,7 @@
 //!
 //! ## Type detection limitation (v1)
 //!
-//! [`mimir_syntax::symbols::find_variable_type_at`] returns the declared
+//! [`crate::symbols::find_variable_type_at`] returns the declared
 //! element type for queues and dynamic arrays — e.g. `"int"` for
 //! `int q[$]` — so there is no way to distinguish a queue from a scalar
 //! of the same element type at this layer. Type-aware completion therefore
@@ -486,14 +486,14 @@ pub fn universal_methods() -> &'static [BuiltinMethod] {
 /// Return built-in methods for a dimension suffix from a variable declaration.
 ///
 /// Maps the raw dimension text captured by
-/// [`mimir_syntax::symbols::find_variable_type_info_at`] to the appropriate
+/// [`crate::symbols::find_variable_type_info_at`] to the appropriate
 /// built-in method table:
 ///
 /// | Suffix pattern | Table |
 /// |---|---|
-/// | `[$]`, `[$:N]` | [`QUEUE_METHODS`] |
-/// | `[]` | [`DYNAMIC_ARRAY_METHODS`] |
-/// | `[T]` (non-empty key type) | [`ASSOC_ARRAY_METHODS`] |
+/// | `[$]`, `[$:N]` | `QUEUE_METHODS` |
+/// | `[]` | `DYNAMIC_ARRAY_METHODS` |
+/// | `[T]` (non-empty key type) | `ASSOC_ARRAY_METHODS` |
 /// | anything else | empty |
 #[must_use]
 pub fn methods_for_suffix(suffix: &str) -> &'static [BuiltinMethod] {

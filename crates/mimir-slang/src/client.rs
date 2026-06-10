@@ -23,7 +23,7 @@
 //! elaborate, **interactive methods** (`definition`, `complete`, etc.) use
 //! `Mutex::try_lock` and return [`ClientError::Busy`] immediately when the
 //! connection is occupied. The server falls through to its tree-sitter
-//! fallback in that case. [`Client::elaborate`] uses the full `lock().await`
+//! fallback in that case. [`Client::compile`] uses the full `lock().await`
 //! because it runs on a background task where waiting is acceptable.
 //!
 //! ## Failure model
@@ -116,7 +116,7 @@ pub enum ConnectionError {
     },
 
     /// The sidecar did not respond within the request's deadline
-    /// ([`COMPILE_TIMEOUT`] / [`EXPAND_TIMEOUT`] / [`SHUTDOWN_TIMEOUT`]).
+    /// (`COMPILE_TIMEOUT` / `EXPAND_TIMEOUT` / `SHUTDOWN_TIMEOUT`).
     /// Produced by [`Connection::request_with_deadline`]. The request bytes
     /// are already out, so a late response (or a partial line from the
     /// cancelled read) may still arrive — the next caller's
@@ -540,9 +540,9 @@ impl Client {
     /// Run a `compile` request against the sidecar.
     ///
     /// Elaborates all project files and serialises the full symbol table as a
-    /// [`CompileResult`] containing a [`MimirAst`] and a flat diagnostics list.
+    /// [`CompileResult`] containing a `MimirAst` and a flat diagnostics list.
     ///
-    /// Bounded by [`COMPILE_TIMEOUT`] so a hung sidecar surfaces as
+    /// Bounded by `COMPILE_TIMEOUT` so a hung sidecar surfaces as
     /// [`ConnectionError::Timeout`] instead of blocking the elaborate task
     /// forever.
     pub async fn compile(
@@ -564,7 +564,7 @@ impl Client {
     /// blocking on its connection mutex.
     ///
     /// Because expansion has its own process and connection
-    /// ([`Self::expand_connection`]), this no longer serialises behind a
+    /// (`Self::expand_connection`), this no longer serialises behind a
     /// `compile` on the main connection — a long or stuck elaborate can't stall
     /// it. It only waits behind another in-flight expansion (sub-second), so
     /// the explicit "Expand Macro" command can safely block on it. Used by the
@@ -615,7 +615,7 @@ impl Client {
     /// other failures. Caller takes ownership so the type system enforces
     /// "you can't use this client after shutdown."
     ///
-    /// Every phase is bounded by [`SHUTDOWN_TIMEOUT`]: a sidecar that
+    /// Every phase is bounded by `SHUTDOWN_TIMEOUT`: a sidecar that
     /// ignores the polite request is killed rather than allowed to hang the
     /// server's own shutdown.
     pub async fn shutdown(self) -> Result<(), ClientError> {
