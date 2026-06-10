@@ -208,6 +208,15 @@ impl Range {
         Self { start, end }
     }
 
+    /// True when `self` fully contains `other` (non-strict on both ends, so
+    /// a range contains itself). [`Position`]'s derived ordering is
+    /// lexicographic on `(line, character)`, which is exactly LSP's
+    /// document order.
+    #[must_use]
+    pub fn contains_range(self, other: Range) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+
     /// Convert this LSP range into a byte range in the rope.
     pub fn to_byte_range(self, rope: &Rope) -> Result<StdRange<usize>, TextDocumentError> {
         // Sanity check before doing any conversion — saves a confusing error
@@ -435,6 +444,19 @@ mod tests {
         let range = Range::new(Position::new(0, 1), Position::new(1, 1));
         doc.apply_incremental_edit(range, "XYZ", 2).unwrap();
         assert_eq!(doc.text(), "aXYZ\nc\n");
+    }
+
+    /// `contains_range` is non-strict containment in document order.
+    #[test]
+    fn contains_range_non_strict() {
+        let r = |sl, sc, el, ec| Range::new(Position::new(sl, sc), Position::new(el, ec));
+        let outer = r(1, 4, 5, 10);
+        assert!(outer.contains_range(outer), "a range contains itself");
+        assert!(outer.contains_range(r(2, 0, 3, 0)), "strict inner");
+        assert!(outer.contains_range(r(1, 4, 5, 10)), "exact bounds");
+        assert!(!outer.contains_range(r(1, 3, 5, 10)), "starts before outer");
+        assert!(!outer.contains_range(r(1, 4, 5, 11)), "ends after outer");
+        assert!(!outer.contains_range(r(0, 0, 9, 0)), "encloses outer");
     }
 
     /// Inverted range is rejected.

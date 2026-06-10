@@ -25,6 +25,15 @@ pub(crate) fn file_uri(path: &str) -> Option<Url> {
     }
 }
 
+/// Convert a `file://` [`Url`] into the plain path string used to key
+/// sidecar requests and `MimirAst` file entries. Returns `None` for
+/// non-file URLs and for paths that aren't valid UTF-8.
+pub(crate) fn uri_to_path_string(uri: &Url) -> Option<String> {
+    uri.to_file_path()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+}
+
 // --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------

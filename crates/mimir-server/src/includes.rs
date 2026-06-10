@@ -34,83 +34,14 @@ use tracing::{debug, trace, warn};
 ///   treated as a directive.
 ///
 /// Does not evaluate macros: `` `include `MY_HDR `` returns nothing.
+///
+/// Thin wrapper over [`scan_includes_with_spans`] — one scanner, two views.
 #[must_use]
 pub fn scan_includes(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    let n = bytes.len();
-
-    while i < n {
-        let b = bytes[i];
-
-        // Line comment: skip to '\n'.
-        if b == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
-            while i < n && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Block comment: skip to "*/".
-        if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(n);
-            continue;
-        }
-        // Plain double-quoted string: skip to closing quote (handle `\`).
-        if b == b'"' {
-            i += 1;
-            while i < n && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < n {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            i = (i + 1).min(n);
-            continue;
-        }
-        // Backtick directive — only `include` is interesting.
-        if b == b'`' {
-            let rest = &bytes[i + 1..];
-            if rest.starts_with(b"include")
-                && rest
-                    .get(7)
-                    .map_or(true, |c| c.is_ascii_whitespace())
-            {
-                i += 1 + 7; // past "`include"
-                while i < n && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                    i += 1;
-                }
-                if i >= n {
-                    break;
-                }
-                let (open, close) = match bytes[i] {
-                    b'"' => (b'"', b'"'),
-                    b'<' => (b'<', b'>'),
-                    _ => continue,
-                };
-                let _ = open;
-                i += 1;
-                let start = i;
-                while i < n && bytes[i] != close && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                if i < n && bytes[i] == close {
-                    if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
-                        out.push(s.to_owned());
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
+    scan_includes_with_spans(text)
+        .into_iter()
+        .map(|span| span.name)
+        .collect()
 }
 
 /// One `` `include `` directive located in source, with the byte span of its

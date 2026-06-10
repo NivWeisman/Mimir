@@ -121,7 +121,11 @@ pub(crate) fn demoted_severity(severity: DiagSeverity, floor: DiagSeverity) -> D
     }
 }
 
-fn parse_severity(s: &str) -> Option<DiagSeverity> {
+/// Parse a severity string into a [`DiagSeverity`]. The single canonical
+/// string→severity mapping for the whole server — callers pick their own
+/// fallback for `None` (this module demotes to `Hint`;
+/// [`crate::project`]'s UVM-lint config falls back to `Warning`).
+pub(crate) fn parse_severity(s: &str) -> Option<DiagSeverity> {
     match s.trim().to_ascii_lowercase().as_str() {
         "error" => Some(DiagSeverity::Error),
         "warning" | "warn" => Some(DiagSeverity::Warning),

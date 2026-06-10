@@ -226,29 +226,7 @@ impl SlangAdapter {
         position: MPosition,
         params: &ExpandMacroParams,
     ) -> Option<ExpandMacroResult> {
-        mimir_core::time_scope!("slang.compile.adapter.expand_macro");
-
-        if let Some(hit) = self.cached_expansion(uri, version, position).await {
-            debug!(uri = %uri, "macro expansion cache hit");
-            return Some(hit);
-        }
-
-        let result = match self.slang.expand_macro(params).await {
-            Ok(r) => r,
-            Err(mimir_slang::ClientError::Busy) => {
-                debug!("sidecar busy during expand_macro");
-                return None;
-            }
-            Err(e) => {
-                error!(error = %e, "[SlangError] expand_macro RPC failed");
-                return None;
-            }
-        };
-
-        if result.found {
-            self.store_expansion(uri, version, &result).await;
-        }
-        Some(result)
+        self.expand_via_cache(uri, version, position, params, true).await
     }
 
     /// Non-blocking counterpart to [`Self::expand_macro`] for the
@@ -267,6 +245,21 @@ impl SlangAdapter {
         position: MPosition,
         params: &ExpandMacroParams,
     ) -> Option<ExpandMacroResult> {
+        self.expand_via_cache(uri, version, position, params, false).await
+    }
+
+    /// Shared cache-then-RPC core behind [`Self::expand_macro`] (blocking)
+    /// and [`Self::expand_macro_if_idle`] (try-lock). `block_on_busy` is the
+    /// only difference: it selects which `SlangService` entry point handles
+    /// the cache miss.
+    async fn expand_via_cache(
+        &self,
+        uri: &Url,
+        version: i32,
+        position: MPosition,
+        params: &ExpandMacroParams,
+        block_on_busy: bool,
+    ) -> Option<ExpandMacroResult> {
         mimir_core::time_scope!("slang.compile.adapter.expand_macro");
 
         if let Some(hit) = self.cached_expansion(uri, version, position).await {
@@ -274,10 +267,18 @@ impl SlangAdapter {
             return Some(hit);
         }
 
-        let result = match self.slang.expand_macro_if_idle(params).await {
+        let call = if block_on_busy {
+            self.slang.expand_macro(params).await
+        } else {
+            self.slang.expand_macro_if_idle(params).await
+        };
+        let result = match call {
             Ok(r) => r,
             Err(mimir_slang::ClientError::Busy) => {
-                debug!("sidecar busy; skipping opportunistic hover macro footer");
+                debug!(
+                    blocking = block_on_busy,
+                    "sidecar busy during expand_macro; caller falls back",
+                );
                 return None;
             }
             Err(e) => {

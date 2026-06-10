@@ -915,7 +915,7 @@ impl Backend {
 
         // AST path: use cached MimirAst for type info and docs.
         if let Some(ast) = self.adapter.cached_ast().await {
-            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            let file_path = crate::paths::uri_to_path_string(&uri);
             if let Some(path) = file_path {
                 if let Some(hover) = ast_features::hover(&ast, &path, mimir_pos, &rope) {
                     return Ok(Some(hover));
@@ -968,7 +968,7 @@ impl Backend {
         let target = MPosition::new(pos.line, pos.character);
 
         let Some(target_path) =
-            uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned))
+            crate::paths::uri_to_path_string(&uri)
         else {
             return Ok(None);
         };
@@ -1604,7 +1604,7 @@ impl LanguageServer for Backend {
                 let docs = self.documents.read().await;
                 docs.get(&uri).map(|s| s.document.rope().clone())
             };
-            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            let file_path = crate::paths::uri_to_path_string(&uri);
             if let (Some(rope), Some(path)) = (rope, file_path) {
                 if let Some(resp) = ast_features::definition(&ast, &path, mimir_pos, &rope) {
                     return Ok(Some(resp));
@@ -1637,7 +1637,7 @@ impl LanguageServer for Backend {
                 let docs = self.documents.read().await;
                 docs.get(&uri).map(|s| s.document.rope().clone())
             };
-            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            let file_path = crate::paths::uri_to_path_string(&uri);
             if let (Some(rope), Some(path)) = (rope, file_path) {
                 if let Some(resp) = ast_features::definition(&ast, &path, mimir_pos, &rope) {
                     return Ok(Some(resp));
@@ -1669,7 +1669,7 @@ impl LanguageServer for Backend {
                 let docs = self.documents.read().await;
                 docs.get(&uri).map(|s| s.document.rope().clone())
             };
-            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            let file_path = crate::paths::uri_to_path_string(&uri);
             if let (Some(rope), Some(path)) = (rope, file_path) {
                 if let Some(resp) = ast_features::type_definition(&ast, &path, mimir_pos, &rope) {
                     return Ok(Some(resp));
@@ -1854,7 +1854,7 @@ impl LanguageServer for Backend {
         let mut candidates = vec![name.clone()];
         if let Some(ast) = self.adapter.cached_ast().await {
             if let Some(path) =
-                uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned))
+                crate::paths::uri_to_path_string(&uri)
             {
                 let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
                 if let Some(type_name) = ast_features::type_name_at(&ast, &path, mimir_pos, &rope) {
@@ -2282,7 +2282,7 @@ impl LanguageServer for Backend {
         }
 
         let Some(file_path) =
-            uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned))
+            crate::paths::uri_to_path_string(&uri)
         else {
             return Ok(base);
         };
@@ -2631,7 +2631,7 @@ impl LanguageServer for Backend {
                 let docs = self.documents.read().await;
                 docs.get(&uri).map(|s| s.document.rope().clone())
             };
-            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            let file_path = crate::paths::uri_to_path_string(&uri);
             if let (Some(rope), Some(path)) = (rope, file_path) {
                 if let Some(sig) = ast_features::signature_help(&ast, &path, mimir_pos, &rope) {
                     return Ok(Some(sig));
@@ -2788,21 +2788,7 @@ impl LanguageServer for Backend {
                             labels = labels.len(),
                             "inlay_hint trace: method resolved",
                         );
-                        for label in labels {
-                            hints.push(InlayHint {
-                                position: Position::new(
-                                    label.position.line,
-                                    label.position.character,
-                                ),
-                                label: InlayHintLabel::String(label.text),
-                                kind: Some(InlayHintKind::PARAMETER),
-                                text_edits: None,
-                                tooltip: None,
-                                padding_left: None,
-                                padding_right: Some(true),
-                                data: None,
-                            });
-                        }
+                        hints.extend(labels.into_iter().map(param_inlay_hint));
                         continue;
                     }
                 }
@@ -2820,21 +2806,7 @@ impl LanguageServer for Backend {
                             labels = labels.len(),
                             "inlay_hint trace: method resolved",
                         );
-                        for label in labels {
-                            hints.push(InlayHint {
-                                position: Position::new(
-                                    label.position.line,
-                                    label.position.character,
-                                ),
-                                label: InlayHintLabel::String(label.text),
-                                kind: Some(InlayHintKind::PARAMETER),
-                                text_edits: None,
-                                tooltip: None,
-                                padding_left: None,
-                                padding_right: Some(true),
-                                data: None,
-                            });
-                        }
+                        hints.extend(labels.into_iter().map(param_inlay_hint));
                     }
                     MethodResolution::NotResolved(reason) => {
                         debug!(
@@ -2877,18 +2849,7 @@ impl LanguageServer for Backend {
 
             let Some(sym) = sym else { continue };
 
-            for label in hints_for(call, &sym, hint_mode) {
-                hints.push(InlayHint {
-                    position: Position::new(label.position.line, label.position.character),
-                    label: InlayHintLabel::String(label.text),
-                    kind: Some(InlayHintKind::PARAMETER),
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: None,
-                    padding_right: Some(true),
-                    data: None,
-                });
-            }
+            hints.extend(hints_for(call, &sym, hint_mode).into_iter().map(param_inlay_hint));
         }
 
         debug!(
@@ -2941,7 +2902,7 @@ impl LanguageServer for Backend {
                 rope.as_ref(),
                 member_trigger.as_ref().cloned(),
             ) {
-                let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+                let file_path = crate::paths::uri_to_path_string(&uri);
                 if let Some(path) = file_path {
                     if let Some(resp) = ast_features::member_completion(
                         &ast, &path, mimir_pos, &receiver, is_pkg,
@@ -2972,7 +2933,7 @@ impl LanguageServer for Backend {
         // cross-file types are always reachable even when slang has only
         // resolved the current file's local scope.
         if let Some(ast) = self.adapter.cached_ast().await {
-            let file_path = uri.to_file_path().ok().and_then(|p| p.to_str().map(str::to_owned));
+            let file_path = crate::paths::uri_to_path_string(&uri);
             if let Some(path) = file_path {
                 let mut items = ast_features::identifier_completion(&ast, &path, mimir_pos);
                 if !items.is_empty() {
@@ -3735,7 +3696,7 @@ fn collect_class_members(
             if e.symbol.kind == MSymbolKind::Class {
                 continue;
             }
-            if !range_contains(class_range, e.symbol.full_range) {
+            if !class_range.contains_range(e.symbol.full_range) {
                 continue;
             }
             if seen_names.insert(e.symbol.name.clone()) {
@@ -4780,7 +4741,7 @@ fn nest_symbol_subtree(symbols: &[Symbol]) -> (DocumentSymbol, usize) {
     let head = &symbols[0];
     let mut children: Vec<DocumentSymbol> = Vec::new();
     let mut i = 1;
-    while i < symbols.len() && range_contains(head.full_range, symbols[i].full_range) {
+    while i < symbols.len() && head.full_range.contains_range(symbols[i].full_range) {
         let (child, consumed) = nest_symbol_subtree(&symbols[i..]);
         children.push(child);
         i += consumed;
@@ -4796,12 +4757,21 @@ fn nest_symbol_subtree(symbols: &[Symbol]) -> (DocumentSymbol, usize) {
     (node, i)
 }
 
-/// True if `outer` fully encloses `inner` (touching endpoints count as
-/// containment — the syntactic ranges of an outer decl and its first
-/// inner decl don't perfectly nest in tree-sitter, so strict comparison
-/// would misclassify legitimate children as siblings).
-fn range_contains(outer: MRange, inner: MRange) -> bool {
-    outer.start <= inner.start && inner.end <= outer.end
+/// Convert one parameter-name [`mimir_syntax::inlay::InlayLabel`] into the
+/// LSP `InlayHint` shape — the single emit path for every branch of the
+/// `inlay_hint` handler (slang ref-map, tree-sitter method resolution, and
+/// plain function/macro lookups all push identical hints).
+fn param_inlay_hint(label: mimir_syntax::inlay::InlayLabel) -> InlayHint {
+    InlayHint {
+        position: Position::new(label.position.line, label.position.character),
+        label: InlayHintLabel::String(label.text),
+        kind: Some(InlayHintKind::PARAMETER),
+        text_edits: None,
+        tooltip: None,
+        padding_left: None,
+        padding_right: Some(true),
+        data: None,
+    }
 }
 
 /// Map a tree-sitter (`mimir-syntax`) diagnostic onto the LSP wire format.

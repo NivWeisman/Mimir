@@ -289,13 +289,18 @@ impl UvmLintConfig {
 
 /// Parse a severity string into [`mimir_syntax::DiagnosticSeverity`],
 /// falling back to `Warning` on an unrecognised value.
+///
+/// Delegates the string→bucket mapping to
+/// [`crate::diag_policy::parse_severity`] so the accepted spellings stay
+/// identical everywhere; only the fallback policy is local.
 fn parse_severity(s: &str) -> mimir_syntax::DiagnosticSeverity {
+    use mimir_ast::DiagSeverity as D;
     use mimir_syntax::DiagnosticSeverity as S;
-    match s.to_ascii_lowercase().as_str() {
-        "error" => S::Error,
-        "information" | "info" => S::Information,
-        "hint" => S::Hint,
-        _ => S::Warning,
+    match crate::diag_policy::parse_severity(s) {
+        Some(D::Error) => S::Error,
+        Some(D::Information) => S::Information,
+        Some(D::Hint) => S::Hint,
+        Some(D::Warning) | None => S::Warning,
     }
 }
 

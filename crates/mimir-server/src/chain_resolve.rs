@@ -29,14 +29,6 @@ use tracing::{debug, trace};
 use crate::workspace_index::WorkspaceIndex;
 
 // --------------------------------------------------------------------------
-// range helper (local copy — avoids a cross-module dependency on backend.rs)
-// --------------------------------------------------------------------------
-
-fn range_contains(outer: mimir_core::Range, inner: mimir_core::Range) -> bool {
-    outer.start <= inner.start && inner.end <= outer.end
-}
-
-// --------------------------------------------------------------------------
 // find_method_in_class / find_field_in_class
 // (moved from backend.rs; signatures upgraded to return the file URL)
 // --------------------------------------------------------------------------
@@ -88,7 +80,7 @@ pub(crate) fn find_method_in_class(
             .iter()
             .find(|e| {
                 e.url == class_entry.url
-                    && range_contains(class_entry.symbol.full_range, e.symbol.full_range)
+                    && class_entry.symbol.full_range.contains_range(e.symbol.full_range)
                     && e.symbol.kind == MSymbolKind::Method
             })
         {
@@ -163,7 +155,7 @@ pub(crate) fn find_field_in_class(
             .iter()
             .find(|e| {
                 e.url == class_entry.url
-                    && range_contains(class_entry.symbol.full_range, e.symbol.full_range)
+                    && class_entry.symbol.full_range.contains_range(e.symbol.full_range)
                     && matches!(
                         e.symbol.kind,
                         MSymbolKind::Variable | MSymbolKind::Port | MSymbolKind::Parameter

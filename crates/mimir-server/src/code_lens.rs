@@ -69,7 +69,7 @@ pub(crate) fn override_lenses(
         }
         let Some(class) = classes
             .iter()
-            .find(|c| range_contains(c.full_range, method.name_range))
+            .find(|c| c.full_range.contains_range(method.name_range))
         else {
             continue;
         };
@@ -107,7 +107,7 @@ fn find_override(
         let hit = wi.lookup(method_name).iter().find(|e| {
             e.url == class_entry.url
                 && e.symbol.kind == SymbolKind::Method
-                && range_contains(class_entry.symbol.full_range, e.symbol.full_range)
+                && class_entry.symbol.full_range.contains_range(e.symbol.full_range)
         });
         if let Some(entry) = hit {
             return Some((current, entry.url.clone(), entry.symbol.clone()));
@@ -134,15 +134,6 @@ fn make_lens(method: &Symbol, base_class: &str, target_url: &Url, target: &Symbo
         }),
         data: None,
     }
-}
-
-/// True when `outer` fully contains `inner` (LSP line/char coordinates).
-fn range_contains(outer: MRange, inner: MRange) -> bool {
-    let start_ok = (outer.start.line, outer.start.character)
-        <= (inner.start.line, inner.start.character);
-    let end_ok =
-        (inner.end.line, inner.end.character) <= (outer.end.line, outer.end.character);
-    start_ok && end_ok
 }
 
 fn to_lsp_range(r: MRange) -> Range {
