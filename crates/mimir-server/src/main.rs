@@ -29,14 +29,19 @@ mod elaborate_service;
 mod filelist;
 mod format;
 mod hierarchy_features;
+mod hover_features;
 mod includes;
+mod lsp_convert;
+mod member_features;
 mod parse_provider;
 mod paths;
 mod project;
+mod references_features;
 mod slang_adapter;
 mod slang_service;
 mod syntax_service;
 mod workspace_index;
+mod workspace_symbols;
 
 /// Environment variable: filesystem path to the slang sidecar binary. When
 /// set and the spawn succeeds, `mimir-server` consults the sidecar for

@@ -138,6 +138,13 @@ one.
   | `ElaborateService` | Debounce + dedup + diagnostic publish |
   | `ast_features` | Feature lookups (`definition`, `hover`, `completion`, …) on `MimirAst` |
   | `hierarchy_features` | `callHierarchy/*` + `typeHierarchy/*` (sync helpers, no locks) |
+  | `hover_features` | Hover content builders (declaration lines, signatures, macro bodies, expansion footer) |
+  | `member_features` | AST-driven method-call resolution + member completion (tree-sitter fallback) |
+  | `references_features` | Definition ranking + workspace-wide reference scan (references + rename) |
+  | `workspace_symbols` | `workspace/symbol` kind filter + fuzzy ranking |
+  | `lsp_convert` | Pure internal-type → LSP wire-shape converters (edits, tokens, kinds, items) |
+  | `chain_resolve` | Class-member lookup + inheritance walk + multi-hop chain resolution |
+  | `paths` | Filesystem path ↔ `file://` URL conversion |
   | `diagnostics` | `MimirDiag` → LSP `Diagnostic` conversion (one place, all backends) |
   | `workspace_index` | Tree-sitter symbol index + identifier presence index |
   | `filelist` | `.f` tokenization + path resolution + `${VAR}` expansion |
