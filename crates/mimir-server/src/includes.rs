@@ -17,7 +17,7 @@
 //! `` `include`` whose path comes from a macro expansion is silently
 //! skipped — slang itself will still see it on the source side.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, trace, warn};
@@ -278,6 +278,11 @@ where
     let mut order: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
+    // Texts already read by the candidate probe below, keyed by resolved
+    // path. Consumed when that path is dequeued, so each discovered file
+    // is read exactly once instead of once for the probe and again for
+    // the scan.
+    let mut prefetched: HashMap<PathBuf, String> = HashMap::new();
 
     for seed in seeds {
         if seen.insert(seed.clone()) {
@@ -287,21 +292,34 @@ where
     }
 
     while let Some(path) = queue.pop_front() {
-        let Some(text) = read(&path) else {
+        let Some(text) = prefetched.remove(&path).or_else(|| read(&path)) else {
             warn!(path = %path.display(), "include expand: file unreadable; skipping");
             continue;
         };
         let current_dir = path.parent().unwrap_or_else(|| Path::new(""));
         for rel in scan_includes(&text) {
+            // The probe *reads* each candidate (the read closure is the
+            // only disk seam, which keeps tests stubbable); a successful
+            // read doubles as the existence check, and the text is kept
+            // for the eventual scan of that file.
+            let mut probe_hit: Option<(PathBuf, String)> = None;
             let Some(resolved) = resolve_include_with(&rel, current_dir, include_dirs, |p| {
-                // The closure approach lets tests stub disk; in production
-                // the read closure is the disk seam, so we treat "read
-                // succeeds" as the existence check at expansion time.
-                read(p).is_some()
+                match read(p) {
+                    Some(t) => {
+                        probe_hit = Some((p.to_path_buf(), t));
+                        true
+                    }
+                    None => false,
+                }
             }) else {
                 trace!(rel, "include not found in include_dirs; skipping");
                 continue;
             };
+            if let Some((hit_path, hit_text)) = probe_hit {
+                if hit_path == resolved {
+                    prefetched.insert(hit_path, hit_text);
+                }
+            }
             if seen.insert(resolved.clone()) {
                 debug!(
                     from = %path.display(),

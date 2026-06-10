@@ -15,7 +15,7 @@ use ropey::Rope;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, GotoDefinitionResponse, Hover,
     HoverContents, Location, MarkupContent, MarkupKind, ParameterInformation,
-    ParameterLabel, Position, Range, SignatureHelp, SignatureInformation, Url,
+    ParameterLabel, Position, Range, SignatureHelp, SignatureInformation,
 };
 use tracing::debug;
 
@@ -332,7 +332,7 @@ pub(crate) fn definition(
 ) -> Option<GotoDefinitionResponse> {
     if let Some(file) = ast.find_file(file_uri) {
         if let Some(r) = find_ref_at(file, pos) {
-            let uri = Url::parse(&format!("file://{}", r.target_path)).ok()?;
+            let uri = crate::paths::file_uri(&r.target_path)?;
             let location = Location { uri, range: mimir_to_lsp_range(r.target_range) };
             debug!(
                 target_path = %r.target_path,
@@ -345,7 +345,7 @@ pub(crate) fn definition(
 
     let name = word_at_rope(rope, pos)?;
     let (decl, decl_file) = find_decl(ast, file_uri, pos, &name)?;
-    let uri = Url::parse(&format!("file://{decl_file}")).ok()?;
+    let uri = crate::paths::file_uri(decl_file)?;
     let location = Location { uri, range: mimir_to_lsp_range(decl.range) };
     debug!(name, file = decl_file, "ast definition resolved via name lookup");
     Some(GotoDefinitionResponse::Scalar(location))
@@ -408,7 +408,7 @@ pub(crate) fn type_definition(
         return None;
     }
 
-    let uri = Url::parse(&format!("file://{type_file}")).ok()?;
+    let uri = crate::paths::file_uri(type_file)?;
     let location = Location { uri, range: mimir_to_lsp_range(type_decl.range) };
     debug!(type_name = %bare_type, "ast type_definition resolved");
     Some(GotoDefinitionResponse::Scalar(location))

@@ -214,6 +214,51 @@ fn detect_header_guard(lines: &[&str], blocks: &[IfdefBlock]) -> Option<HeaderGu
 // Wrapping / stripping
 // --------------------------------------------------------------------------
 
+/// Output of [`wrap_ifdefs`]: the pragma-wrapped text plus the bookkeeping
+/// needed to translate original line numbers into wrapped-text line numbers.
+///
+/// The translation matters for range formatting: Verible's `--lines` flag
+/// must reference the text it is actually given (the wrapped text), so a
+/// selection made against the original document has to be shifted past any
+/// pragma lines inserted above it. See [`Self::wrapped_line`].
+#[derive(Debug, Clone)]
+pub struct WrappedSource {
+    /// The wrapped text. Identical to the input when `has_ifdefs` is `false`.
+    pub text: String,
+    /// Whether any `` `ifdef``/`` `ifndef `` blocks were found and wrapped.
+    pub has_ifdefs: bool,
+    /// One entry per inserted pragma line, holding the 0-based *original*
+    /// line index the pragma was inserted before. Sorted ascending; empty
+    /// when `has_ifdefs` is `false`.
+    inserted_before: Vec<usize>,
+}
+
+impl WrappedSource {
+    /// A pass-through result: `text` is `source` unchanged, no pragmas.
+    /// Used when ifdef wrapping is disabled by configuration.
+    #[must_use]
+    pub fn unchanged(source: &str) -> Self {
+        Self {
+            text: source.to_owned(),
+            has_ifdefs: false,
+            inserted_before: Vec::new(),
+        }
+    }
+
+    /// Translate a 0-based line index in the *original* source to the
+    /// matching 0-based line index in [`Self::text`].
+    ///
+    /// Every pragma inserted before (or at) the original line shifts it
+    /// down by one. O(log n) via binary search on the sorted insert list.
+    #[must_use]
+    pub fn wrapped_line(&self, original_line: u32) -> u32 {
+        let shift = self
+            .inserted_before
+            .partition_point(|&before| before <= original_line as usize);
+        original_line + shift as u32
+    }
+}
+
 /// Wrap `` `ifdef``/`` `ifndef `` blocks in `source` with Verible format-off/on
 /// pragmas so the formatter leaves them verbatim.
 ///
@@ -223,17 +268,17 @@ fn detect_header_guard(lines: &[&str], blocks: &[IfdefBlock]) -> Option<HeaderGu
 ///   as single-line wraps; the file body is exposed for normal formatting.
 ///   Every depth-1 block inside the guard body is fully wrapped.
 ///
-/// Returns `(wrapped_source, has_ifdefs)`.  When `has_ifdefs` is `false`
-/// the source is returned unchanged.
-pub fn wrap_ifdefs(source: &str) -> (String, bool) {
+/// Returns a [`WrappedSource`]; when its `has_ifdefs` is `false` the text
+/// is the source unchanged.
+pub fn wrap_ifdefs(source: &str) -> WrappedSource {
     let lines: Vec<&str> = source.lines().collect();
     if lines.is_empty() {
-        return (source.to_owned(), false);
+        return WrappedSource::unchanged(source);
     }
 
     let blocks = find_blocks(&lines);
     if blocks.is_empty() {
-        return (source.to_owned(), false);
+        return WrappedSource::unchanged(source);
     }
 
     let header_guard = detect_header_guard(&lines, &blocks);
@@ -264,18 +309,25 @@ pub fn wrap_ifdefs(source: &str) -> (String, bool) {
         append.entry(hg.close_line).or_default().push(FORMAT_ON_PRAGMA);
     }
 
-    // Reconstruct the source with pragmas spliced in.
+    // Reconstruct the source with pragmas spliced in, recording each
+    // insertion point so callers can translate line numbers afterwards.
+    // A prepend at line `i` sits before original line `i`; an append at
+    // line `i` sits before original line `i + 1`. The loop runs in
+    // ascending `i`, so the list comes out sorted.
+    let mut inserted_before: Vec<usize> = Vec::new();
     let mut out = String::with_capacity(source.len() + blocks.len() * 80);
     for (i, line) in lines.iter().enumerate() {
         for pragma in prepend.get(&i).into_iter().flatten() {
             out.push_str(pragma);
             out.push('\n');
+            inserted_before.push(i);
         }
         out.push_str(line);
         out.push('\n');
         for pragma in append.get(&i).into_iter().flatten() {
             out.push_str(pragma);
             out.push('\n');
+            inserted_before.push(i + 1);
         }
     }
 
@@ -284,7 +336,11 @@ pub fn wrap_ifdefs(source: &str) -> (String, bool) {
         out.pop();
     }
 
-    (out, true)
+    WrappedSource {
+        text: out,
+        has_ifdefs: true,
+        inserted_before,
+    }
 }
 
 /// Remove every line that contains [`MIMIR_TAG`] from `text`.
@@ -673,16 +729,17 @@ mod tests {
     #[test]
     fn wrap_ifdefs_no_ifdefs_returns_unchanged() {
         let src = "module foo;\nwire x;\nendmodule\n";
-        let (out, flag) = wrap_ifdefs(src);
-        assert!(!flag);
-        assert_eq!(out, src);
+        let w = wrap_ifdefs(src);
+        assert!(!w.has_ifdefs);
+        assert_eq!(w.text, src);
     }
 
     /// A plain depth-0 ifdef block is fully wrapped.
     #[test]
     fn wrap_ifdefs_wraps_depth0_block() {
         let src = "`ifdef VCS\nassign x = 1;\n`endif\n";
-        let (out, flag) = wrap_ifdefs(src);
+        let w = wrap_ifdefs(src);
+        let (out, flag) = (w.text, w.has_ifdefs);
         assert!(flag, "should report has_ifdefs=true");
         assert!(
             out.contains(FORMAT_OFF_PRAGMA),
@@ -708,7 +765,8 @@ mod tests {
             "endmodule\n",
             "`endif\n",
         );
-        let (out, flag) = wrap_ifdefs(src);
+        let w = wrap_ifdefs(src);
+        let (out, flag) = (w.text, w.has_ifdefs);
         assert!(flag);
         // Body code must NOT be inside format-off (the pragma before `ifndef
         // and format-on after `define means body is exposed).
@@ -767,9 +825,86 @@ mod tests {
             "endmodule\n",
             "`endif\n",
         );
-        let (wrapped, _) = wrap_ifdefs(src);
-        let restored = strip_mimir_pragmas(&wrapped);
+        let wrapped = wrap_ifdefs(src);
+        let restored = strip_mimir_pragmas(&wrapped.text);
         assert_eq!(restored, src, "round-trip should be identity:\n{restored}");
+    }
+
+    // ------------------------------------------------------------------
+    // WrappedSource line-mapping tests (regression for the range-format
+    // `--lines` offset bug: original-source line numbers must be shifted
+    // past inserted pragma lines before being handed to Verible).
+    // ------------------------------------------------------------------
+
+    /// With no ifdefs the mapping is the identity.
+    #[test]
+    fn wrapped_line_identity_without_ifdefs() {
+        let w = wrap_ifdefs("module foo;\nwire x;\nendmodule\n");
+        for line in 0..5 {
+            assert_eq!(w.wrapped_line(line), line);
+        }
+        let pass = WrappedSource::unchanged("module foo;\nendmodule\n");
+        assert_eq!(pass.wrapped_line(3), 3);
+    }
+
+    /// Lines below a fully-wrapped depth-0 block shift down by the two
+    /// pragmas inserted around it; lines above it don't move.
+    #[test]
+    fn wrapped_line_shifts_past_wrapped_block() {
+        // 0: module foo;
+        // 1: `ifdef VCS      <- format-off prepended before this line
+        // 2: assign d = 1;
+        // 3: `endif          <- format-on appended after this line
+        // 4: wire x;
+        // 5: endmodule
+        let src = "module foo;\n`ifdef VCS\nassign d = 1;\n`endif\nwire x;\nendmodule\n";
+        let w = wrap_ifdefs(src);
+        assert!(w.has_ifdefs);
+        // Line 0 is before any insertion.
+        assert_eq!(w.wrapped_line(0), 0);
+        // Line 1 has one pragma before it.
+        assert_eq!(w.wrapped_line(1), 2);
+        // Lines past the `endif have both pragmas above them.
+        assert_eq!(w.wrapped_line(4), 6);
+        assert_eq!(w.wrapped_line(5), 7);
+        // Cross-check against the actual wrapped text: the mapped lines
+        // must hold the same content as the original lines.
+        let orig: Vec<&str> = src.lines().collect();
+        let wrapped: Vec<&str> = w.text.lines().collect();
+        for (i, line) in orig.iter().enumerate() {
+            assert_eq!(
+                wrapped[w.wrapped_line(i as u32) as usize],
+                *line,
+                "original line {i} should map to identical wrapped line",
+            );
+        }
+    }
+
+    /// Header-guard wrapping inserts four pragmas; every original line must
+    /// still map onto its identical counterpart in the wrapped text.
+    #[test]
+    fn wrapped_line_maps_through_header_guard() {
+        let src = concat!(
+            "`ifndef MY_HDR\n",
+            "`define MY_HDR\n",
+            "module foo;\n",
+            "`ifdef VCS\n",
+            "assign dbg = 1;\n",
+            "`endif\n",
+            "endmodule\n",
+            "`endif\n",
+        );
+        let w = wrap_ifdefs(src);
+        assert!(w.has_ifdefs);
+        let orig: Vec<&str> = src.lines().collect();
+        let wrapped: Vec<&str> = w.text.lines().collect();
+        for (i, line) in orig.iter().enumerate() {
+            assert_eq!(
+                wrapped[w.wrapped_line(i as u32) as usize],
+                *line,
+                "original line {i} should map to identical wrapped line",
+            );
+        }
     }
 
     /// Integration test: requires a real `verible-verilog-format` binary.

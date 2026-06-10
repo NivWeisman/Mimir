@@ -388,7 +388,6 @@ impl SlangAdapter {
     ///
     /// Call this after a project reload so stale symbol data is not used for
     /// LSP features while the new compile is in flight.
-    #[allow(dead_code)]
     pub(crate) async fn invalidate(&self) {
         *self.cached_ast.write().await = None;
         debug!("cached MimirAst invalidated");

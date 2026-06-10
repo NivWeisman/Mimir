@@ -9,6 +9,7 @@
 //! | `+incdir+A[+B+...]`      | One or more include search paths, `+`-separated.   |
 //! | `+define+NAME[=VALUE]`   | Predefine a macro (multiple `+`-separated allowed).|
 //! | `-f nested.f`            | Recursively read another filelist.                 |
+//! | other `-flag`/`+plusarg` | Simulator option we don't consume — skipped with a warning. |
 //! | `// rest of line`        | Comment.                                           |
 //! | `# rest of line`         | Comment (alternate).                               |
 //! | trailing `\` + newline   | Line continuation.                                 |
@@ -35,6 +36,27 @@ use crate::project::ProjectError;
 /// more than two or three levels; 16 is a comfortable ceiling that still
 /// catches misconfiguration before we exhaust the stack.
 pub(crate) const FILELIST_MAX_DEPTH: usize = 16;
+
+/// Simulator flags that take a separate argument token. When one of these
+/// is skipped, its argument is skipped with it so the argument isn't
+/// misread as a source file (`-y ./libs` would otherwise add `./libs`).
+const FLAGS_WITH_ARG: &[&str] = &["-y", "-v", "-top", "-l", "-sv_lib"];
+
+/// True when a glued `-fPATH`/`-FPATH` token is a nested-filelist
+/// reference rather than a simulator flag. The two-token `-f path` form is
+/// canonical; the glued form is accepted only when the remainder names a
+/// `.f`/`.F` file, so flags like `-full64` are not misread as `-f ull64`
+/// (which used to fail the whole project load with a missing-file error).
+fn glued_filelist_path(token: &str) -> Option<&str> {
+    let rest = token
+        .strip_prefix("-f")
+        .or_else(|| token.strip_prefix("-F"))?;
+    if rest.ends_with(".f") || rest.ends_with(".F") {
+        Some(rest)
+    } else {
+        None
+    }
+}
 
 /// Tokenise a `.f` filelist body. Handles `//` and `#` line comments,
 /// backslash-newline line continuation, and ASCII whitespace as the token
@@ -357,8 +379,9 @@ fn expand_filelist(
             );
             expand_filelist(&nested, depth + 1, toml_root, state, env)?;
             i += 2;
-        } else if let Some(rest) = token.strip_prefix("-f") {
-            // One-token form: `-fnested.f`.
+        } else if let Some(rest) = glued_filelist_path(token) {
+            // One-token form: `-fnested.f` (only when the rest names a
+            // `.f` file — see `glued_filelist_path`).
             let nested = absolutise_filelist(
                 &base,
                 toml_root,
@@ -366,13 +389,21 @@ fn expand_filelist(
             );
             expand_filelist(&nested, depth + 1, toml_root, state, env)?;
             i += 1;
-        } else if let Some(rest) = token.strip_prefix("-F") {
-            let nested = absolutise_filelist(
-                &base,
-                toml_root,
-                Path::new(&expand_env_vars(rest, env)),
+        } else if token.starts_with('-') {
+            // A simulator flag we don't consume (`-full64`, `-sverilog`,
+            // `-y <dir>`, …). Skip it — and its argument for flags known
+            // to take one — rather than misreading it as a source file.
+            let takes_arg = FLAGS_WITH_ARG.contains(&token.as_str());
+            warn!(
+                token = %token,
+                skipped_argument = takes_arg,
+                "unrecognised simulator flag in filelist; skipping"
             );
-            expand_filelist(&nested, depth + 1, toml_root, state, env)?;
+            i += if takes_arg { 2 } else { 1 };
+        } else if token.starts_with('+') {
+            // A plusarg we don't consume (`+libext+.v+.sv`,
+            // `+systemverilogext+`, …). Same treatment as unknown flags.
+            warn!(token = %token, "unrecognised plusarg in filelist; skipping");
             i += 1;
         } else {
             state.files.push(absolutise_filelist(
@@ -637,6 +668,70 @@ mod tests {
         // shared_inc appears exactly once.
         assert_eq!(parts.include_dirs.len(), 1);
         assert!(parts.include_dirs[0].ends_with("shared_inc"));
+    }
+
+    /// Simulator flags that merely *start* with `-f` (e.g. VCS's `-full64`)
+    /// are skipped — they must not be misread as a nested filelist named
+    /// `ull64` (which used to fail the entire project load) nor as a
+    /// source file.
+    #[test]
+    fn expand_filelist_skips_simulator_flags() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("project.f");
+        fs::write(&f, "-full64\n-sverilog\na.sv\n--some-long-flag\n").unwrap();
+
+        let parts = expand_filelist_to_parts(&f, dir.path(), &HashMap::new())
+            .expect("flags must not break the filelist");
+
+        assert_eq!(parts.files.len(), 1, "got {:?}", parts.files);
+        assert!(parts.files[0].ends_with("a.sv"));
+    }
+
+    /// Flags known to take a separate argument (`-y`, `-v`, …) skip the
+    /// argument too, so a library path isn't misread as a source file.
+    #[test]
+    fn expand_filelist_skips_flag_arguments() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("project.f");
+        fs::write(&f, "-y ./libs\n-v lib_cells.v\na.sv\n").unwrap();
+
+        let parts = expand_filelist_to_parts(&f, dir.path(), &HashMap::new()).unwrap();
+
+        assert_eq!(parts.files.len(), 1, "got {:?}", parts.files);
+        assert!(parts.files[0].ends_with("a.sv"));
+    }
+
+    /// Unrecognised plusargs (`+libext+.v`, …) are skipped, not pushed as
+    /// source files. `+incdir+`/`+define+` keep working alongside.
+    #[test]
+    fn expand_filelist_skips_unknown_plusargs() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("project.f");
+        fs::write(&f, "+libext+.v+.sv\n+incdir+inc\na.sv\n").unwrap();
+
+        let parts = expand_filelist_to_parts(&f, dir.path(), &HashMap::new()).unwrap();
+
+        assert_eq!(parts.files.len(), 1, "got {:?}", parts.files);
+        assert!(parts.files[0].ends_with("a.sv"));
+        assert_eq!(parts.include_dirs.len(), 1);
+        assert!(parts.include_dirs[0].ends_with("inc"));
+    }
+
+    /// The glued one-token form `-fnested.f` still recurses when the rest
+    /// names a `.f` file.
+    #[test]
+    fn expand_filelist_glued_form_still_recurses() {
+        let dir = tempdir().unwrap();
+        let inner = dir.path().join("inner.f");
+        fs::write(&inner, "inner.sv\n").unwrap();
+        let outer = dir.path().join("outer.f");
+        fs::write(&outer, "-finner.f\nouter.sv\n").unwrap();
+
+        let parts = expand_filelist_to_parts(&outer, dir.path(), &HashMap::new()).unwrap();
+
+        assert_eq!(parts.files.len(), 2, "got {:?}", parts.files);
+        assert!(parts.files[0].ends_with("inner.sv"));
+        assert!(parts.files[1].ends_with("outer.sv"));
     }
 
     /// The same filelist referenced twice at the top level also warns-and-skips

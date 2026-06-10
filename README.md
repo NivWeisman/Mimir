@@ -402,7 +402,8 @@ empty (matches `make` / most simulators).
 | `path/to/file.sv`                | Source file. Relative paths resolve against the `.f`.   |
 | `+incdir+A` or `+incdir+A+B+...` | One or more include search paths.                       |
 | `+define+NAME` / `+define+N=V`   | Predefine a macro (multiple `+`-separated allowed).     |
-| `-f nested.f` or `-fnested.f`    | Recursively read another filelist.                      |
+| `-f nested.f` or `-fnested.f`    | Recursively read another filelist (the glued one-token form only when it names a `.f`/`.F` file). |
+| other `-flag` / `+plusarg`       | Simulator options mimir doesn't consume (`-full64`, `+libext+.v`, …) are skipped with a warning; `-y`/`-v`/`-top`/`-l`/`-sv_lib` skip their argument too. |
 
 Recursion is bounded at 16 levels and cycles are detected by canonical
 path, so a misconfigured `-f a.f` that points back at itself fails fast

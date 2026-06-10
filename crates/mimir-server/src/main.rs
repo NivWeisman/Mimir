@@ -31,6 +31,7 @@ mod format;
 mod hierarchy_features;
 mod includes;
 mod parse_provider;
+mod paths;
 mod project;
 mod slang_adapter;
 mod slang_service;

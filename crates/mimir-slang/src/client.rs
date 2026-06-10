@@ -39,6 +39,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -48,6 +49,22 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, trace, warn};
+
+/// Hard deadline for one `compile` round-trip. Generous because a real
+/// project elaborate can legitimately take tens of seconds — the point is
+/// to bound a *hung* sidecar (which used to block the elaborate task
+/// forever), not to police slow-but-progressing compiles.
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Deadline for one `expandMacro` round-trip. The expand sidecar only runs
+/// the preprocessor (normally sub-second), and the callers are interactive
+/// (hover footer, explicit expand command), so a short ceiling is right.
+const EXPAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for the polite `shutdown` request and the subsequent child
+/// wait. Past it we stop being polite and kill the process instead of
+/// hanging the server's own shutdown.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::protocol::{
     methods, CompileResult, ElaborateParams, ExpandMacroParams, ExpandMacroResult, Request,
@@ -98,11 +115,13 @@ pub enum ConnectionError {
         got: u64,
     },
 
-    /// The sidecar did not respond within the deadline for an interactive
-    /// request. The connection guard has been dropped (lock released) so a
-    /// stale response may be left in the sidecar's stdout buffer; the next
-    /// caller that acquires the lock will drain it via the id-ordering logic
-    /// in [`Connection::request`].
+    /// The sidecar did not respond within the request's deadline
+    /// ([`COMPILE_TIMEOUT`] / [`EXPAND_TIMEOUT`] / [`SHUTDOWN_TIMEOUT`]).
+    /// Produced by [`Connection::request_with_deadline`]. The request bytes
+    /// are already out, so a late response (or a partial line from the
+    /// cancelled read) may still arrive — the next caller's
+    /// resync-and-drain step in [`Connection::request`] disposes of it, so
+    /// the connection stays usable.
     #[error("sidecar request timed out after {secs}s")]
     Timeout {
         /// Wall-clock seconds we waited before giving up.
@@ -155,6 +174,14 @@ pub enum ClientError {
     /// than queuing behind a potentially slow elaborate round-trip.
     #[error("sidecar connection is busy with another in-flight request")]
     Busy,
+
+    /// No sidecar client exists to send the request to. Produced by
+    /// embedders that hold an *optional* client (the server keeps
+    /// `Option<Arc<Client>>` behind a lock) when a request races a
+    /// configuration change that removed the sidecar — a recoverable
+    /// "feature unavailable right now", never a panic.
+    #[error("no slang sidecar is configured")]
+    NotConfigured,
 }
 
 // --------------------------------------------------------------------------
@@ -176,8 +203,14 @@ where
     /// Monotonically incremented per request. `u64` is plenty — at one
     /// request per microsecond it'd take 580,000 years to wrap.
     next_id: u64,
-    /// Reusable buffer for `read_line` to avoid a per-request allocation.
-    line_buf: String,
+    /// Reusable line buffer. Kept as `Vec<u8>` + [`AsyncBufReadExt::read_until`]
+    /// rather than `String` + `read_line` deliberately: `read_until` appends
+    /// through this `&mut` borrow, so a read cancelled by a deadline leaves
+    /// the partial line *here*, where the resync step at the top of
+    /// [`Self::request`] can complete and discard it. `read_line` moves the
+    /// buffer into its future and loses the partial bytes on cancellation,
+    /// which would corrupt the framing undetectably.
+    line_buf: Vec<u8>,
 }
 
 impl<R, W> Connection<R, W>
@@ -192,7 +225,7 @@ where
             reader,
             writer,
             next_id: 1,
-            line_buf: String::new(),
+            line_buf: Vec::new(),
         }
     }
 
@@ -207,7 +240,7 @@ where
             reader,
             writer,
             next_id,
-            line_buf: String::new(),
+            line_buf: Vec::new(),
         }
     }
 
@@ -223,6 +256,24 @@ where
         P: Serialize,
         Res: DeserializeOwned,
     {
+        // A previous request may have been cancelled (deadline elapsed, task
+        // aborted) in the middle of `read_until`, leaving a *partial* line
+        // in `line_buf` whose tail is still in the reader. Re-synchronise to
+        // a line boundary before writing anything new: finish the partial
+        // line and discard it. A line that is already complete is the
+        // previous (processed or stale) response — discard without touching
+        // the reader.
+        if !self.line_buf.is_empty() {
+            if self.line_buf.last() != Some(&b'\n') {
+                self.reader.read_until(b'\n', &mut self.line_buf).await?;
+                debug!(
+                    bytes = self.line_buf.len(),
+                    "resynced framing after a cancelled read",
+                );
+            }
+            self.line_buf.clear();
+        }
+
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
@@ -268,7 +319,7 @@ where
             self.line_buf.clear();
             let n = {
                 mimir_core::time_scope!("slang.ipc.read_line");
-                self.reader.read_line(&mut self.line_buf).await?
+                self.reader.read_until(b'\n', &mut self.line_buf).await?
             };
             if n == 0 {
                 return Err(ConnectionError::Closed);
@@ -277,7 +328,7 @@ where
 
             let resp: Response = {
                 mimir_core::time_scope!("slang.ipc.decode_envelope");
-                serde_json::from_str(&self.line_buf)?
+                serde_json::from_slice(&self.line_buf)?
             };
             if resp.id == id {
                 return match (resp.result, resp.error) {
@@ -301,6 +352,35 @@ where
                 expected: id,
                 got: resp.id,
             });
+        }
+    }
+
+    /// Like [`Self::request`], but gives up after `deadline` with
+    /// [`ConnectionError::Timeout`].
+    ///
+    /// The timed-out request's bytes are already written, so the sidecar may
+    /// still answer it later — the resync-and-drain logic at the top of
+    /// [`Self::request`] disposes of that late response (and of any partial
+    /// line the cancelled read left behind), so a single hung round-trip
+    /// doesn't poison the connection.
+    pub async fn request_with_deadline<P, Res>(
+        &mut self,
+        method: &str,
+        params: &P,
+        deadline: Duration,
+    ) -> Result<Res, ConnectionError>
+    where
+        P: Serialize,
+        Res: DeserializeOwned,
+    {
+        match tokio::time::timeout(deadline, self.request(method, params)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                warn!(method, secs = deadline.as_secs(), "sidecar request hit its deadline");
+                Err(ConnectionError::Timeout {
+                    secs: deadline.as_secs(),
+                })
+            }
         }
     }
 
@@ -461,6 +541,10 @@ impl Client {
     ///
     /// Elaborates all project files and serialises the full symbol table as a
     /// [`CompileResult`] containing a [`MimirAst`] and a flat diagnostics list.
+    ///
+    /// Bounded by [`COMPILE_TIMEOUT`] so a hung sidecar surfaces as
+    /// [`ConnectionError::Timeout`] instead of blocking the elaborate task
+    /// forever.
     pub async fn compile(
         &self,
         params: &ElaborateParams,
@@ -470,7 +554,10 @@ impl Client {
             mimir_core::time_scope!("slang.compile.client_lock_wait");
             self.connection.lock().await
         };
-        Ok(conn.compile(params).await?)
+        mimir_core::time_scope!("slang.compile.connection_total");
+        Ok(conn
+            .request_with_deadline(methods::COMPILE, params, COMPILE_TIMEOUT)
+            .await?)
     }
 
     /// Run an `expandMacro` request against the **dedicated expand sidecar**,
@@ -491,7 +578,9 @@ impl Client {
             mimir_core::time_scope!("slang.expand_macro.client_lock_wait");
             self.expand_connection.lock().await
         };
-        Ok(conn.expand_macro(params).await?)
+        Ok(conn
+            .request_with_deadline(methods::EXPAND_MACRO, params, EXPAND_TIMEOUT)
+            .await?)
     }
 
     /// Non-blocking variant of [`Client::expand_macro`].
@@ -513,7 +602,9 @@ impl Client {
             Ok(conn) => conn,
             Err(_) => return Err(ClientError::Busy),
         };
-        Ok(conn.expand_macro(params).await?)
+        Ok(conn
+            .request_with_deadline(methods::EXPAND_MACRO, params, EXPAND_TIMEOUT)
+            .await?)
     }
 
     /// Send the `shutdown` request to **both** sidecars, then wait for each
@@ -523,16 +614,18 @@ impl Client {
     /// (the sidecar might exit before flushing a response) but propagate
     /// other failures. Caller takes ownership so the type system enforces
     /// "you can't use this client after shutdown."
+    ///
+    /// Every phase is bounded by [`SHUTDOWN_TIMEOUT`]: a sidecar that
+    /// ignores the polite request is killed rather than allowed to hang the
+    /// server's own shutdown.
     pub async fn shutdown(self) -> Result<(), ClientError> {
         // We only care whether the request *got out*; each sidecar is allowed
         // to drop its connection without responding to `shutdown`.
         Self::send_shutdown(&self.connection).await;
         Self::send_shutdown(&self.expand_connection).await;
 
-        let status = self.child.lock().await.wait().await?;
-        debug!(?status, "compile sidecar exited");
-        let expand_status = self.expand_child.lock().await.wait().await?;
-        debug!(?expand_status, "expand sidecar exited");
+        Self::wait_or_kill(&self.child, "compile").await?;
+        Self::wait_or_kill(&self.expand_child, "expand").await?;
         Ok(())
     }
 
@@ -540,8 +633,9 @@ impl Client {
     /// propagating) the expected "connection closed" outcome.
     async fn send_shutdown(connection: &Mutex<SidecarConnection>) {
         let mut conn = connection.lock().await;
-        let res: Result<serde_json::Value, _> =
-            conn.request(methods::SHUTDOWN, &serde_json::Value::Null).await;
+        let res: Result<serde_json::Value, _> = conn
+            .request_with_deadline(methods::SHUTDOWN, &serde_json::Value::Null, SHUTDOWN_TIMEOUT)
+            .await;
         if let Err(e) = res {
             // `Closed` is the expected outcome. Anything else is worth a warn
             // so we notice misbehaving sidecars.
@@ -552,6 +646,24 @@ impl Client {
                 other => warn!(error = %other, "unexpected error during shutdown"),
             }
         }
+    }
+
+    /// Wait for one sidecar child to exit, killing it if it outlives
+    /// [`SHUTDOWN_TIMEOUT`]. The kill path returns `Ok` — a sidecar that had
+    /// to be killed is a logged anomaly, not a failure of *our* shutdown.
+    async fn wait_or_kill(child: &Mutex<Child>, label: &str) -> Result<(), ClientError> {
+        let mut guard = child.lock().await;
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, guard.wait()).await {
+            Ok(status) => {
+                debug!(status = ?status?, label, "sidecar exited");
+            }
+            Err(_elapsed) => {
+                warn!(label, "sidecar ignored shutdown request; killing it");
+                let _ = guard.start_kill();
+                let _ = guard.wait().await;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -930,6 +1042,110 @@ mod tests {
         let _ = conn.compile(&p).await.unwrap();
         let _ = conn.compile(&p).await.unwrap();
         sidecar.await.unwrap();
+    }
+
+    /// A sidecar that never answers makes `request_with_deadline` return
+    /// `Timeout` instead of hanging forever — the bug this deadline exists
+    /// to prevent.
+    #[tokio::test]
+    async fn silent_sidecar_surfaces_as_timeout() {
+        let ((c_r, c_w), (mut s_r, _s_w)) = pair();
+
+        // The "sidecar" reads the request and then goes silent (but keeps
+        // its write end open, so the client sees neither data nor EOF).
+        let sidecar = tokio::spawn(async move {
+            let mut line = String::new();
+            s_r.read_line(&mut line).await.unwrap();
+            // Hold the write end open until the client has timed out.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let mut conn = Connection::new(c_r, c_w);
+        let err = conn
+            .request_with_deadline::<_, CompileResult>(
+                methods::COMPILE,
+                &serde_json::json!({"files": []}),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        sidecar.await.unwrap();
+
+        assert!(matches!(err, ConnectionError::Timeout { .. }), "got {err:?}");
+    }
+
+    /// After a timed-out request — including one cancelled in the middle of
+    /// reading a *partial* response line — the connection re-synchronises:
+    /// the next request finishes and discards the leftover line, drains the
+    /// stale response by id, and succeeds.
+    #[tokio::test]
+    async fn connection_resyncs_after_timed_out_request() {
+        let ((c_r, c_w), (mut s_r, mut s_w)) = pair();
+
+        let sidecar = tokio::spawn(async move {
+            // Request 1: send only *half* the response line, then stall past
+            // the client's deadline so the cancelled read leaves a partial
+            // line in the client's buffer — and only then send the rest, the
+            // way a briefly-stalled (but alive) sidecar would.
+            let mut line = String::new();
+            s_r.read_line(&mut line).await.unwrap();
+            let req: Request = serde_json::from_str(&line).unwrap();
+            let full = {
+                let resp = Response {
+                    id: req.id,
+                    result: Some(serde_json::json!({"ast": {"files": []}, "diagnostics": []})),
+                    error: None,
+                };
+                let mut s = serde_json::to_string(&resp).unwrap();
+                s.push('\n');
+                s
+            };
+            let (head, tail) = full.split_at(full.len() / 2);
+            s_w.write_all(head.as_bytes()).await.unwrap();
+            s_w.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            s_w.write_all(tail.as_bytes()).await.unwrap();
+            s_w.flush().await.unwrap();
+
+            // Request 2: answer it properly.
+            let mut line2 = String::new();
+            s_r.read_line(&mut line2).await.unwrap();
+            let req2: Request = serde_json::from_str(&line2).unwrap();
+            let resp2 = Response {
+                id: req2.id,
+                result: Some(serde_json::json!({"ast": {"files": []}, "diagnostics": []})),
+                error: None,
+            };
+            let mut out = serde_json::to_string(&resp2).unwrap();
+            out.push('\n');
+            s_w.write_all(out.as_bytes()).await.unwrap();
+        });
+
+        let mut conn = Connection::new(c_r, c_w);
+        let params = serde_json::json!({"files": []});
+
+        let first = conn
+            .request_with_deadline::<_, CompileResult>(
+                methods::COMPILE,
+                &params,
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            matches!(first, Err(ConnectionError::Timeout { .. })),
+            "first request should time out, got {first:?}",
+        );
+
+        // Second request must succeed despite the partial + stale bytes.
+        let second = conn
+            .request_with_deadline::<_, CompileResult>(
+                methods::COMPILE,
+                &params,
+                Duration::from_secs(5),
+            )
+            .await;
+        sidecar.await.unwrap();
+        assert!(second.is_ok(), "expected resync + success, got {second:?}");
     }
 
     /// Spawning a non-existent program surfaces as `ClientError::Spawn`,

@@ -28,7 +28,7 @@ use ropey::Rope;
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::{Position, Range};
 use tower_lsp::lsp_types::Url;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::backend::DocumentState;
 use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
@@ -69,7 +69,12 @@ pub(crate) struct ClosedFileDiskCache {
     /// from disk. Files that returned `None` from `read_to_string` are absent;
     /// the caller treats absence the same as an empty string (matching
     /// `assemble_elaborate_params`'s `unwrap_or_default` semantics).
-    pub(crate) texts: HashMap<PathBuf, String>,
+    ///
+    /// Values are `Arc<str>` so the per-elaborate snapshot in
+    /// [`assemble_with_cache`] clones reference counts, not every file's
+    /// full text (which used to copy the whole project per keystroke-
+    /// debounced compile).
+    pub(crate) texts: HashMap<PathBuf, Arc<str>>,
 }
 
 // --------------------------------------------------------------------------
@@ -333,8 +338,12 @@ impl SlangService {
     -> Result<CompileResult, mimir_slang::ClientError>
     {
         mimir_core::time_scope!("slang.compile.service_total");
-        let slang = self.slang.read().await.clone()
-            .expect("compile called without a configured sidecar");
+        let Some(slang) = self.slang.read().await.clone() else {
+            // The caller's is_configured() check can race a config reload
+            // that removed the sidecar — a recoverable state, not a panic.
+            warn!("compile requested but no slang sidecar is configured");
+            return Err(mimir_slang::ClientError::NotConfigured);
+        };
         slang.compile(params).await
     }
 
@@ -371,8 +380,10 @@ impl SlangService {
     -> Result<ExpandMacroResult, mimir_slang::ClientError>
     {
         mimir_core::time_scope!("slang.expand_macro.service_total");
-        let slang = self.slang.read().await.clone()
-            .expect("expand_macro called without a configured sidecar");
+        let Some(slang) = self.slang.read().await.clone() else {
+            warn!("expand_macro requested but no slang sidecar is configured");
+            return Err(mimir_slang::ClientError::NotConfigured);
+        };
         slang.expand_macro(params).await
     }
 
@@ -384,8 +395,10 @@ impl SlangService {
     -> Result<ExpandMacroResult, mimir_slang::ClientError>
     {
         mimir_core::time_scope!("slang.expand_macro.service_total");
-        let slang = self.slang.read().await.clone()
-            .expect("expand_macro_if_idle called without a configured sidecar");
+        let Some(slang) = self.slang.read().await.clone() else {
+            warn!("expand_macro_if_idle requested but no slang sidecar is configured");
+            return Err(mimir_slang::ClientError::NotConfigured);
+        };
         slang.try_expand_macro(params).await
     }
 
@@ -510,8 +523,9 @@ pub(crate) async fn assemble_with_cache(
 ) -> (ElaborateParams, Vec<Url>) {
     mimir_core::time_scope!("elaborate.assemble_with_cache");
 
-    // Phase 1: snapshot existing cached texts.
-    let cached_texts: HashMap<PathBuf, String> = {
+    // Phase 1: snapshot existing cached texts. `Arc<str>` values make this
+    // a pointer-clone per entry, not a copy of every file's text.
+    let cached_texts: HashMap<PathBuf, Arc<str>> = {
         mimir_core::time_scope!("elaborate.assemble.cache_snapshot");
         closed_file_cache
             .read()
@@ -522,14 +536,14 @@ pub(crate) async fn assemble_with_cache(
     };
 
     // Phase 2: assemble params — no lock held; disk reads happen here.
-    let mut new_entries: HashMap<PathBuf, String> = HashMap::new();
+    let mut new_entries: HashMap<PathBuf, Arc<str>> = HashMap::new();
     let result = {
         mimir_core::time_scope!("elaborate.assemble.disk_reads_and_params");
         assemble_elaborate_params(project, open_text, |path| {
             if let Some(text) = cached_texts.get(path) {
                 return Some(text.clone());
             }
-            let text = std::fs::read_to_string(path).ok()?;
+            let text: Arc<str> = Arc::from(std::fs::read_to_string(path).ok()?);
             new_entries.insert(path.to_path_buf(), text.clone());
             Some(text)
         })
@@ -556,7 +570,7 @@ pub(crate) async fn assemble_with_cache(
 pub(crate) fn assemble_elaborate_params(
     project: &ResolvedProject,
     open_text: &HashMap<PathBuf, (Url, String)>,
-    mut read_disk: impl FnMut(&Path) -> Option<String>,
+    mut read_disk: impl FnMut(&Path) -> Option<Arc<str>>,
 ) -> (ElaborateParams, Vec<Url>) {
     let mut files: Vec<SourceFile> = Vec::new();
     let mut files_in_request: Vec<Url> = Vec::new();
@@ -569,7 +583,11 @@ pub(crate) fn assemble_elaborate_params(
         let (url, text) = match open_text.get(project_file) {
             Some((url, text)) => (url.clone(), text.clone()),
             None => {
-                let text = read_disk(project_file).unwrap_or_default();
+                // One copy into the wire type is unavoidable (`SourceFile.text`
+                // is an owned `String`); the cached `Arc<str>` itself is shared.
+                let text = read_disk(project_file)
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
                 let url = Url::from_file_path(project_file)
                     .unwrap_or_else(|()| placeholder_url(project_file));
                 (url, text)
@@ -718,7 +736,7 @@ mod tests {
         );
 
         let (params, files_in_request) =
-            assemble_elaborate_params(&project, &open_text, |_| Some(String::new()));
+            assemble_elaborate_params(&project, &open_text, |_| Some(Arc::from("")));
 
         assert_eq!(params.files.len(), 2);
         assert_eq!(params.files[0].path, "/proj/a.sv");
@@ -735,7 +753,7 @@ mod tests {
         let project = project_with_files(vec![f.clone(), f.clone()]);
 
         let (params, files_in_request) =
-            assemble_elaborate_params(&project, &HashMap::new(), |_| Some(String::new()));
+            assemble_elaborate_params(&project, &HashMap::new(), |_| Some(Arc::from("")));
 
         assert_eq!(params.files.len(), 1);
         assert_eq!(files_in_request.len(), 1);
@@ -748,7 +766,7 @@ mod tests {
         project.include_dirs = vec![PathBuf::from("/uvm/src")];
 
         let pkg = PathBuf::from("/uvm/src/uvm_pkg.sv");
-        let texts: HashMap<PathBuf, String> = HashMap::from([
+        let texts: HashMap<PathBuf, Arc<str>> = HashMap::from([
             (umbrella.clone(), "`include \"uvm_pkg.sv\"\n".into()),
             (pkg.clone(), "package uvm_pkg; endpackage\n".into()),
         ]);

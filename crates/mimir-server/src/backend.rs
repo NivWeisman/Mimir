@@ -63,7 +63,7 @@ use crate::completion_score;
 use crate::hierarchy_features;
 use crate::includes;
 use crate::elaborate_service::ElaborateService;
-use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs};
+use crate::format::{invoke_verible, strip_mimir_pragmas, wrap_ifdefs, WrappedSource};
 use crate::parse_provider::TreeSitterProvider;
 use crate::project::{FeatureToggles, FormatterConfig, ResolvedProject};
 use crate::slang_adapter::SlangAdapter;
@@ -349,12 +349,35 @@ impl Backend {
                 );
                 let paths = resolved.files.clone();
                 let include_dirs = resolved.include_dirs.clone();
+                let first_project_file = paths.first().cloned();
                 self.slang.set_project(Some(resolved)).await;
+
+                // The new config can change anything from the filelist to
+                // the diagnostics policy without touching any open buffer,
+                // so both elaborate caches are stale: reset the input-hash
+                // dedup (or the next schedule would skip the sidecar) and
+                // drop the cached AST (so features stop answering from the
+                // old project while the recompile is in flight).
+                self.elaborate.invalidate_hash().await;
+                self.adapter.invalidate().await;
+
                 let ts = self.ts.clone();
                 let workspace = self.workspace.clone();
                 tokio::spawn(async move {
                     hydrate_workspace_index(paths, include_dirs, ts, workspace).await;
                 });
+
+                // Re-elaborate now rather than on the next edit — a
+                // config-only change (e.g. demoting vendor diagnostics)
+                // must refresh squiggles on its own. Same trigger-URI
+                // convention as the startup elaborate: the first filelist
+                // entry is just a stable debounce-map key.
+                if let Some(first) = first_project_file {
+                    if let Ok(trigger) = Url::from_file_path(&first) {
+                        debug!(trigger = %trigger, "scheduling post-reload slang elaborate");
+                        self.elaborate.schedule(trigger).await;
+                    }
+                }
             }
             Ok(None) => {
                 warn!(
@@ -3027,19 +3050,20 @@ impl LanguageServer for Backend {
             }
         };
         let rope = ropey::Rope::from_str(&source);
-        let (wrapped, has_ifdefs) = if cfg.wrap_ifdefs {
-            let (w, flag) = wrap_ifdefs(&source);
-            if flag {
+        let wrapped = if cfg.wrap_ifdefs {
+            let w = wrap_ifdefs(&source);
+            if w.has_ifdefs {
                 warn!(
                     "formatting: file contains `ifdef/`ifndef blocks; \
                      wrapping them with format-off pragmas so Verible can parse the rest"
                 );
             }
-            (w, flag)
+            w
         } else {
-            (source.clone(), false)
+            WrappedSource::unchanged(&source)
         };
-        match invoke_verible(&cfg, &wrapped, None).await {
+        let has_ifdefs = wrapped.has_ifdefs;
+        match invoke_verible(&cfg, &wrapped.text, None).await {
             Ok(raw_formatted) => {
                 let formatted = if has_ifdefs {
                     strip_mimir_pragmas(&raw_formatted)
@@ -3104,22 +3128,25 @@ impl LanguageServer for Backend {
             }
         };
         let rope = ropey::Rope::from_str(&source);
-        // LSP line numbers are 0-based; Verible's --lines flag is 1-based.
-        let start_line = params.range.start.line + 1;
-        let end_line = params.range.end.line + 1;
-        let (wrapped, has_ifdefs) = if cfg.wrap_ifdefs {
-            let (w, flag) = wrap_ifdefs(&source);
-            if flag {
+        let wrapped = if cfg.wrap_ifdefs {
+            let w = wrap_ifdefs(&source);
+            if w.has_ifdefs {
                 warn!(
                     "range_formatting: file contains `ifdef/`ifndef blocks; \
                      wrapping them with format-off pragmas"
                 );
             }
-            (w, flag)
+            w
         } else {
-            (source.clone(), false)
+            WrappedSource::unchanged(&source)
         };
-        match invoke_verible(&cfg, &wrapped, Some(start_line..=end_line)).await {
+        let has_ifdefs = wrapped.has_ifdefs;
+        // Verible's `--lines` flag is 1-based and references the text it is
+        // given — the *wrapped* text — so the selection's 0-based LSP lines
+        // must first be shifted past any pragma lines inserted above them.
+        let start_line = wrapped.wrapped_line(params.range.start.line) + 1;
+        let end_line = wrapped.wrapped_line(params.range.end.line) + 1;
+        match invoke_verible(&cfg, &wrapped.text, Some(start_line..=end_line)).await {
             Ok(raw_formatted) => {
                 let formatted = if has_ifdefs {
                     strip_mimir_pragmas(&raw_formatted)

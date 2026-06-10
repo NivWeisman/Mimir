@@ -27,7 +27,7 @@
 //! list may have changed without touching any open buffer.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use mimir_ast::{MimirDiag};
@@ -47,6 +47,12 @@ use mimir_syntax::SymbolKind;
 // --------------------------------------------------------------------------
 // Internal types
 // --------------------------------------------------------------------------
+
+/// One debounce-map entry: the owning task's generation tag plus its handle.
+type PendingTask = (u64, JoinHandle<()>);
+
+/// The debounce map: one tagged in-flight elaborate task per trigger URI.
+type PendingMap = HashMap<Url, PendingTask>;
 
 /// One round of slang publishes, computed without touching tower-lsp.
 struct SlangPublishPlan {
@@ -73,8 +79,13 @@ pub(crate) struct ElaborateService {
     /// Channel for pushing `publishDiagnostics` back to the editor.
     client: Client,
     /// One in-flight (sleeping or running) elaborate task per trigger URI.
-    /// Aborted and replaced on every new edit for the same URI — the debounce.
-    pending: Arc<RwLock<HashMap<Url, JoinHandle<()>>>>,
+    /// Aborted and replaced on every new edit for the same URI — the
+    /// debounce. Each entry is tagged with the generation of the task that
+    /// owns it so a finishing task only removes *its own* entry, never a
+    /// successor's (see [`remove_pending_generation`]).
+    pending: Arc<RwLock<PendingMap>>,
+    /// Monotonic source for the per-task generation tags in `pending`.
+    next_generation: Arc<AtomicU64>,
     /// Hash of inputs sent to the last *successful* compile. The same hash
     /// on the next call → skip the sidecar entirely.
     last_hash: Arc<RwLock<Option<u64>>>,
@@ -101,6 +112,7 @@ impl ElaborateService {
             adapter,
             client,
             pending: Arc::new(RwLock::new(HashMap::new())),
+            next_generation: Arc::new(AtomicU64::new(0)),
             last_hash: Arc::new(RwLock::new(None)),
             published: Arc::new(RwLock::new(HashSet::new())),
             startup_logged: Arc::new(AtomicBool::new(false)),
@@ -126,14 +138,6 @@ impl ElaborateService {
             None => return,
         };
 
-        {
-            let mut pending = self.pending.write().await;
-            if let Some(prior) = pending.remove(&trigger_uri) {
-                prior.abort();
-                debug!(uri = %trigger_uri, "cancelled prior pending elaborate");
-            }
-        }
-
         let adapter = self.adapter.clone();
         let pending = self.pending.clone();
         let published = self.published.clone();
@@ -142,6 +146,18 @@ impl ElaborateService {
         let lsp_client = self.client.clone();
         let workspace = self.workspace.clone();
         let trigger_for_task = trigger_uri.clone();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+
+        // Abort-prior, spawn, and insert happen under one write-lock hold so
+        // two concurrent `schedule` calls for the same URI can't interleave
+        // and leave an orphaned (never-aborted) task behind. The spawned
+        // task's own cleanup waits on this same lock, so it can't run before
+        // its entry is inserted.
+        let mut pending_guard = self.pending.write().await;
+        if let Some((_, prior)) = pending_guard.remove(&trigger_uri) {
+            prior.abort();
+            debug!(uri = %trigger_uri, "cancelled prior pending elaborate");
+        }
 
         let handle = tokio::spawn(async move {
             mimir_core::time_scope!("elaborate.task_total");
@@ -153,7 +169,7 @@ impl ElaborateService {
             let Some((params, files_in_request)) =
                 adapter.slang().build_elaborate_params().await
             else {
-                pending.write().await.remove(&trigger_for_task);
+                remove_pending_generation(&pending, &trigger_for_task, generation).await;
                 return;
             };
 
@@ -167,7 +183,7 @@ impl ElaborateService {
                     files = params.files.len(),
                     "slang inputs unchanged since last compile; skipping",
                 );
-                pending.write().await.remove(&trigger_for_task);
+                remove_pending_generation(&pending, &trigger_for_task, generation).await;
                 return;
             }
 
@@ -214,10 +230,10 @@ impl ElaborateService {
                 debug!("compile returned no outcome; diagnostic state unchanged");
             }
 
-            pending.write().await.remove(&trigger_for_task);
+            remove_pending_generation(&pending, &trigger_for_task, generation).await;
         });
 
-        self.pending.write().await.insert(trigger_uri, handle);
+        pending_guard.insert(trigger_uri, (generation, handle));
     }
 
     /// Reset the input hash so the next [`schedule`] call always runs the
@@ -225,9 +241,26 @@ impl ElaborateService {
     ///
     /// Call this after a project reload where the filelist or include dirs
     /// may have changed without touching any open buffer.
-    #[allow(dead_code)]
     pub(crate) async fn invalidate_hash(&self) {
         *self.last_hash.write().await = None;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Pending-map helpers
+// --------------------------------------------------------------------------
+
+/// Remove the `pending` entry for `uri` only when it still belongs to the
+/// task tagged `generation`.
+///
+/// A finishing elaborate task must not blindly `remove(uri)`: a newer
+/// `schedule` call for the same URI may already have replaced the entry
+/// with its own handle, and removing *that* would silently break the
+/// next debounce-abort for the URI.
+async fn remove_pending_generation(pending: &RwLock<PendingMap>, uri: &Url, generation: u64) {
+    let mut map = pending.write().await;
+    if map.get(uri).is_some_and(|(gen, _)| *gen == generation) {
+        map.remove(uri);
     }
 }
 
@@ -546,5 +579,26 @@ mod tests {
     #[test]
     fn extract_macro_name_none_on_bad_format() {
         assert_eq!(extract_macro_name("some other error"), None);
+    }
+
+    /// `remove_pending_generation` removes only the entry owned by the
+    /// finishing task's generation: a stale task can't evict the newer
+    /// task that replaced it in the debounce map.
+    #[tokio::test]
+    async fn remove_pending_generation_respects_ownership() {
+        let pending: RwLock<PendingMap> = RwLock::new(HashMap::new());
+        let uri = Url::parse("file:///proj/a.sv").unwrap();
+
+        // Entry currently belongs to generation 2 (a newer schedule).
+        let newer = tokio::spawn(async {});
+        pending.write().await.insert(uri.clone(), (2, newer));
+
+        // The finishing generation-1 task must leave it alone…
+        remove_pending_generation(&pending, &uri, 1).await;
+        assert!(pending.read().await.contains_key(&uri), "stale task evicted its successor");
+
+        // …while the owning generation-2 task removes it.
+        remove_pending_generation(&pending, &uri, 2).await;
+        assert!(!pending.read().await.contains_key(&uri));
     }
 }
