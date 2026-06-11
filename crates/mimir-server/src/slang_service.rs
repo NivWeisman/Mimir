@@ -143,6 +143,18 @@ impl SlangService {
         self.slang.read().await.is_some()
     }
 
+    /// Returns `true` when the project config predefines `name` via
+    /// `+define+` (filelist or inline TOML). Used by the undefined-macro
+    /// hover verdict — a config-defined macro has no `` `define `` in any
+    /// source file, so the workspace index alone would misreport it.
+    pub(crate) async fn project_defines_contain(&self, name: &str) -> bool {
+        self.project
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|p| p.defines.iter().any(|d| d.name == name))
+    }
+
     /// Return the current [`FeatureToggles`] from the resolved project config.
     ///
     /// Falls back to [`FeatureToggles::default`] when no project config is
@@ -372,6 +384,9 @@ impl SlangService {
             timescale: ep.timescale,
             target_path,
             position,
+            // Filled by the mimir-slang client, which owns the
+            // hash-negotiation with the sidecar.
+            input_hash: None,
         })
     }
 

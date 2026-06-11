@@ -62,7 +62,7 @@ use crate::code_lens;
 use crate::completion_score;
 use crate::hierarchy_features;
 use crate::hover_features::{
-    append_hover_footer, builtin_method_hover_at, cursor_on_macro_usage, hover_for_symbol,
+    append_hover_footer, builtin_method_hover_at, hover_for_symbol,
     keyword_hover_at, macro_footer_markdown, read_line_trimmed, ExpandMacroResponse,
 };
 use crate::includes;
@@ -1034,6 +1034,40 @@ impl Backend {
         }
     }
 
+    /// True when the backtick identifier `name` has no definition anywhere
+    /// we can see: not a standard compiler directive, no `` `define `` in
+    /// the workspace index (source files + transitive includes), and no
+    /// `+define+` in the project config.
+    ///
+    /// The verdict is only issued once the index knows at least one macro —
+    /// before hydration finishes the index is empty and "not found" would
+    /// just mean "not indexed yet", so we return `false` and let the caller
+    /// fall through to the sidecar.
+    async fn macro_is_undefined(&self, name: &str) -> bool {
+        if mimir_syntax::is_directive_or_define(name) {
+            return false;
+        }
+        if self.slang.project_defines_contain(name).await {
+            return false;
+        }
+        let ws = self.workspace.read().await;
+        if ws
+            .index
+            .lookup(name)
+            .iter()
+            .any(|e| e.symbol.kind == MSymbolKind::Macro)
+        {
+            return false;
+        }
+        // Hydration gate: any UVM/real project indexes hundreds of macros;
+        // zero means the index hasn't been hydrated yet.
+        let index_knows_macros = ws
+            .index
+            .entries()
+            .any(|e| e.symbol.kind == MSymbolKind::Macro);
+        index_knows_macros
+    }
+
     /// Handler for the custom `mimir/expandMacro` LSP request (registered in
     /// `main.rs` via `LspService::build(...).custom_method(...)`).
     ///
@@ -1041,7 +1075,9 @@ impl Backend {
     /// expanded source text. Returns `Ok(None)` when slang isn't configured,
     /// the cursor isn't on a macro usage, or the sidecar is unavailable —
     /// the VS Code extension turns that into a friendly "not on a macro"
-    /// message.
+    /// message. A macro that is provably *undefined* gets a response with
+    /// the `error` field set instead, so the extension can say so precisely
+    /// (and nobody waits on a whole-project preprocess that can't succeed).
     pub(crate) async fn expand_macro(
         &self,
         params: TextDocumentPositionParams,
@@ -1057,11 +1093,32 @@ impl Backend {
             return Ok(None);
         };
 
-        let version = {
+        let (version, macro_name) = {
             let docs = self.documents.read().await;
-            docs.get(&uri).map(|s| s.document.version())
+            match docs.get(&uri) {
+                Some(s) => (
+                    s.document.version(),
+                    crate::hover_features::macro_name_at_cursor(s.document.rope(), target),
+                ),
+                None => (i32::MIN, None),
+            }
+        };
+
+        // Undefined-macro fast path: answer without the sidecar.
+        if let Some(name) = &macro_name {
+            if self.macro_is_undefined(name).await {
+                debug!(name = %name, "expand_macro: macro undefined; skipping sidecar");
+                return Ok(Some(ExpandMacroResponse {
+                    name: name.clone(),
+                    expansion: String::new(),
+                    line_count: 0,
+                    error: Some(format!(
+                        "`{name} is undefined: no `define in the project or its \
+                         include chain, and no +define+{name} in the configuration",
+                    )),
+                }));
+            }
         }
-        .unwrap_or(i32::MIN);
 
         let Some(eparams) =
             self.slang.build_expand_macro_params(target_path, target).await
@@ -1074,6 +1131,7 @@ impl Backend {
                 name: r.macro_name,
                 expansion: r.expanded_text,
                 line_count: r.line_count,
+                error: None,
             })),
             _ => Ok(None),
         }
@@ -2273,9 +2331,10 @@ impl LanguageServer for Backend {
                 None => return Ok(base),
             }
         };
-        if !cursor_on_macro_usage(&rope, target) {
+        let Some(macro_name) = crate::hover_features::macro_name_at_cursor(&rope, target)
+        else {
             return Ok(base);
-        }
+        };
 
         // 1. Fresh cache hit — same document version. Costs nothing: skips the
         //    elaborate-param assembly and the sidecar round-trip entirely.
@@ -2283,6 +2342,18 @@ impl LanguageServer for Backend {
             if r.found {
                 return Ok(Some(append_hover_footer(base, macro_footer_markdown(&r, false))));
             }
+        }
+
+        // 1b. Undefined-macro fast path: a backtick word with no `define
+        //     anywhere in the index and no +define+ in the config can't
+        //     expand — say so immediately instead of letting the editor sit
+        //     on "Loading…" through a whole-project preprocess that ends in
+        //     an empty hover.
+        if self.macro_is_undefined(&macro_name).await {
+            return Ok(Some(append_hover_footer(
+                base,
+                crate::hover_features::undefined_macro_footer(&macro_name),
+            )));
         }
 
         let Some(file_path) =

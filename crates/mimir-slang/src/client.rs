@@ -68,7 +68,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::protocol::{
     methods, CompileResult, ElaborateParams, ExpandMacroParams, ExpandMacroResult, Request,
-    Response, ResponseError,
+    Response, ResponseError, EXPAND_CACHE_STALE_CODE,
 };
 
 // --------------------------------------------------------------------------
@@ -414,6 +414,117 @@ type SidecarConnection = Connection<BufReader<ChildStdout>, ChildStdin>;
 /// process, and the task draining its stderr.
 type SpawnedSidecar = (SidecarConnection, Child, JoinHandle<()>);
 
+/// The expand sidecar's connection plus the input-hash of the file set it
+/// last loaded successfully. Kept in one mutex so the hash can never drift
+/// from what the connection actually sent (the negotiation in
+/// [`expand_with_cache`] reads and writes both under one guard hold).
+struct ExpandConnection {
+    conn: SidecarConnection,
+    /// `Some(hash)` after a successful full-payload expand; `None` until
+    /// then and after any failed request (forces the next request to carry
+    /// file payloads again).
+    last_hash: Option<String>,
+}
+
+/// Hash the preprocessor-relevant fields of `params` — everything except
+/// `target_path` / `position` (always sent) and `input_hash` itself. Any
+/// edit to any file, or any config change, produces a different hash.
+fn expand_input_hash(params: &ExpandMacroParams) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in &params.files {
+        f.path.hash(&mut h);
+        f.text.hash(&mut h);
+        f.is_compilation_unit.hash(&mut h);
+    }
+    params.include_dirs.hash(&mut h);
+    for d in &params.defines {
+        d.name.hash(&mut h);
+        d.value.hash(&mut h);
+    }
+    params.extra_args.hash(&mut h);
+    params.single_unit.hash(&mut h);
+    params.timescale.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Run one `expandMacro` round-trip with input-hash cache negotiation.
+///
+/// When the sidecar already holds this file set (the hash matches the last
+/// successful full send), only a *slim* request goes out — no file
+/// payloads, which on a real UVM project removes megabytes of JSON per
+/// hover. A sidecar whose cache turns out to be stale answers
+/// [`EXPAND_CACHE_STALE_CODE`] and we retry once with the full payloads.
+///
+/// Free function generic over the stream pair (rather than a `Client`
+/// method) so the negotiation is unit-testable against an in-memory duplex
+/// pair. `last_hash` lives next to the connection inside
+/// [`ExpandConnection`]; both are passed split so the borrow stays simple.
+async fn expand_with_cache<R, W>(
+    conn: &mut Connection<R, W>,
+    last_hash: &mut Option<String>,
+    params: &ExpandMacroParams,
+) -> Result<ExpandMacroResult, ConnectionError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let hash = expand_input_hash(params);
+
+    if last_hash.as_deref() == Some(hash.as_str()) {
+        // Slim request: everything except the file payloads.
+        let slim = ExpandMacroParams {
+            files: Vec::new(),
+            include_dirs: params.include_dirs.clone(),
+            defines: params.defines.clone(),
+            extra_args: params.extra_args.clone(),
+            single_unit: params.single_unit,
+            timescale: params.timescale.clone(),
+            target_path: params.target_path.clone(),
+            position: params.position,
+            input_hash: Some(hash.clone()),
+        };
+        match conn
+            .request_with_deadline::<_, ExpandMacroResult>(
+                methods::EXPAND_MACRO,
+                &slim,
+                EXPAND_TIMEOUT,
+            )
+            .await
+        {
+            Err(ConnectionError::Sidecar(e)) if e.code == EXPAND_CACHE_STALE_CODE => {
+                debug!("expand cache stale on sidecar; resending file payloads");
+            }
+            Err(e) => {
+                // Anything else is a real failure; force a full resend next
+                // time in case the sidecar's state is now unknown.
+                *last_hash = None;
+                return Err(e);
+            }
+            Ok(r) => return Ok(r),
+        }
+    }
+
+    // Full request: file payloads plus the hash the sidecar should cache
+    // them under. Serialized via a borrowed wrapper so the (potentially
+    // large) params are not cloned just to set `input_hash`.
+    #[derive(serde::Serialize)]
+    struct WithHash<'a> {
+        #[serde(flatten)]
+        params: &'a ExpandMacroParams,
+        input_hash: &'a str,
+    }
+    let full = WithHash {
+        params,
+        input_hash: &hash,
+    };
+    let res = conn
+        .request_with_deadline::<_, ExpandMacroResult>(methods::EXPAND_MACRO, &full, EXPAND_TIMEOUT)
+        .await;
+    *last_hash = if res.is_ok() { Some(hash) } else { None };
+    res
+}
+
 /// Owns **two** running slang sidecar processes — one for heavy
 /// `compile`/elaborate round-trips, one dedicated to on-demand `expandMacro` —
 /// each with its own [`Connection`] over its stdio.
@@ -436,8 +547,10 @@ pub struct Client {
     connection: Mutex<SidecarConnection>,
     /// Dedicated connection (and process) for `expandMacro`, so an interactive
     /// expansion never queues behind — or stalls on — a long/stuck elaborate
-    /// holding `connection`.
-    expand_connection: Mutex<SidecarConnection>,
+    /// holding `connection`. Bundled with the input-hash of the file set
+    /// last sent, so repeat expansions can skip the file payloads entirely
+    /// (see [`expand_with_cache`]).
+    expand_connection: Mutex<ExpandConnection>,
     /// The compile sidecar process. Held under a `Mutex` so `shutdown` can
     /// `wait` without competing with anyone else; `drop` doesn't need the lock.
     child: Mutex<Child>,
@@ -491,7 +604,10 @@ impl Client {
         debug!("slang sidecars spawned (compile + expand)");
         Ok(Self {
             connection: Mutex::new(connection),
-            expand_connection: Mutex::new(expand_connection),
+            expand_connection: Mutex::new(ExpandConnection {
+                conn: expand_connection,
+                last_hash: None,
+            }),
             child: Mutex::new(child),
             expand_child: Mutex::new(expand_child),
             stderr_pump: Some(stderr_pump),
@@ -574,13 +690,11 @@ impl Client {
         params: &ExpandMacroParams,
     ) -> Result<ExpandMacroResult, ClientError> {
         mimir_core::time_scope!("slang.expand_macro.client_total");
-        let mut conn = {
+        let state = &mut *{
             mimir_core::time_scope!("slang.expand_macro.client_lock_wait");
             self.expand_connection.lock().await
         };
-        Ok(conn
-            .request_with_deadline(methods::EXPAND_MACRO, params, EXPAND_TIMEOUT)
-            .await?)
+        Ok(expand_with_cache(&mut state.conn, &mut state.last_hash, params).await?)
     }
 
     /// Non-blocking variant of [`Client::expand_macro`].
@@ -598,13 +712,12 @@ impl Client {
         params: &ExpandMacroParams,
     ) -> Result<ExpandMacroResult, ClientError> {
         mimir_core::time_scope!("slang.expand_macro.client_total");
-        let mut conn = match self.expand_connection.try_lock() {
-            Ok(conn) => conn,
+        let mut guard = match self.expand_connection.try_lock() {
+            Ok(state) => state,
             Err(_) => return Err(ClientError::Busy),
         };
-        Ok(conn
-            .request_with_deadline(methods::EXPAND_MACRO, params, EXPAND_TIMEOUT)
-            .await?)
+        let state = &mut *guard;
+        Ok(expand_with_cache(&mut state.conn, &mut state.last_hash, params).await?)
     }
 
     /// Send the `shutdown` request to **both** sidecars, then wait for each
@@ -621,8 +734,8 @@ impl Client {
     pub async fn shutdown(self) -> Result<(), ClientError> {
         // We only care whether the request *got out*; each sidecar is allowed
         // to drop its connection without responding to `shutdown`.
-        Self::send_shutdown(&self.connection).await;
-        Self::send_shutdown(&self.expand_connection).await;
+        Self::send_shutdown(&mut *self.connection.lock().await).await;
+        Self::send_shutdown(&mut self.expand_connection.lock().await.conn).await;
 
         Self::wait_or_kill(&self.child, "compile").await?;
         Self::wait_or_kill(&self.expand_child, "expand").await?;
@@ -631,8 +744,7 @@ impl Client {
 
     /// Send a `shutdown` request over one connection, logging (but not
     /// propagating) the expected "connection closed" outcome.
-    async fn send_shutdown(connection: &Mutex<SidecarConnection>) {
-        let mut conn = connection.lock().await;
+    async fn send_shutdown(conn: &mut SidecarConnection) {
         let res: Result<serde_json::Value, _> = conn
             .request_with_deadline(methods::SHUTDOWN, &serde_json::Value::Null, SHUTDOWN_TIMEOUT)
             .await;
@@ -1146,6 +1258,146 @@ mod tests {
             .await;
         sidecar.await.unwrap();
         assert!(second.is_ok(), "expected resync + success, got {second:?}");
+    }
+
+    /// One canned `ExpandMacroParams` for the negotiation tests.
+    fn expand_params() -> ExpandMacroParams {
+        ExpandMacroParams {
+            files: vec![SourceFile {
+                path: "/proj/a.sv".into(),
+                text: "`uvm_info(\"T\", \"hi\", UVM_LOW)".into(),
+                is_compilation_unit: true,
+            }],
+            include_dirs: vec!["/uvm/src".into()],
+            defines: vec![],
+            extra_args: vec![],
+            single_unit: true,
+            timescale: None,
+            target_path: "/proj/a.sv".into(),
+            position: mimir_core::Position::new(0, 3),
+            input_hash: None,
+        }
+    }
+
+    fn found_expansion_json() -> serde_json::Value {
+        serde_json::json!({
+            "found": true,
+            "expanded_text": "x",
+            "macro_name": "uvm_info",
+            "line_count": 1,
+            "diagnostics": []
+        })
+    }
+
+    /// First expand sends the file payloads + hash; a repeat with the same
+    /// inputs sends a *slim* request (no files) carrying the same hash.
+    #[tokio::test]
+    async fn expand_negotiation_goes_slim_on_repeat() {
+        let ((c_r, c_w), (mut s_r, mut s_w)) = pair();
+
+        let sidecar = tokio::spawn(async move {
+            let mut seen: Vec<Request> = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                s_r.read_line(&mut line).await.unwrap();
+                let req: Request = serde_json::from_str(&line).unwrap();
+                let resp = Response {
+                    id: req.id,
+                    result: Some(found_expansion_json()),
+                    error: None,
+                };
+                seen.push(req);
+                let mut out = serde_json::to_string(&resp).unwrap();
+                out.push('\n');
+                s_w.write_all(out.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+
+        let mut conn = Connection::new(c_r, c_w);
+        let mut last_hash: Option<String> = None;
+        let p = expand_params();
+        expand_with_cache(&mut conn, &mut last_hash, &p).await.expect("first expand");
+        expand_with_cache(&mut conn, &mut last_hash, &p).await.expect("second expand");
+        let seen = sidecar.await.unwrap();
+
+        // First request: full payloads + hash.
+        let first = &seen[0].params;
+        assert!(!first["files"].as_array().unwrap().is_empty(), "first request carries files");
+        let hash1 = first["input_hash"].as_str().unwrap().to_owned();
+        // Second request: slim — no files on the wire, same hash.
+        let second = &seen[1].params;
+        let slim_files = second.get("files").and_then(|f| f.as_array()).map(|a| a.len());
+        assert_eq!(slim_files, Some(0), "repeat request must not carry file payloads");
+        assert_eq!(second["input_hash"].as_str().unwrap(), hash1);
+    }
+
+    /// A slim request the sidecar can't serve (stale cache) is retried once
+    /// with full payloads, transparently to the caller.
+    #[tokio::test]
+    async fn expand_negotiation_retries_full_on_stale_cache() {
+        let ((c_r, c_w), (mut s_r, mut s_w)) = pair();
+
+        let sidecar = tokio::spawn(async move {
+            let mut seen: Vec<Request> = Vec::new();
+            // Request 1 (full) → ok. Request 2 (slim) → stale-cache error.
+            // Request 3 (full retry) → ok.
+            for i in 0..3 {
+                let mut line = String::new();
+                s_r.read_line(&mut line).await.unwrap();
+                let req: Request = serde_json::from_str(&line).unwrap();
+                let resp = if i == 1 {
+                    Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: EXPAND_CACHE_STALE_CODE,
+                            message: "expand cache stale".into(),
+                        }),
+                    }
+                } else {
+                    Response { id: req.id, result: Some(found_expansion_json()), error: None }
+                };
+                seen.push(req);
+                let mut out = serde_json::to_string(&resp).unwrap();
+                out.push('\n');
+                s_w.write_all(out.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+
+        let mut conn = Connection::new(c_r, c_w);
+        let mut last_hash: Option<String> = None;
+        let p = expand_params();
+        expand_with_cache(&mut conn, &mut last_hash, &p).await.expect("first expand");
+        // The stale-cache retry must be invisible to the caller.
+        expand_with_cache(&mut conn, &mut last_hash, &p)
+            .await
+            .expect("second expand (with retry)");
+        let seen = sidecar.await.unwrap();
+
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            seen[1].params["files"].as_array().map(|a| a.len()),
+            Some(0),
+            "second wire request is slim",
+        );
+        assert!(!seen[2].params["files"].as_array().unwrap().is_empty(),
+            "retry carries file payloads again");
+    }
+
+    /// Different inputs produce different hashes; identical inputs match.
+    #[test]
+    fn expand_input_hash_tracks_inputs() {
+        let p = expand_params();
+        let mut q = expand_params();
+        assert_eq!(expand_input_hash(&p), expand_input_hash(&q));
+        q.files[0].text.push_str("\n// edit");
+        assert_ne!(expand_input_hash(&p), expand_input_hash(&q));
+        // Cursor position must NOT affect the hash — that's per-request.
+        let mut r = expand_params();
+        r.position = mimir_core::Position::new(5, 1);
+        assert_eq!(expand_input_hash(&p), expand_input_hash(&r));
     }
 
     /// Spawning a non-existent program surfaces as `ClientError::Spawn`,

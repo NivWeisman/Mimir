@@ -268,7 +268,24 @@ pub struct ExpandMacroParams {
     /// Cursor position (zero-based line, UTF-16 character) somewhere on the
     /// macro usage to expand.
     pub position: Position,
+
+    /// Client-computed hash of the preprocessor-relevant inputs (`files`,
+    /// `include_dirs`, `defines`, `extra_args`, `single_unit`,
+    /// `timescale`). The sidecar caches its loaded buffers and per-file
+    /// macro runs under this hash, so a follow-up request with a matching
+    /// hash may omit `files` entirely — eliminating the megabytes of file
+    /// text that otherwise cross the wire on every hover. When the
+    /// sidecar's cache is stale it answers error
+    /// [`EXPAND_CACHE_STALE_CODE`] and the client resends with payloads.
+    /// Wire-omitted when `None` so older sidecars are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
 }
+
+/// Sidecar error code: a slim `expandMacro` request (no `files`) referenced
+/// an [`ExpandMacroParams::input_hash`] the sidecar doesn't have cached.
+/// The client retries once with the full file payloads.
+pub const EXPAND_CACHE_STALE_CODE: i32 = -32010;
 
 /// Result for [`methods::EXPAND_MACRO`].
 ///
@@ -682,6 +699,7 @@ mod tests {
             timescale: None,
             target_path: "/proj/agent.sv".into(),
             position: Position::new(0, 4),
+            input_hash: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(!s.contains("extra_args"), "default extra_args should be skipped: {s}");
@@ -708,6 +726,7 @@ mod tests {
             timescale: Some("1ns/1ps".into()),
             target_path: "/x.sv".into(),
             position: Position::new(2, 1),
+            input_hash: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: ExpandMacroParams = serde_json::from_str(&s).unwrap();

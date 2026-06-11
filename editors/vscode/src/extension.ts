@@ -31,6 +31,10 @@ interface ExpandMacroResponse {
   name: string;
   expansion: string;
   lineCount: number;
+  // Set when the expansion could not be produced (e.g. the macro has no
+  // `define anywhere in the project). The extension shows this message
+  // instead of opening an expansion tab.
+  error?: string;
 }
 
 // Holds the most recent expansion text per virtual-doc URI so the
@@ -114,6 +118,10 @@ function registerMacroExpansion(context: vscode.ExtensionContext): void {
         void vscode.window.showInformationMessage(
           "Mimir: the cursor is not on a macro usage (or slang isn't configured).",
         );
+        return;
+      }
+      if (result.error) {
+        void vscode.window.showWarningMessage(`Mimir: ${result.error}`);
         return;
       }
 

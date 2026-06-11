@@ -62,6 +62,6 @@ pub use calls::{ArgSpan, CallKind, CallSite, EnclosingCallable};
 pub use diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use folding::FoldRange;
 pub use inlay::{InlayLabel, MethodHintMode};
-pub use parser::{SyntaxParser, SyntaxParserError, SyntaxTree};
+pub use parser::{is_compiler_directive, is_directive_or_define, SyntaxParser, SyntaxParserError, SyntaxTree};
 pub use signature::{ParamInfo, SignatureInfo};
 pub use symbols::{ChainSegment, MemberChain, Param, Symbol, SymbolKind, TypeInfo};

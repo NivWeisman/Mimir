@@ -1461,6 +1461,46 @@ static json handle_compile(const json& params) {
 // in a real file buffer) into the run's bounds; for body tokens that range is
 // the whole `` `MACRO(...) `` invocation. We then pick the run whose bounds
 // cover the requested cursor position and concatenate its tokens' text.
+//
+// Caching: the client tags each request with a hash of the preprocessor
+// inputs (`input_hash`). We keep the last generation's SourceManager,
+// loaded buffers, and the per-target-file run lists; a request whose hash
+// matches skips both the file-payload load *and* (for an already-expanded
+// file) the whole preprocess. A slim request (no `files`) against a stale
+// cache is answered with error code -32010 so the client resends payloads.
+
+// One contiguous run of macro-expansion tokens attributed to a target file.
+struct MacroRun {
+    bool active = false;
+    bool has_target = false;
+    // LSP bounds of the run's mapped file range (target buffer only).
+    uint32_t lo_line = 0, lo_char = 0, hi_line = 0, hi_char = 0;
+    // SourceLocations for the usage_range output.
+    slang::SourceLocation min_start;
+    slang::SourceLocation max_end;
+    std::string text;
+    std::string macro_name;
+};
+
+// One cached buffer from the last expandMacro generation.
+struct ExpandCachedFile {
+    slang::SourceBuffer buffer;
+    bool is_cu = false;
+};
+
+// The expandMacro input cache: one generation, replaced wholesale whenever
+// the client's input hash changes (i.e. on any edit anywhere). `sm` must
+// stay alive as long as `runs_by_target` — the runs hold SourceLocations
+// that are only meaningful against this SourceManager.
+struct ExpandCache {
+    std::string hash;
+    std::shared_ptr<slang::SourceManager> sm;
+    std::vector<slang::SourceBuffer> cu_buffers;
+    std::map<std::string, ExpandCachedFile> by_path;
+    std::map<std::string, std::vector<MacroRun>> runs_by_target;
+};
+static ExpandCache g_expand_cache;
+
 static json handle_expand_macro(const json& params) {
     using namespace slang;
     using namespace slang::parsing;
@@ -1477,16 +1517,42 @@ static json handle_expand_macro(const json& params) {
         want_char = params["position"].value("character", 0u);
     }
 
-    auto sm = std::make_shared<SourceManager>();
+    const std::string input_hash = params.value("input_hash", std::string{});
+    const bool has_files = params.contains("files") && params["files"].is_array()
+        && !params["files"].empty();
+    const bool cache_hit = !input_hash.empty() && g_expand_cache.sm
+        && input_hash == g_expand_cache.hash;
+
     auto setup = build_preproc_setup(params);
 
-    // Load every file into the SourceManager. Track the ordered list of
-    // compilation-unit buffers (for single-unit feeding) and the target
-    // buffer (the file whose macro we're expanding).
+    std::shared_ptr<SourceManager> sm;
     std::vector<SourceBuffer> cu_buffers;
     std::optional<SourceBuffer> target_buffer;
     bool target_is_cu = false;
-    if (params.contains("files") && params["files"].is_array()) {
+
+    if (cache_hit) {
+        // Reuse the previous generation's loaded buffers — the client
+        // promises (by hash) that every file's text is unchanged.
+        sm = g_expand_cache.sm;
+        cu_buffers = g_expand_cache.cu_buffers;
+        auto it = g_expand_cache.by_path.find(target_path);
+        if (it != g_expand_cache.by_path.end()) {
+            target_buffer = it->second.buffer;
+            target_is_cu = it->second.is_cu;
+        }
+    } else if (!has_files) {
+        // Slim request against a cache we don't have: tell the client to
+        // resend with payloads. The dispatch loop turns this marker into
+        // wire error -32010.
+        json stale;
+        stale["__expand_cache_stale"] = true;
+        return stale;
+    } else {
+        // Full request: load every file into a fresh SourceManager. Track
+        // the ordered compilation-unit buffers (for single-unit feeding)
+        // and the target buffer (the file whose macro we're expanding).
+        sm = std::make_shared<SourceManager>();
+        std::map<std::string, ExpandCachedFile> by_path;
         for (const auto& f : params["files"]) {
             const auto path = f.value("path", std::string{});
             const auto text = f.value("text", std::string{});
@@ -1497,12 +1563,17 @@ static json handle_expand_macro(const json& params) {
             } catch (const std::exception&) {
                 continue; // duplicate path — already loaded via `include
             }
+            by_path[path] = ExpandCachedFile{buffer, is_cu};
             if (path == target_path) {
                 target_buffer = buffer;
                 target_is_cu = is_cu;
             }
             if (is_cu) cu_buffers.push_back(buffer);
         }
+        // Cache this generation (runs start empty and fill per target).
+        // An empty input_hash (older client) never matches, so the entry
+        // just holds the buffers until the next full request replaces it.
+        g_expand_cache = ExpandCache{input_hash, sm, cu_buffers, std::move(by_path), {}};
     }
     if (!target_buffer) return result; // target not among the sent files
 
@@ -1513,121 +1584,130 @@ static json handle_expand_macro(const json& params) {
     std::error_code path_ec;
     const std::filesystem::path target_canon =
         std::filesystem::weakly_canonical(sm->getFullPath(target_buffer->id), path_ec);
-
-    // Which buffers to drive the preprocessor over:
-    //   * single_unit, or the target isn't itself a compilation-unit member
-    //     (it's pulled in via `` `include `` — e.g. a UVM component included
-    //     by its package) → feed all CU buffers so the including context
-    //     defines the macros the target uses (`` `uvm_* `` live in a header
-    //     the package includes *before* the component);
-    //   * otherwise (a self-contained CU member) → just the target buffer,
-    //     which is cheaper than re-preprocessing the whole unit.
-    const bool need_cu_context = setup.single_unit || !target_is_cu;
-    std::vector<SourceBuffer> feed;
-    if (need_cu_context && !cu_buffers.empty()) {
-        feed = cu_buffers;
-    } else {
-        feed.push_back(*target_buffer);
-    }
-
-    BumpAllocator alloc;
-    Diagnostics diags;
-    Preprocessor pp(*sm, alloc, diags, setup.options);
-    // pushSource is a stack — push in reverse so processing is in file order
-    // (mirrors `SyntaxTree::create`).
-    for (auto it = feed.rbegin(); it != feed.rend(); ++it) pp.pushSource(*it);
-
-    // One in-progress run of consecutive macro-loc tokens.
-    struct Run {
-        bool active = false;
-        bool has_target = false;
-        // LSP bounds of the run's mapped file range (target buffer only).
-        uint32_t lo_line = 0, lo_char = 0, hi_line = 0, hi_char = 0;
-        // SourceLocations for the usage_range output.
-        SourceLocation min_start;
-        SourceLocation max_end;
-        std::string text;
-        std::string macro_name;
-    };
-    std::vector<Run> runs;
-    Run cur;
-
-    auto close_run = [&]() {
-        if (cur.active && cur.has_target) runs.push_back(std::move(cur));
-        cur = Run{};
-    };
+    const std::string canon_key = target_canon.string();
 
     auto lsp_le = [](uint32_t l1, uint32_t c1, uint32_t l2, uint32_t c2) {
         return l1 < l2 || (l1 == l2 && c1 <= c2);
     };
 
-    // True when `bid`'s file is the target file. Compared by canonical path so
-    // an include-instance buffer (distinct id, same file) still matches.
-    auto is_target_file = [&](slang::BufferID bid) {
-        std::error_code ec;
-        const std::filesystem::path p =
-            std::filesystem::weakly_canonical(sm->getFullPath(bid), ec);
-        return !ec && !p.empty() && p == target_canon;
-    };
-
-    while (true) {
-        Token tok = pp.next();
-        if (tok.kind == TokenKind::EndOfFile) break;
-        const SourceLocation loc = tok.location();
-        if (!loc.valid() || !sm->isMacroLoc(loc)) {
-            close_run();
-            continue;
-        }
-
-        if (!cur.active) cur.active = true;
-
-        // Walk to the outermost macro location (for the name) and the
-        // outermost *file* expansion range (for the bounds).
-        SourceLocation macro_loc = loc;
-        SourceRange exp = sm->getExpansionRange(loc);
-        while (sm->isMacroLoc(exp.start())) {
-            macro_loc = exp.start();
-            exp = sm->getExpansionRange(exp.start());
-        }
-
-        if (is_target_file(exp.start().buffer())) {
-            LspPos s = to_lsp_pos(*sm, exp.start());
-            LspPos e = to_lsp_pos(*sm, exp.end());
-            if (!cur.has_target) {
-                cur.has_target = true;
-                cur.lo_line = s.line; cur.lo_char = s.character;
-                cur.hi_line = e.line; cur.hi_char = e.character;
-                cur.min_start = exp.start();
-                cur.max_end = exp.end();
-            } else {
-                if (lsp_le(s.line, s.character, cur.lo_line, cur.lo_char)) {
-                    cur.lo_line = s.line; cur.lo_char = s.character;
-                    cur.min_start = exp.start();
-                }
-                if (lsp_le(cur.hi_line, cur.hi_char, e.line, e.character)) {
-                    cur.hi_line = e.line; cur.hi_char = e.character;
-                    cur.max_end = exp.end();
-                }
-            }
-            if (cur.macro_name.empty()) {
-                std::string_view name = sm->getMacroName(macro_loc);
-                if (!name.empty()) {
-                    if (name.front() == '`') name.remove_prefix(1);
-                    cur.macro_name = std::string(name);
-                }
-            }
-        }
-
-        // toString() reproduces each token's leading trivia, so the
-        // concatenation preserves the macro body's own line breaks and
-        // indentation — important for readable UVM expansions.
-        cur.text += tok.toString();
+    // Per-target run list: reuse the cached generation's if present,
+    // otherwise preprocess now and remember the result.
+    std::vector<MacroRun>* runs = nullptr;
+    auto cached_runs = g_expand_cache.runs_by_target.find(canon_key);
+    if (g_expand_cache.hash == input_hash && !input_hash.empty()
+        && cached_runs != g_expand_cache.runs_by_target.end()) {
+        runs = &cached_runs->second;
     }
-    close_run();
+
+    std::vector<MacroRun> computed;
+    if (runs == nullptr) {
+        // Which buffers to drive the preprocessor over:
+        //   * single_unit, or the target isn't itself a compilation-unit
+        //     member (it's pulled in via `` `include `` — e.g. a UVM
+        //     component included by its package) → feed all CU buffers so
+        //     the including context defines the macros the target uses;
+        //   * otherwise (a self-contained CU member) → just the target
+        //     buffer, which is cheaper than re-preprocessing the whole unit.
+        const bool need_cu_context = setup.single_unit || !target_is_cu;
+        std::vector<SourceBuffer> feed;
+        if (need_cu_context && !cu_buffers.empty()) {
+            feed = cu_buffers;
+        } else {
+            feed.push_back(*target_buffer);
+        }
+
+        BumpAllocator alloc;
+        Diagnostics diags;
+        Preprocessor pp(*sm, alloc, diags, setup.options);
+        // pushSource is a stack — push in reverse so processing is in file
+        // order (mirrors `SyntaxTree::create`).
+        for (auto it = feed.rbegin(); it != feed.rend(); ++it) pp.pushSource(*it);
+
+        MacroRun cur;
+        auto close_run = [&]() {
+            if (cur.active && cur.has_target) computed.push_back(std::move(cur));
+            cur = MacroRun{};
+        };
+
+        // True when `bid`'s file is the target file. Compared by canonical
+        // path so an include-instance buffer (distinct id, same file) still
+        // matches.
+        auto is_target_file = [&](slang::BufferID bid) {
+            std::error_code ec;
+            const std::filesystem::path p =
+                std::filesystem::weakly_canonical(sm->getFullPath(bid), ec);
+            return !ec && !p.empty() && p == target_canon;
+        };
+
+        while (true) {
+            Token tok = pp.next();
+            if (tok.kind == TokenKind::EndOfFile) break;
+            const SourceLocation loc = tok.location();
+            if (!loc.valid() || !sm->isMacroLoc(loc)) {
+                close_run();
+                continue;
+            }
+
+            if (!cur.active) cur.active = true;
+
+            // Walk to the outermost macro location (for the name) and the
+            // outermost *file* expansion range (for the bounds).
+            SourceLocation macro_loc = loc;
+            SourceRange exp = sm->getExpansionRange(loc);
+            while (sm->isMacroLoc(exp.start())) {
+                macro_loc = exp.start();
+                exp = sm->getExpansionRange(exp.start());
+            }
+
+            if (is_target_file(exp.start().buffer())) {
+                LspPos s = to_lsp_pos(*sm, exp.start());
+                LspPos e = to_lsp_pos(*sm, exp.end());
+                if (!cur.has_target) {
+                    cur.has_target = true;
+                    cur.lo_line = s.line; cur.lo_char = s.character;
+                    cur.hi_line = e.line; cur.hi_char = e.character;
+                    cur.min_start = exp.start();
+                    cur.max_end = exp.end();
+                } else {
+                    if (lsp_le(s.line, s.character, cur.lo_line, cur.lo_char)) {
+                        cur.lo_line = s.line; cur.lo_char = s.character;
+                        cur.min_start = exp.start();
+                    }
+                    if (lsp_le(cur.hi_line, cur.hi_char, e.line, e.character)) {
+                        cur.hi_line = e.line; cur.hi_char = e.character;
+                        cur.max_end = exp.end();
+                    }
+                }
+                if (cur.macro_name.empty()) {
+                    std::string_view name = sm->getMacroName(macro_loc);
+                    if (!name.empty()) {
+                        if (name.front() == '`') name.remove_prefix(1);
+                        cur.macro_name = std::string(name);
+                    }
+                }
+            }
+
+            // toString() reproduces each token's leading trivia, so the
+            // concatenation preserves the macro body's own line breaks and
+            // indentation — important for readable UVM expansions.
+            cur.text += tok.toString();
+        }
+        close_run();
+
+        // Remember this target's runs for the generation, so repeat
+        // expansions in the same file skip the preprocess entirely.
+        if (!input_hash.empty() && g_expand_cache.hash == input_hash) {
+            auto [slot, _inserted] =
+                g_expand_cache.runs_by_target.emplace(canon_key, std::move(computed));
+            runs = &slot->second;
+        } else {
+            runs = &computed;
+        }
+    }
 
     // Pick the run whose bounds contain the requested cursor position.
-    const Run* best = nullptr;
-    for (const auto& r : runs) {
+    const MacroRun* best = nullptr;
+    for (const auto& r : *runs) {
         const bool after_start = lsp_le(r.lo_line, r.lo_char, want_line, want_char);
         const bool before_end  = lsp_le(want_line, want_char, r.hi_line, r.hi_char);
         if (after_start && before_end) { best = &r; break; }
@@ -1655,6 +1735,7 @@ static json handle_expand_macro(const json& params) {
     result["diagnostics"]   = json::array();
     return result;
 }
+
 
 // --- main loop -----------------------------------------------------------
 
@@ -1685,7 +1766,17 @@ int main() {
             if (method == "compile") {
                 resp["result"] = handle_compile(req.value("params", json::object()));
             } else if (method == "expandMacro") {
-                resp["result"] = handle_expand_macro(req.value("params", json::object()));
+                json r = handle_expand_macro(req.value("params", json::object()));
+                if (r.is_object() && r.contains("__expand_cache_stale")) {
+                    // Slim request against a stale cache: the client retries
+                    // once with full file payloads on this exact code.
+                    resp["error"] = {
+                        {"code", -32010},
+                        {"message", "expand cache stale; resend with files"},
+                    };
+                } else {
+                    resp["result"] = std::move(r);
+                }
             } else if (method == "shutdown") {
                 // Acknowledge, flush, exit. Keeps the client from seeing
                 // a "Closed" before its shutdown response lands.

@@ -53,7 +53,22 @@ pub(crate) fn hover_for_symbol(
         ));
     }
 
-    // 2. Non-callables: the declaration line.
+    // 2. Multi-line typedefs (`typedef enum {...} state_e;`): the *name*
+    //    token sits on the closing line, so a single-line read would show
+    //    a broken `"} state_e;"` snippet. Show the whole declaration block
+    //    from `full_range` instead (elided when very long).
+    if sym.kind == MSymbolKind::Typedef
+        && sym.full_range.end.line > sym.full_range.start.line
+    {
+        if let Some(block) = read_range_text(sym.full_range, sym_url, rope_from_doc.as_ref()) {
+            let block = elide_after_lines(block.trim_end(), 30);
+            return Some(hover_from_markdown(format!(
+                "```systemverilog\n{block}\n```"
+            )));
+        }
+    }
+
+    // 3. Non-callables: the declaration line.
     let line_no = sym.name_range.start.line;
     let line = rope_from_doc
         .as_ref()
@@ -66,7 +81,8 @@ pub(crate) fn hover_for_symbol(
                 .and_then(|t| read_line_trimmed(&Rope::from_str(&t), line_no))
         })?;
 
-    // 2a. For typedefs, append the expanded base type after the declaration.
+    // 3a. For single-line typedefs, append the expanded base type after the
+    //     declaration (multi-line ones already show their full body above).
     if sym.kind == MSymbolKind::Typedef {
         if let Some(base) = typedef_base_from_line(&line, &sym.name) {
             let md = format!(
@@ -78,6 +94,41 @@ pub(crate) fn hover_for_symbol(
     }
 
     Some(hover_markdown(&line))
+}
+
+/// Read the source slice covering `range` from the open-doc rope first,
+/// then from disk. The raw text, untrimmed — callers decide presentation.
+fn read_range_text(
+    range: mimir_core::Range,
+    sym_url: &Url,
+    doc_rope: Option<&Rope>,
+) -> Option<String> {
+    let slice_from_rope = |rope: &Rope| -> Option<String> {
+        let start = range.start.to_byte_offset(rope).ok()?;
+        let end = range.end.to_byte_offset(rope).ok()?;
+        if end <= start || end > rope.len_bytes() {
+            return None;
+        }
+        Some(rope.byte_slice(start..end).to_string())
+    };
+
+    doc_rope.and_then(slice_from_rope).or_else(|| {
+        let path = sym_url.to_file_path().ok()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let rope = Rope::from_str(&text);
+        slice_from_rope(&rope)
+    })
+}
+
+/// Keep the first `max` lines of `text`, replacing the rest with an
+/// elision comment. Hover popups for hundred-member enums stay readable.
+fn elide_after_lines(text: &str, max: usize) -> String {
+    let total = text.lines().count();
+    if total <= max {
+        return text.to_string();
+    }
+    let kept: Vec<&str> = text.lines().take(max).collect();
+    format!("{}\n// … ({} more lines)", kept.join("\n"), total - max)
 }
 
 /// Extract the base type from a typedef declaration line.
@@ -106,21 +157,7 @@ pub(crate) fn typedef_base_from_line(line: &str, alias: &str) -> Option<String> 
 /// `None` if neither source is readable; the caller drops to showing
 /// just the signature in that case.
 pub(crate) fn read_macro_body(sym: &Symbol, sym_url: &Url, doc_rope: Option<&Rope>) -> Option<String> {
-    let slice_from_rope = |rope: &Rope| -> Option<String> {
-        let start = sym.full_range.start.to_byte_offset(rope).ok()?;
-        let end = sym.full_range.end.to_byte_offset(rope).ok()?;
-        if end <= start || end > rope.len_bytes() {
-            return None;
-        }
-        Some(rope.byte_slice(start..end).to_string())
-    };
-
-    let raw = doc_rope.and_then(slice_from_rope).or_else(|| {
-        let path = sym_url.to_file_path().ok()?;
-        let text = std::fs::read_to_string(&path).ok()?;
-        let rope = Rope::from_str(&text);
-        slice_from_rope(&rope)
-    })?;
+    let raw = read_range_text(sym.full_range, sym_url, doc_rope)?;
 
     // Strip the leading `\`define MACRO_NAME(...)`-or-`\`define MACRO_NAME`
     // header. Everything after the first `)` (for parametrised macros) or
@@ -271,23 +308,29 @@ pub(crate) struct ExpandMacroResponse {
     pub expansion: String,
     /// Number of lines in `expansion`.
     pub line_count: u32,
+    /// Human-readable reason the expansion could not be produced (e.g.
+    /// "undefined macro"). When set, `expansion` is empty and the extension
+    /// shows this message instead of opening an expansion tab. Omitted from
+    /// the wire on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
-/// Cheap textual gate: is the cursor sitting on a `` `macro `` usage? Used to
-/// avoid running the preprocessor on ordinary hovers — we only attempt a
-/// macro expansion when the identifier under the cursor is immediately
-/// preceded (after skipping the identifier's own characters leftward) by a
-/// backtick on the same line.
-pub(crate) fn cursor_on_macro_usage(rope: &Rope, pos: MPosition) -> bool {
+/// Extract the macro name the cursor is sitting on (`` `uvm_info `` →
+/// `"uvm_info"`), or `None` when the identifier under the cursor isn't
+/// backtick-prefixed. Cheap textual gate doubling as a name extractor: the
+/// hover path uses it both to decide *whether* to attempt an expansion and
+/// to answer "is this macro even defined?" before paying for a sidecar
+/// round-trip.
+pub(crate) fn macro_name_at_cursor(rope: &Rope, pos: MPosition) -> Option<String> {
     if (pos.line as usize) >= rope.len_lines() {
-        return false;
+        return None;
     }
     let line = rope.line(pos.line as usize);
 
-    // Collect the line up to a generous bound and locate the cursor column
-    // in UTF-16 units (matching LSP coordinates).
+    // Collect the line and locate the cursor column in UTF-16 units
+    // (matching LSP coordinates).
     let chars: Vec<char> = line.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-    // Map the UTF-16 character offset to a char index.
     let mut idx = 0usize;
     let mut utf16 = 0u32;
     for (i, c) in chars.iter().enumerate() {
@@ -299,7 +342,7 @@ pub(crate) fn cursor_on_macro_usage(rope: &Rope, pos: MPosition) -> bool {
         idx = i + 1;
     }
     if idx > chars.len() {
-        return false;
+        return None;
     }
 
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
@@ -309,7 +352,29 @@ pub(crate) fn cursor_on_macro_usage(rope: &Rope, pos: MPosition) -> bool {
         start -= 1;
     }
     // A macro usage is `<ident> preceded by a backtick.
-    start > 0 && chars[start - 1] == '`'
+    if start == 0 || chars[start - 1] != '`' {
+        return None;
+    }
+    // Walk right to capture the full name (the cursor may sit mid-name).
+    let mut end = start;
+    while end < chars.len() && is_ident(chars[end]) {
+        end += 1;
+    }
+    if end == start {
+        return None; // a bare backtick with no identifier after it
+    }
+    Some(chars[start..end].iter().collect())
+}
+
+/// Hover footer for a backtick identifier with no `` `define `` anywhere in
+/// the indexed project (and no `+define+` in the config). Shown *instead of*
+/// a sidecar round-trip — an undefined macro can't expand, so the answer is
+/// immediate rather than a multi-second "Loading…" that ends in nothing.
+pub(crate) fn undefined_macro_footer(name: &str) -> String {
+    format!(
+        "\n\n---\n\n▶ `` `{name} `` — **undefined macro**: no `` `define `` found in the \
+         project or its include chain, and no `+define+{name}` in the configuration"
+    )
 }
 
 /// Build the hover footer markdown for an expansion result. Shows the line
@@ -423,6 +488,45 @@ mod tests {
         assert!(md.contains("(((k)+1)*2)"), "stale footer still previews the expansion");
     }
 
+    /// The undefined-macro footer names the macro and says "undefined".
+    #[test]
+    fn undefined_footer_names_the_macro() {
+        let md = undefined_macro_footer("uvm_tpyo");
+        assert!(md.contains("`uvm_tpyo `"), "footer should name the macro: {md}");
+        assert!(md.contains("undefined macro"), "footer should say undefined: {md}");
+        assert!(md.contains("+define+uvm_tpyo"), "footer should mention the config knob: {md}");
+    }
+
+    /// `macro_name_at_cursor` returns the full name with the cursor anywhere
+    /// on it, and `None` off a backtick word.
+    #[test]
+    fn macro_name_at_cursor_extracts_name() {
+        let rope = ropey::Rope::from_str("  `uvm_info(\"T\", \"hi\", UVM_LOW)\n");
+        // Cursor mid-name.
+        assert_eq!(
+            macro_name_at_cursor(&rope, MPosition::new(0, 6)).as_deref(),
+            Some("uvm_info"),
+        );
+        // Cursor at the very start of the name (right after the backtick).
+        assert_eq!(
+            macro_name_at_cursor(&rope, MPosition::new(0, 3)).as_deref(),
+            Some("uvm_info"),
+        );
+        // Cursor on a plain identifier — no backtick.
+        assert_eq!(macro_name_at_cursor(&rope, MPosition::new(0, 25)), None);
+        // Out-of-bounds line.
+        assert_eq!(macro_name_at_cursor(&rope, MPosition::new(9, 0)), None);
+    }
+
+    /// The extractor is also the boolean gate: backtick word → Some,
+    /// plain word → None.
+    #[test]
+    fn macro_name_at_cursor_is_the_usage_gate() {
+        let rope = ropey::Rope::from_str("`MY_MACRO\nplain_word\n");
+        assert!(macro_name_at_cursor(&rope, MPosition::new(0, 4)).is_some());
+        assert!(macro_name_at_cursor(&rope, MPosition::new(1, 4)).is_none());
+    }
+
 
     /// `read_line_trimmed` returns the line text minus surrounding
     /// whitespace and the trailing newline.
@@ -469,6 +573,60 @@ mod tests {
         }
     }
 
+
+    /// Multi-line typedef: the name token lives on the *closing* line
+    /// (`} state_e;`), so a single-line read would show a broken snippet.
+    /// The hover must show the whole declaration block instead.
+    #[test]
+    fn hover_for_multiline_typedef_shows_full_block() {
+        let url = url("file:///a.sv");
+        let text = "typedef enum logic [1:0] {\n  IDLE,\n  BUSY\n} state_e;\n";
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(text));
+
+        // Ranges as the indexer reports them: name on line 3, full block 0..=3.
+        let s = Symbol {
+            name: "state_e".to_string(),
+            kind: MSymbolKind::Typedef,
+            name_range: MRange::new(MPosition::new(3, 2), MPosition::new(3, 9)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(3, 10)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let md = hover_markdown_value(&h);
+        assert!(md.contains("typedef enum logic [1:0] {"), "block start missing: {md}");
+        assert!(md.contains("IDLE"), "enum member missing: {md}");
+        assert!(md.contains("} state_e;"), "block end missing: {md}");
+    }
+
+    /// Very long multi-line typedefs are elided, not dumped wholesale.
+    #[test]
+    fn hover_for_long_typedef_is_elided() {
+        let url = url("file:///a.sv");
+        let members: Vec<String> = (0..60).map(|i| format!("  M{i},")).collect();
+        let text = format!("typedef enum {{\n{}\n  LAST\n}} big_e;\n", members.join("\n"));
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(&text));
+
+        let last_line = text.lines().count() as u32 - 1;
+        let s = Symbol {
+            name: "big_e".to_string(),
+            kind: MSymbolKind::Typedef,
+            name_range: MRange::new(MPosition::new(last_line, 2), MPosition::new(last_line, 7)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(last_line, 8)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let md = hover_markdown_value(&h);
+        assert!(md.contains("more lines)"), "long block should be elided: {md}");
+        assert!(!md.contains("LAST"), "elided tail should be dropped: {md}");
+    }
 
     /// Bare non-callable symbol (class) → fenced declaration line.
     #[test]

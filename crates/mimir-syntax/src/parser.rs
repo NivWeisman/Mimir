@@ -151,7 +151,12 @@ fn blank_backtick_lines(source: &str) -> Cow<'_, str> {
 /// Compiler directives that don't represent SV syntax the parser knows about.
 /// Listed against IEEE 1800-2023 §22; `define` is intentionally NOT here —
 /// we keep `\`define` lines intact so the symbol indexer can read macro names.
-fn is_compiler_directive(kw: &str) -> bool {
+///
+/// Public so feature code can distinguish "backtick word that is a standard
+/// directive" from "backtick word that should be a user macro" (e.g. the
+/// hover footer's undefined-macro verdict). Use
+/// [`is_directive_or_define`] when `define` itself should also count.
+pub fn is_compiler_directive(kw: &str) -> bool {
     matches!(
         kw,
         "ifdef"
@@ -176,6 +181,14 @@ fn is_compiler_directive(kw: &str) -> bool {
             | "__FILE__"
             | "__LINE__"
     )
+}
+
+/// Like [`is_compiler_directive`], but also matches `define` (and `undef`,
+/// already in the base list) — i.e. every standard backtick word. A backtick
+/// identifier that fails this check is a *user macro usage* and should have
+/// a `` `define `` somewhere in the project.
+pub fn is_directive_or_define(kw: &str) -> bool {
+    kw == "define" || is_compiler_directive(kw)
 }
 
 
