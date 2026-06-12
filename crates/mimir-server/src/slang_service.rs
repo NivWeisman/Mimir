@@ -584,15 +584,26 @@ pub(crate) fn assemble_elaborate_params(
         files_in_request.push(url);
     }
 
-    for (path, (url, text)) in open_text {
-        if seen.insert(path.clone()) {
-            files.push(SourceFile {
-                path: path.display().to_string(),
-                text: text.clone(),
-                is_compilation_unit: false,
-            });
-            files_in_request.push(url.clone());
-        }
+    // Open docs outside the filelist, in *sorted path order*. `open_text` is
+    // a HashMap whose iteration order changes between calls; appending in
+    // that order made the assembled file list — and therefore the content
+    // hashes derived from it (`hash_inputs` for the elaborate skip,
+    // `expand_input_hash` for the sidecar's expandMacro cache) — differ
+    // between identical requests, so every cache layer missed whenever two
+    // or more non-filelist files were open.
+    let mut extra_open: Vec<&PathBuf> = open_text
+        .keys()
+        .filter(|path| !seen.contains(*path))
+        .collect();
+    extra_open.sort();
+    for path in extra_open {
+        let (url, text) = &open_text[path];
+        files.push(SourceFile {
+            path: path.display().to_string(),
+            text: text.clone(),
+            is_compilation_unit: false,
+        });
+        files_in_request.push(url.clone());
     }
 
     let include_dirs = project
@@ -728,6 +739,39 @@ mod tests {
         assert!(!params.files[1].is_compilation_unit);
         assert_eq!(files_in_request.len(), 2);
         assert!(files_in_request.contains(&scratch_url));
+    }
+
+    /// Open docs outside the filelist must be appended in a *stable* order
+    /// across calls. `open_text` is a HashMap; iteration order varies per
+    /// instance, and an order-dependent file list breaks every downstream
+    /// content hash (`hash_inputs`, the sidecar's expandMacro cache) — the
+    /// "macro expansion re-preprocesses the whole project on every hover"
+    /// bug.
+    #[test]
+    fn assemble_appends_extra_open_docs_in_sorted_order() {
+        let project = project_with_files(vec![]);
+
+        // Several extra open files, inserted in shuffled order. Re-build the
+        // HashMap fresh on every iteration so a different iteration order
+        // would actually be exercised.
+        let paths = ["/w/zz.sv", "/w/aa.sv", "/w/mm.sv", "/w/bb.sv"];
+        let mut orders = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let mut open_text = HashMap::new();
+            for p in paths {
+                let pb = PathBuf::from(p);
+                let url = Url::from_file_path(&pb).unwrap();
+                open_text.insert(pb, (url, format!("// {p}")));
+            }
+            let (params, _) =
+                assemble_elaborate_params(&project, &open_text, |_| Some(Arc::from("")));
+            let got: Vec<String> = params.files.iter().map(|f| f.path.clone()).collect();
+            orders.insert(got);
+        }
+
+        assert_eq!(orders.len(), 1, "file order must not vary between calls");
+        let only = orders.into_iter().next().unwrap();
+        assert_eq!(only, vec!["/w/aa.sv", "/w/bb.sv", "/w/mm.sv", "/w/zz.sv"]);
     }
 
     #[test]

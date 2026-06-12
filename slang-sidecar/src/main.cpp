@@ -1631,12 +1631,20 @@ static json handle_expand_macro(const json& params) {
 
         // True when `bid`'s file is the target file. Compared by canonical
         // path so an include-instance buffer (distinct id, same file) still
-        // matches.
+        // matches. Memoised per BufferID: this runs for every macro token in
+        // the compilation unit (hundreds of thousands on a UVM project), and
+        // weakly_canonical stats the filesystem per path component — unmemoised
+        // it was ~90% of expandMacro's wall time (minutes-long expands).
+        std::unordered_map<uint32_t, bool> target_bid_memo;
         auto is_target_file = [&](slang::BufferID bid) {
-            std::error_code ec;
-            const std::filesystem::path p =
-                std::filesystem::weakly_canonical(sm->getFullPath(bid), ec);
-            return !ec && !p.empty() && p == target_canon;
+            auto [it, inserted] = target_bid_memo.try_emplace(bid.getId(), false);
+            if (inserted) {
+                std::error_code ec;
+                const std::filesystem::path p =
+                    std::filesystem::weakly_canonical(sm->getFullPath(bid), ec);
+                it->second = !ec && !p.empty() && p == target_canon;
+            }
+            return it->second;
         };
 
         while (true) {

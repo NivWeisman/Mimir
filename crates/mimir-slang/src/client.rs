@@ -56,10 +56,17 @@ use tracing::{debug, error, info, instrument, trace, warn};
 /// forever), not to police slow-but-progressing compiles.
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Deadline for one `expandMacro` round-trip. The expand sidecar only runs
-/// the preprocessor (normally sub-second), and the callers are interactive
-/// (hover footer, explicit expand command), so a short ceiling is right.
-const EXPAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for one `expandMacro` round-trip. A *cold* expand (first request
+/// after an edit) preprocesses the whole compilation unit — a second or two
+/// on a UVM-sized project, potentially more on a huge one — while every
+/// repeat against the warm cache is a position lookup (sub-millisecond).
+/// The ceiling exists to bound a *hung* sidecar, not a slow-but-progressing
+/// preprocess: timing out a legitimate cold expand is worse than waiting,
+/// because the timeout also clears `last_hash` and forces the next request
+/// to resend full file payloads. Interactive callers stay responsive
+/// regardless — the hover footer uses a try-lock plus a stale-result cache,
+/// and the explicit command was invoked by a user who asked for the answer.
+const EXPAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Deadline for the polite `shutdown` request and the subsequent child
 /// wait. Past it we stop being polite and kill the process instead of

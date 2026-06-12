@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 import tempfile
 import time
 import unittest
@@ -252,6 +253,119 @@ _BUSY_USAGE_CHAR = 21  # on the `A identifier
 _BUSY_SIBLINGS = 8
 _BUSY_MODULES_PER_SIBLING = 6000
 _MAX_LATENCY_S = 8.0
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+RISCV_DV = REPO_ROOT / "examples" / "riscv-dv"
+UVM_SRC = REPO_ROOT / "examples" / "uvm-1.2" / "src"
+VECTOR_CFG = RISCV_DV / "src" / "riscv_vector_cfg.sv"
+# `uvm_field_queue_int(legal_eew, UVM_DEFAULT)` — line 117 (1-based) in
+# riscv_vector_cfg.sv, cursor inside the macro name.
+_QUEUE_INT_LINE = 116
+_QUEUE_INT_CHAR = 8
+# A cached repeat must be a position lookup (milliseconds of sidecar time
+# plus LSP overhead), nowhere near the multi-second cold preprocess. The
+# bound is generous for slow CI but far below one re-preprocess.
+_REPEAT_BUDGET_S = 3.0
+
+
+class UvmFieldQueueIntTimingTest(unittest.TestCase):
+    """Dedicated timing + caching regression test for the user-reported
+    "`uvm_field_queue_int` takes minutes to expand" bug.
+
+    Reproduces the real-world shape on real sources: riscv-dv's package
+    files as the compilation unit (with UVM-1.2 on the include path), the
+    macro usage inside riscv_vector_cfg.sv — a file reached only via
+    `` `include ``, so the sidecar must preprocess the whole unit once.
+    *Three* non-filelist files are open, which is what used to randomise
+    the assembled file order (HashMap iteration), flip the input hash on
+    every request, and force a full re-preprocess per expand.
+
+    Asserts the cold expand completes and that repeat expansions with no
+    change are answered from the cache.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        slang_path = _require_slang()
+        if not VECTOR_CFG.is_file():
+            raise unittest.SkipTest(f"riscv-dv not cloned at {RISCV_DV}")
+        if not (UVM_SRC / "uvm_macros.svh").is_file():
+            raise unittest.SkipTest(f"uvm-1.2 not present at {UVM_SRC}")
+
+        cls._tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(cls._tmp.name)
+        cu_files = [
+            RISCV_DV / "src" / "riscv_signature_pkg.sv",
+            RISCV_DV / "src" / "riscv_instr_pkg.sv",
+            RISCV_DV / "test" / "riscv_instr_test_pkg.sv",
+            RISCV_DV / "test" / "riscv_instr_gen_tb_top.sv",
+        ]
+        (root / "files.f").write_text("".join(f"{p}\n" for p in cu_files))
+        (root / ".mimir.toml").write_text(
+            "[slang]\n"
+            'filelist = "files.f"\n'
+            f'include_dirs = ["{RISCV_DV}/src", "{RISCV_DV}/test", '
+            f'"{RISCV_DV}/target/rv32imc", "{UVM_SRC}"]\n'
+        )
+        # Two scratch files; together with the target they are three open
+        # docs outside the filelist (the order-instability trigger).
+        scratches = []
+        for name in ("scratch_a.sv", "scratch_b.sv"):
+            p = root / name
+            p.write_text(f"module {name.removesuffix('.sv')}; endmodule\n")
+            scratches.append(p)
+
+        cls.lsp = MimirLspClient(env={"MIMIR_SLANG_PATH": slang_path})
+        cls.lsp.initialize(workspace_root=root)
+        for p in scratches:
+            cls.lsp.did_open(file_uri(p), p.read_text())
+        cls.uri = file_uri(VECTOR_CFG)
+        cls.lsp.did_open(cls.uri, VECTOR_CFG.read_text())
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.lsp.close()
+        cls._tmp.cleanup()
+
+    def _expand_timed(self) -> tuple[dict | None, float]:
+        start = time.monotonic()
+        result = self.lsp.request(
+            "mimir/expandMacro",
+            {
+                "textDocument": {"uri": self.uri},
+                "position": {"line": _QUEUE_INT_LINE, "character": _QUEUE_INT_CHAR},
+            },
+            timeout=120.0,
+        )
+        return result, time.monotonic() - start
+
+    def test_cold_expand_then_cached_repeats(self) -> None:
+        result, cold = self._expand_timed()
+        self.assertIsNotNone(result, "no expansion for `uvm_field_queue_int")
+        self.assertIn(
+            "legal_eew", result["expansion"],
+            "expansion does not contain the queue field name",
+        )
+        self.assertGreater(result["lineCount"], 10)
+
+        repeats = []
+        for _ in range(5):
+            r, dt = self._expand_timed()
+            self.assertIsNotNone(r, "repeat expansion went missing")
+            repeats.append(dt)
+
+        worst = max(repeats)
+        print(
+            f"\n[uvm_field_queue_int] cold={cold:.2f}s "
+            f"repeats={['%.3f' % t for t in repeats]} worst={worst:.3f}s",
+            file=sys.stderr,
+        )
+        self.assertLess(
+            worst, _REPEAT_BUDGET_S,
+            f"repeat expand took {worst:.2f}s (cold was {cold:.2f}s) — the "
+            "expand cache is not being hit for consecutive unchanged requests",
+        )
 
 
 class MacroExpandDuringCompileTest(unittest.TestCase):
