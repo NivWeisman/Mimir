@@ -1127,6 +1127,22 @@ impl Backend {
         };
 
         match self.adapter.expand_macro(&uri, version, target, &eparams).await {
+            // Defined-but-empty: a conditional `ifdef branch compiled the body
+            // away (e.g. +define+UVM_EMPTY_MACROS). Surface the reason instead
+            // of opening an empty expansion tab.
+            Some(r) if r.found && r.expanded_text.trim().is_empty() => {
+                Ok(Some(ExpandMacroResponse {
+                    error: Some(format!(
+                        "`{name} is defined but expands to nothing in the active \
+                         configuration (a compiled-out `ifdef branch, e.g. \
+                         +define+UVM_EMPTY_MACROS)",
+                        name = r.macro_name,
+                    )),
+                    name: r.macro_name,
+                    expansion: String::new(),
+                    line_count: 0,
+                }))
+            }
             Some(r) if r.found => Ok(Some(ExpandMacroResponse {
                 name: r.macro_name,
                 expansion: r.expanded_text,

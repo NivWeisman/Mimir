@@ -384,6 +384,23 @@ pub(crate) fn undefined_macro_footer(name: &str) -> String {
 /// busy/unresponsive (see [`crate::slang_adapter::SlangAdapter::stale_expansion`]); the footer says
 /// so, since the macro may have changed since it was last expanded.
 pub(crate) fn macro_footer_markdown(r: &mimir_slang::ExpandMacroResult, stale: bool) -> String {
+    // A defined macro that expanded to nothing — a conditional `` `ifdef ``
+    // branch compiled the body away (e.g. `+define+UVM_EMPTY_MACROS` blanks
+    // every `` `uvm_field_* ``). Report it honestly instead of "expands to
+    // **0 lines**" followed by an empty code fence.
+    if r.expanded_text.trim().is_empty() {
+        let note = if stale {
+            " _(cached — may be stale while slang re-elaborates)_"
+        } else {
+            ""
+        };
+        return format!(
+            "\n\n---\n\n▶ `` `{name} `` is **defined but expands to nothing**{note} — its \
+             body is empty in the active configuration (a compiled-out `` `ifdef `` branch, \
+             e.g. `+define+UVM_EMPTY_MACROS`)",
+            name = r.macro_name,
+        );
+    }
     const PREVIEW_LINES: usize = 6;
     let total = r.line_count;
     let preview: Vec<&str> = r.expanded_text.lines().take(PREVIEW_LINES).collect();
@@ -478,6 +495,33 @@ mod tests {
         assert!(!md.contains("may be stale"), "fresh footer must not be marked stale");
     }
 
+
+    /// A defined-but-empty expansion (a compiled-out `` `ifdef `` branch, e.g.
+    /// `UVM_EMPTY_MACROS`) is reported as such — never as "expands to 0 lines"
+    /// with an empty code fence.
+    #[test]
+    fn macro_footer_empty_expansion_says_nothing() {
+        let md = macro_footer_markdown(&expansion("uvm_field_int", ""), false);
+        assert!(md.contains("`uvm_field_int `"), "footer should name the macro: {md}");
+        assert!(
+            md.contains("defined but expands to nothing"),
+            "empty expansion must be reported honestly: {md}"
+        );
+        assert!(!md.contains("0 line"), "must not say '0 lines': {md}");
+        assert!(!md.contains("```"), "must not emit an empty code fence: {md}");
+    }
+
+    /// The empty-expansion footer is still marked stale when served from the
+    /// cache during a busy elaborate.
+    #[test]
+    fn macro_footer_empty_expansion_can_be_stale() {
+        let md = macro_footer_markdown(&expansion("uvm_field_int", "   \n  "), true);
+        assert!(
+            md.contains("defined but expands to nothing"),
+            "whitespace-only expansion counts as empty: {md}"
+        );
+        assert!(md.contains("may be stale"), "stale note must survive: {md}");
+    }
 
     /// A stale footer (served from cache while slang is busy) is explicitly
     /// marked so the user knows it may be out of date.

@@ -114,7 +114,21 @@ static uint32_t utf8_prefix_to_utf16_units(std::string_view prefix) {
 // Multi-byte sequence boundaries: LSP positions live *between* code
 // points, not bytes. A client never points at the middle of a UTF-8
 // sequence; if it did, we round forward to the start of the next
-// codepoint, which is the same boundary `utf8_prefix_to_utf16_units`
+// codepoint, which is the same boundary `utf8_prefix_to_utf16_units` walks.
+static size_t utf16_col_to_byte(std::string_view line, uint32_t utf16_char) {
+    uint32_t units = 0;
+    size_t i = 0;
+    while (i < line.size() && units < utf16_char) {
+        unsigned char b = static_cast<unsigned char>(line[i]);
+        if (b < 0x80)                { units += 1; i += 1; }
+        else if ((b & 0xE0) == 0xC0) { units += 1; i += 2; }
+        else if ((b & 0xF0) == 0xE0) { units += 1; i += 3; }
+        else if ((b & 0xF8) == 0xF0) { units += 2; i += 4; }
+        else                         { units += 1; i += 1; }
+    }
+    return i;
+}
+
 // --- LSP position from a slang SourceLocation ----------------------------
 
 struct LspPos {
@@ -1488,6 +1502,18 @@ struct ExpandCachedFile {
     bool is_cu = false;
 };
 
+// One target file's expansion result for a generation: the macro-expansion
+// runs found in it, plus every macro name *defined* during the preprocess
+// that produced them. The defined-name set lets a usage that expanded to
+// nothing still be recognised as a real, defined macro — e.g. a `` `uvm_field_*
+// `` under `+define+UVM_EMPTY_MACROS`, where UVM defines the macro as an empty
+// body via an `` `ifdef `` branch. Without it, an empty expansion is
+// indistinguishable from "cursor isn't on a macro".
+struct TargetExpansion {
+    std::vector<MacroRun> runs;
+    std::unordered_set<std::string> defined_macros;
+};
+
 // The expandMacro input cache: one generation, replaced wholesale whenever
 // the client's input hash changes (i.e. on any edit anywhere). `sm` must
 // stay alive as long as `runs_by_target` — the runs hold SourceLocations
@@ -1497,9 +1523,68 @@ struct ExpandCache {
     std::shared_ptr<slang::SourceManager> sm;
     std::vector<slang::SourceBuffer> cu_buffers;
     std::map<std::string, ExpandCachedFile> by_path;
-    std::map<std::string, std::vector<MacroRun>> runs_by_target;
+    std::map<std::string, TargetExpansion> runs_by_target;
 };
 static ExpandCache g_expand_cache;
+
+// SystemVerilog simple-identifier character. Macro names are always simple
+// identifiers, so this is enough to scan a `` `name `` usage out of a line.
+static bool is_sv_ident_char(unsigned char c) {
+    return std::isalnum(c) != 0 || c == '_' || c == '$';
+}
+
+// A `` `IDENTIFIER `` macro usage located textually at the cursor. `name` is
+// empty when the cursor isn't on one. `start_char`/`end_char` are 0-based
+// UTF-16 columns spanning the backtick through the last name character
+// (one-past), so the caller can report a usage range for an expansion that
+// emitted no tokens of its own.
+struct MacroUsageAtCursor {
+    std::string name;
+    uint32_t start_char = 0;
+    uint32_t end_char = 0;
+};
+
+// If the cursor at (`want_line`, `want_char`) in `text` sits on a
+// `` `IDENTIFIER `` macro usage, return it; otherwise a value with an empty
+// `name`. `want_char` is a 0-based UTF-16 column (LSP coordinates),
+// `want_line` a 0-based line. Used only to give an honest answer when a macro
+// produced no expansion tokens: the run collector then has nothing to match,
+// but the cursor may still be on a real, defined macro that expanded to
+// nothing (a compiled-out `` `ifdef `` branch).
+static MacroUsageAtCursor macro_usage_at_cursor(std::string_view text,
+                                                uint32_t want_line, uint32_t want_char) {
+    // Seek to the start of the requested line.
+    size_t pos = 0;
+    for (uint32_t l = 0; l < want_line; ++l) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string_view::npos) return {};
+        pos = nl + 1;
+    }
+    size_t line_end = text.find('\n', pos);
+    std::string_view line = text.substr(
+        pos, line_end == std::string_view::npos ? std::string_view::npos : line_end - pos);
+
+    size_t cur = utf16_col_to_byte(line, want_char);
+    // The cursor commonly sits just past the name (on the '(' of a call) or
+    // on the backtick; snap left onto the identifier body in those cases.
+    if ((cur >= line.size() || !is_sv_ident_char(static_cast<unsigned char>(line[cur])))
+        && cur > 0 && is_sv_ident_char(static_cast<unsigned char>(line[cur - 1]))) {
+        cur -= 1;
+    }
+    if (cur >= line.size() || !is_sv_ident_char(static_cast<unsigned char>(line[cur]))) {
+        return {};
+    }
+    size_t start = cur, end = cur;
+    while (start > 0 && is_sv_ident_char(static_cast<unsigned char>(line[start - 1]))) --start;
+    while (end + 1 < line.size() && is_sv_ident_char(static_cast<unsigned char>(line[end + 1]))) ++end;
+    if (start == 0 || line[start - 1] != '`') return {};
+
+    MacroUsageAtCursor out;
+    out.name = std::string(line.substr(start, end - start + 1));
+    out.start_char = utf8_prefix_to_utf16_units(line.substr(0, start - 1)); // the backtick
+    out.end_char = utf8_prefix_to_utf16_units(line.substr(0, end + 1));      // one past name
+    return out;
+}
 
 static json handle_expand_macro(const json& params) {
     using namespace slang;
@@ -1590,16 +1675,20 @@ static json handle_expand_macro(const json& params) {
         return l1 < l2 || (l1 == l2 && c1 <= c2);
     };
 
-    // Per-target run list: reuse the cached generation's if present,
-    // otherwise preprocess now and remember the result.
-    std::vector<MacroRun>* runs = nullptr;
+    // Per-target expansion: reuse the cached generation's if present,
+    // otherwise preprocess now and remember the result. Both the runs and
+    // the defined-macro set come from the same preprocess, so they're cached
+    // and reused together.
+    const std::vector<MacroRun>* runs = nullptr;
+    const std::unordered_set<std::string>* defined = nullptr;
     auto cached_runs = g_expand_cache.runs_by_target.find(canon_key);
     if (g_expand_cache.hash == input_hash && !input_hash.empty()
         && cached_runs != g_expand_cache.runs_by_target.end()) {
-        runs = &cached_runs->second;
+        runs = &cached_runs->second.runs;
+        defined = &cached_runs->second.defined_macros;
     }
 
-    std::vector<MacroRun> computed;
+    TargetExpansion computed;
     if (runs == nullptr) {
         // Which buffers to drive the preprocessor over:
         //   * single_unit, or the target isn't itself a compilation-unit
@@ -1625,7 +1714,7 @@ static json handle_expand_macro(const json& params) {
 
         MacroRun cur;
         auto close_run = [&]() {
-            if (cur.active && cur.has_target) computed.push_back(std::move(cur));
+            if (cur.active && cur.has_target) computed.runs.push_back(std::move(cur));
             cur = MacroRun{};
         };
 
@@ -1702,14 +1791,25 @@ static json handle_expand_macro(const json& params) {
         }
         close_run();
 
+        // Every macro defined during this preprocess, so a usage that
+        // produced no expansion tokens (an empty `` `ifdef `` branch) can still
+        // be told apart from "not a macro".
+        for (const auto* def : pp.getDefinedMacros()) {
+            if (!def) continue;
+            std::string_view nm = def->name.valueText();
+            if (!nm.empty()) computed.defined_macros.insert(std::string(nm));
+        }
+
         // Remember this target's runs for the generation, so repeat
         // expansions in the same file skip the preprocess entirely.
         if (!input_hash.empty() && g_expand_cache.hash == input_hash) {
             auto [slot, _inserted] =
                 g_expand_cache.runs_by_target.emplace(canon_key, std::move(computed));
-            runs = &slot->second;
+            runs = &slot->second.runs;
+            defined = &slot->second.defined_macros;
         } else {
-            runs = &computed;
+            runs = &computed.runs;
+            defined = &computed.defined_macros;
         }
     }
 
@@ -1720,7 +1820,32 @@ static json handle_expand_macro(const json& params) {
         const bool before_end  = lsp_le(want_line, want_char, r.hi_line, r.hi_char);
         if (after_start && before_end) { best = &r; break; }
     }
-    if (best == nullptr) return result;
+    if (best == nullptr) {
+        // No expansion tokens cover the cursor. Two very different cases:
+        //   * the cursor is on a real macro usage that expanded to *nothing*
+        //     (a conditional `` `ifdef `` branch compiled the body away, e.g.
+        //     `+define+UVM_EMPTY_MACROS` blanks every `` `uvm_field_* ``) — an
+        //     honest empty expansion, which we report so the user sees the
+        //     macro is defined-but-empty rather than a silent "not a macro";
+        //   * the cursor genuinely isn't on a macro usage → found stays false.
+        const MacroUsageAtCursor usage = macro_usage_at_cursor(
+            sm->getSourceText(target_buffer->id), want_line, want_char);
+        if (!usage.name.empty() && defined && defined->count(usage.name) != 0) {
+            result["found"]         = true;
+            result["expanded_text"] = "";
+            result["macro_name"]    = usage.name;
+            result["line_count"]    = 0;
+            // The expansion emitted no tokens, so the usage range comes from
+            // the textual `` `name `` span at the cursor, not a mapped macro
+            // location.
+            result["usage_range"]   = {
+                {"start", {{"line", want_line}, {"character", usage.start_char}}},
+                {"end",   {{"line", want_line}, {"character", usage.end_char}}},
+            };
+            result["diagnostics"]   = json::array();
+        }
+        return result;
+    }
 
     // Trim surrounding whitespace the macro body's trivia introduced.
     std::string text = best->text;

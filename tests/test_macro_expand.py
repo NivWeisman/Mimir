@@ -255,6 +255,86 @@ _BUSY_MODULES_PER_SIBLING = 6000
 _MAX_LATENCY_S = 8.0
 
 
+# A macro defined TWO ways behind `ifdef — the UVM `ifdef UVM_EMPTY_MACROS
+# pattern, where every `uvm_field_* / utility macro has a real body in one
+# branch and an empty body in the other. Expansion must follow the active
+# +define+ state, and a defined-but-empty branch must be reported as such
+# (not silently treated as "cursor isn't on a macro").
+_COND_MACROS = """\
+`ifdef MY_EMPTY
+`define util(T)
+`else
+`define util(T) function void name_of_``T(); endfunction
+`endif
+"""
+_COND_TOP = """\
+`include "macros.svh"
+module m;
+  `util(widget)
+endmodule
+"""
+_COND_USAGE_LINE = 2
+_COND_USAGE_CHAR = 4
+
+
+class ConditionalMacroDefinitionTest(unittest.TestCase):
+    """Conditional (`ifdef-guarded) macro definitions resolve to the branch
+    the active +define+ state selects, and the empty branch is honest."""
+
+    def _server(self, extra_toml: str):
+        slang_path = _require_slang()
+        tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(tmp.name)
+        (root / "macros.svh").write_text(_COND_MACROS)
+        (root / "top.sv").write_text(_COND_TOP)
+        (root / "files.f").write_text("top.sv\n")
+        (root / ".mimir.toml").write_text(
+            '[slang]\nfilelist = "files.f"\ninclude_dirs = ["."]\n' + extra_toml
+        )
+        lsp = MimirLspClient(env={"MIMIR_SLANG_PATH": slang_path})
+        lsp.initialize(workspace_root=root)
+        uri = file_uri(root / "top.sv")
+        lsp.did_open(uri, _COND_TOP)
+        return tmp, lsp, uri
+
+    def _expand(self, lsp, uri):
+        return lsp.request(
+            "mimir/expandMacro",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": _COND_USAGE_LINE, "character": _COND_USAGE_CHAR},
+            },
+            timeout=30.0,
+        )
+
+    def test_full_branch_when_define_absent(self) -> None:
+        tmp, lsp, uri = self._server("")
+        try:
+            r = self._expand(lsp, uri)
+            self.assertIsNotNone(r, "expected the non-empty branch to expand")
+            self.assertEqual(r["name"], "util")
+            self.assertIn("name_of_widget", "".join(r["expansion"].split()))
+            self.assertIsNone(r.get("error"))
+        finally:
+            lsp.close()
+            tmp.cleanup()
+
+    def test_empty_branch_reported_when_define_set(self) -> None:
+        tmp, lsp, uri = self._server('defines = ["MY_EMPTY"]\n')
+        try:
+            r = self._expand(lsp, uri)
+            self.assertIsNotNone(
+                r, "a defined-but-empty macro must not be reported as 'not a macro'"
+            )
+            self.assertEqual(r["name"], "util")
+            self.assertEqual(r["expansion"], "")
+            self.assertEqual(r["lineCount"], 0)
+            self.assertIn("expands to nothing", r.get("error") or "")
+        finally:
+            lsp.close()
+            tmp.cleanup()
+
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 RISCV_DV = REPO_ROOT / "examples" / "riscv-dv"
 UVM_SRC = REPO_ROOT / "examples" / "uvm-1.2" / "src"
