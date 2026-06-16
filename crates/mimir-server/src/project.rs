@@ -148,6 +148,7 @@ pub struct ProjectConfig {
     /// format_specs_in_strings = false   # whole-string color instead of per-`%fmt`
     /// keyword_hover = false             # no popup on `always_ff` / `$display` / …
     /// formatting    = false             # disable LSP formatting even if verible is present
+    /// hover_macro_expansion = true      # add an expansion footer to `macro hovers (off by default)
     /// ```
     #[serde(default)]
     pub features: FeatureToggles,
@@ -345,10 +346,24 @@ pub struct FeatureToggles {
     /// and wants to prevent double-formatting.
     #[serde(default = "default_true")]
     pub formatting: bool,
+
+    /// Append a macro-expansion footer to `textDocument/hover` when the cursor
+    /// is on a `` `macro `` usage. Unlike the other toggles this defaults to
+    /// **`false`**: an expansion footer costs a sidecar preprocessor
+    /// round-trip per hover, and most of the time a hover just wants the
+    /// macro's `` `define `` declaration (always shown in the base hover). Set
+    /// `true` to opt into the inline expansion preview; the explicit
+    /// **Mimir: Expand Macro** command works regardless of this flag.
+    #[serde(default = "default_false")]
+    pub hover_macro_expansion: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 impl Default for FeatureToggles {
@@ -358,6 +373,7 @@ impl Default for FeatureToggles {
             format_specs_in_strings: true,
             keyword_hover: true,
             formatting: true,
+            hover_macro_expansion: false,
         }
     }
 }
@@ -892,11 +908,23 @@ mod tests {
         assert!(cfg.slang.top.is_none());
         assert_eq!(cfg.slang.debounce_ms, DEFAULT_DEBOUNCE_MS);
         assert!(cfg.env.is_empty());
-        // Every feature toggle defaults to ON.
+        // Every feature toggle defaults to ON…
         assert!(cfg.features.semantic_tokens);
         assert!(cfg.features.format_specs_in_strings);
         assert!(cfg.features.keyword_hover);
         assert!(cfg.features.formatting);
+        // …except the macro-expansion hover footer, which is opt-in.
+        assert!(!cfg.features.hover_macro_expansion);
+    }
+
+    /// `hover_macro_expansion` opts in when set to `true`; the other toggles
+    /// keep their defaults.
+    #[test]
+    fn project_config_hover_macro_expansion_opt_in() {
+        let cfg: ProjectConfig =
+            toml::from_str("[features]\nhover_macro_expansion = true\n").unwrap();
+        assert!(cfg.features.hover_macro_expansion);
+        assert!(cfg.features.semantic_tokens);
     }
 
     /// `[features]` table parses; missing fields keep their defaults.

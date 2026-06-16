@@ -104,6 +104,69 @@ class MacroExpandTest(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class HoverMacroExpansionToggleTest(unittest.TestCase):
+    """`textDocument/hover` on a `macro shows the `define declaration by
+    default and only adds the expansion footer when
+    `[features] hover_macro_expansion = true`. The footer costs a sidecar
+    round-trip, so it is opt-in."""
+
+    def _server(self, extra_toml: str):
+        slang_path = _require_slang()
+        tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(tmp.name)
+        (root / "top.sv").write_text(_FIXTURE)
+        (root / "files.f").write_text("top.sv\n")
+        (root / ".mimir.toml").write_text(
+            '[slang]\nfilelist = "files.f"\n' + extra_toml
+        )
+        lsp = MimirLspClient(env={"MIMIR_SLANG_PATH": slang_path})
+        lsp.initialize(workspace_root=root)
+        uri = file_uri(root / "top.sv")
+        lsp.did_open(uri, _FIXTURE)
+        return tmp, lsp, uri
+
+    def _hover(self, lsp, uri):
+        return lsp.request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": _USAGE_LINE, "character": _USAGE_CHAR},
+            },
+            timeout=30.0,
+        )
+
+    def test_default_hover_shows_definition_without_footer(self) -> None:
+        tmp, lsp, uri = self._server("")
+        try:
+            result = self._hover(lsp, uri)
+            self.assertIsNotNone(result, "hover should still show the `define")
+            text = str(result)
+            self.assertNotIn(
+                "expands to", text,
+                "macro expansion footer must be OFF by default",
+            )
+            # The base hover still surfaces the macro's definition.
+            self.assertIn("A", text)
+        finally:
+            lsp.close()
+            tmp.cleanup()
+
+    def test_footer_appears_when_enabled(self) -> None:
+        tmp, lsp, uri = self._server(
+            "[features]\nhover_macro_expansion = true\n"
+        )
+        try:
+            result = self._hover(lsp, uri)
+            self.assertIsNotNone(result)
+            self.assertIn(
+                "expands to", str(result),
+                "footer must appear when hover_macro_expansion = true",
+            )
+        finally:
+            lsp.close()
+            tmp.cleanup()
+
+
 # A *multi-line* nested macro (the UVM-style case): `RECORD` expands to a
 # `FIELD` call plus a function, each macro body written with `\` line
 # continuations. The fully-recursive expansion must stay multi-line — the
@@ -465,8 +528,11 @@ class MacroExpandDuringCompileTest(unittest.TestCase):
             files.append(f"big{n}.sv")
         (root / "files.f").write_text("\n".join(files) + "\n")
         # debounce_ms = 0 so the elaborate starts immediately on did_open.
+        # hover_macro_expansion = true opts into the hover footer, which is
+        # off by default — this class asserts the footer's behaviour.
         (root / ".mimir.toml").write_text(
             '[slang]\nfilelist = "files.f"\ndebounce_ms = 0\n'
+            "[features]\nhover_macro_expansion = true\n"
         )
         cls.lsp = MimirLspClient(env={"MIMIR_SLANG_PATH": slang_path})
         cls.lsp.initialize(workspace_root=root)

@@ -2336,6 +2336,16 @@ impl LanguageServer for Backend {
         // and slang can expand it. The footer is gated by a cheap textual
         // check so ordinary hovers never pay for a preprocessor round-trip.
         let base = self.hover_impl(&params).await?;
+
+        // The macro-expansion footer is opt-in (`[features] hover_macro_expansion`,
+        // default false): it costs a sidecar preprocessor round-trip, and a
+        // plain hover usually just wants the macro's `` `define `` declaration,
+        // which the base hover already shows. When off, return the base hover
+        // unchanged — the explicit "Mimir: Expand Macro" command is unaffected.
+        if !self.current_features().await.hover_macro_expansion {
+            return Ok(base);
+        }
+
         let pos = params.text_document_position_params.position;
         let target = MPosition::new(pos.line, pos.character);
         let uri = params.text_document_position_params.text_document.uri.clone();
