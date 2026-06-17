@@ -1,9 +1,11 @@
 .vscode/**
 .vscode-test/**
 src/**
+out/**/*.test.js
 **/*.ts
 **/*.map
 **/tsconfig.json
+build-vsix.js
 .gitignore
 .vscodeignore
 package-lock.json

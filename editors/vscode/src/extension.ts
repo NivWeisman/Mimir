@@ -20,22 +20,14 @@ import {
   TransportKind,
 } from "vscode-languageclient/node";
 
+import { EXPAND_SCHEME, ExpandMacroResponse, expandMacroAt } from "./expand";
+
 let client: LanguageClient | undefined;
 
-// Scheme for the read-only virtual documents that show macro expansions.
-const EXPAND_SCHEME = "mimir-expand";
-
-// Shape of the `mimir/expandMacro` custom-request response (mirrors
-// `ExpandMacroResponse` in the Rust server).
-interface ExpandMacroResponse {
-  name: string;
-  expansion: string;
-  lineCount: number;
-  // Set when the expansion could not be produced (e.g. the macro has no
-  // `define anywhere in the project). The extension shows this message
-  // instead of opening an expansion tab.
-  error?: string;
-}
+// Per-expand timing output (Output → "Mimir Expand Timing"). Lets us see where
+// an expand spends its time in the editor — the server round trip is
+// sub-second, so anything slower points at the VS Code side.
+let timingChannel: vscode.OutputChannel | undefined;
 
 // Holds the most recent expansion text per virtual-doc URI so the
 // TextDocumentContentProvider can serve it. Keyed by the macro name so
@@ -89,55 +81,43 @@ function registerMacroExpansion(context: vscode.ExtensionContext): void {
       if (!editor || !client) {
         return;
       }
-      // Run inside a progress notification: the server may block briefly
-      // behind an in-flight background elaborate (they share one sidecar
-      // connection), and a silent wait reads as "the command did nothing".
-      // The spinner makes it clear the expansion is being computed.
-      let result: ExpandMacroResponse | null;
-      try {
-        result = await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: "Mimir: expanding macro…",
-            cancellable: false,
-          },
-          () =>
-            client!.sendRequest<ExpandMacroResponse | null>("mimir/expandMacro", {
-              textDocument: { uri: editor.document.uri.toString() },
-              position: {
-                line: editor.selection.active.line,
-                character: editor.selection.active.character,
-              },
-            }),
-        );
-      } catch (err) {
-        void vscode.window.showErrorMessage(`Mimir: macro expansion failed: ${err}`);
-        return;
-      }
-      if (!result) {
-        void vscode.window.showInformationMessage(
-          "Mimir: the cursor is not on a macro usage (or slang isn't configured).",
-        );
-        return;
-      }
-      if (result.error) {
-        void vscode.window.showWarningMessage(`Mimir: ${result.error}`);
-        return;
-      }
-
-      const header =
-        `// Expansion of \`${result.name} (${result.lineCount} line` +
-        `${result.lineCount === 1 ? "" : "s"})\n\n`;
-      const docUri = vscode.Uri.parse(`${EXPAND_SCHEME}:${result.name}.expanded.sv`);
-      expansionContents.set(docUri.toString(), header + result.expansion);
-      expansionEmitter.fire(docUri); // refresh if the tab is already open
-
-      const doc = await vscode.workspace.openTextDocument(docUri);
-      await vscode.languages.setTextDocumentLanguage(doc, "systemverilog");
-      await vscode.window.showTextDocument(doc, {
-        viewColumn: vscode.ViewColumn.Beside,
-        preview: true,
-        preserveFocus: false,
+      await expandMacroAt({
+        target: {
+          uri: editor.document.uri.toString(),
+          line: editor.selection.active.line,
+          character: editor.selection.active.character,
+        },
+        sendRequest: (method, params) =>
+          client!.sendRequest<ExpandMacroResponse | null>(method, params),
+        // Status-bar progress (not a notification toast): expansion now runs
+        // on its own sidecar connection, so it no longer blocks behind a
+        // background elaborate — a toast that pops and vanishes for a
+        // sub-second op just reads as flicker.
+        withProgress: (title, task) =>
+          vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Window, title },
+            task,
+          ),
+        setContent: (uriStr, text) => expansionContents.set(uriStr, text),
+        fireChange: (uriStr) => expansionEmitter.fire(vscode.Uri.parse(uriStr)),
+        openDoc: (uriStr) =>
+          Promise.resolve(vscode.workspace.openTextDocument(vscode.Uri.parse(uriStr))),
+        languageIdOf: (doc) => (doc as vscode.TextDocument).languageId,
+        setLanguage: async (doc, lang) => {
+          await vscode.languages.setTextDocumentLanguage(doc as vscode.TextDocument, lang);
+        },
+        showDoc: async (doc) => {
+          await vscode.window.showTextDocument(doc as vscode.TextDocument, {
+            viewColumn: vscode.ViewColumn.Beside,
+            preview: true,
+            preserveFocus: false,
+          });
+        },
+        info: (msg) => void vscode.window.showInformationMessage(msg),
+        warn: (msg) => void vscode.window.showWarningMessage(msg),
+        error: (msg) => void vscode.window.showErrorMessage(msg),
+        log: (msg) => timingChannel?.appendLine(msg),
+        now: () => (typeof performance !== "undefined" ? performance.now() : Date.now()),
       });
     }),
   );
@@ -179,6 +159,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     serverOptions,
     clientOptions,
   );
+
+  timingChannel = vscode.window.createOutputChannel("Mimir Expand Timing");
+  context.subscriptions.push(timingChannel);
 
   // Register commands before the client starts so they're available as soon
   // as the editor loads.

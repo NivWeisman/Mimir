@@ -38,15 +38,16 @@ const stage = fs.mkdtempSync(path.join(require("os").tmpdir(), "vsix-"));
 const extDir = path.join(stage, "extension");
 fs.mkdirSync(extDir, { recursive: true });
 
-// Skip dev/source cruft inside any copied tree (mirrors .vscodeignore intent).
-const SKIP = new Set([".map"]);
+// Skip dev/source cruft inside any copied tree (mirrors .vscodeignore intent):
+// sourcemaps and compiled test files have no business in a shipped extension.
+const SKIP_EXT = new Set([".map"]);
 function copy(src, dst) {
   const st = fs.statSync(src);
   if (st.isDirectory()) {
     fs.mkdirSync(dst, { recursive: true });
     for (const e of fs.readdirSync(src)) copy(path.join(src, e), path.join(dst, e));
   } else {
-    if (SKIP.has(path.extname(src))) return;
+    if (SKIP_EXT.has(path.extname(src)) || src.endsWith(".test.js")) return;
     fs.copyFileSync(src, dst);
   }
 }

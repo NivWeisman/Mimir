@@ -42,3 +42,18 @@ Set in your VS Code settings:
 
 Server logs go to the **Output** panel under "Mimir SystemVerilog"; LSP
 trace goes to "Mimir LSP Trace".
+
+### Expand-macro timing
+
+Every **Mimir: Expand Macro** writes a per-step breakdown to the **Output**
+panel under "Mimir Expand Timing", e.g.
+
+```
+expand `uvm_object_utils_begin: 1006 lines — request=264ms open=8ms setLang=0ms show=12ms total=284ms
+```
+
+`request` is the server round trip; `open`/`setLang`/`show` are VS Code opening
+the read-only expansion tab. If `request` dominates, it's the server; if the
+total dwarfs `request`, it's the editor side. (`setLang=0ms` is normal — the
+`.expanded.sv` tab already classifies as SystemVerilog, so no re-tokenize.)
+
