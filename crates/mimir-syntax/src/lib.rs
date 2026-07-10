@@ -26,6 +26,9 @@
 //!    walks the tree and classifies every keyword, identifier, type,
 //!    string, number, and comment into a stable legend. Powers
 //!    `textDocument/semanticTokens` (full + range) in `mimir-server`.
+//! 8. **UVM db call-site scanner.** [`config_db::db_calls`] finds every
+//!    `uvm_config_db#(T)::…` / `uvm_resource_db#(T)::…` call in a tree.
+//!    Powers the custom `mimir/uvmDb` viewer request in `mimir-server`.
 //!
 //! ## Why tree-sitter?
 //!
@@ -46,6 +49,7 @@
 
 pub mod builtin_methods;
 pub mod calls;
+pub mod config_db;
 pub mod diagnostics;
 pub mod folding;
 pub mod hover_format;
@@ -59,6 +63,7 @@ pub mod symbols;
 pub mod uvm;
 
 pub use calls::{ArgSpan, CallKind, CallSite, EnclosingCallable};
+pub use config_db::{DbAccess, DbArg, DbCall, DbKind};
 pub use diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use folding::FoldRange;
 pub use inlay::{InlayLabel, MethodHintMode};

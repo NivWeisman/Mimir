@@ -20,6 +20,8 @@ import {
   TransportKind,
 } from "vscode-languageclient/node";
 
+import { registerUvmDbView } from "./uvmDbView";
+
 let client: LanguageClient | undefined;
 
 // Scheme for the read-only virtual documents that show macro expansions.
@@ -184,6 +186,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // as the editor loads.
   registerMacroExpansion(context);
   registerGotoLocation(context);
+  registerUvmDbView(context, () => client);
+
+  // Drives the `when: "mimir.active"` clause on the UVM DB view, so the
+  // view only appears in workspaces where the extension actually activated.
+  void vscode.commands.executeCommand("setContext", "mimir.active", true);
 
   // Surface failure clearly: if the binary isn't on PATH we want a real
   // notification, not a silent dead client.

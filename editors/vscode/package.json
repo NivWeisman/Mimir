@@ -3,7 +3,7 @@
   "name": "mimir-vscode",
   "displayName": "Mimir SystemVerilog",
   "description": "SystemVerilog language server (verification-focused) — VS Code client.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "mimir",
   "license": "MIT OR Apache-2.0",
   "engines": {
@@ -24,14 +24,37 @@
         "command": "mimir.expandMacro",
         "title": "Mimir: Expand Macro",
         "category": "Mimir"
+      },
+      {
+        "command": "mimir.uvmDb.refresh",
+        "title": "Mimir: Refresh UVM DB View",
+        "category": "Mimir",
+        "icon": "$(refresh)"
       }
     ],
+    "views": {
+      "explorer": [
+        {
+          "id": "mimirUvmDb",
+          "name": "UVM Config/Resource DB",
+          "when": "mimir.active",
+          "contextualTitle": "Mimir UVM DB"
+        }
+      ]
+    },
     "menus": {
       "editor/context": [
         {
           "command": "mimir.expandMacro",
           "when": "editorLangId == systemverilog || editorLangId == verilog",
           "group": "navigation@99"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "mimir.uvmDb.refresh",
+          "when": "view == mimirUvmDb",
+          "group": "navigation"
         }
       ]
     },

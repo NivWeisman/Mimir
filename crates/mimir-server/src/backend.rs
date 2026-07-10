@@ -1152,6 +1152,70 @@ impl Backend {
             _ => Ok(None),
         }
     }
+
+    /// Handler for the custom `mimir/uvmDb` LSP request (registered in
+    /// `main.rs` via `LspService::build(...).custom_method(...)`).
+    ///
+    /// Returns every `uvm_config_db#(T)::…` / `uvm_resource_db#(T)::…` call
+    /// across the workspace, grouped by `(database, key)` — the data behind
+    /// the VS Code "UVM Config/Resource DB" tree view. Purely syntactic
+    /// (tree-sitter only), so it works with or without the slang sidecar.
+    ///
+    /// `params` is `Option` so a client that sends `"params": null` (or
+    /// omits it) doesn't get an InvalidParams error; the struct is empty
+    /// today and exists only as a forward-compatible filter slot.
+    #[instrument(level = "debug", skip_all)]
+    pub(crate) async fn uvm_db(
+        &self,
+        params: Option<crate::uvm_db_features::UvmDbParams>,
+    ) -> LspResult<crate::uvm_db_features::UvmDbResponse> {
+        mimir_core::time_scope!("lsp.uvm_db");
+        let _ = params; // no filters yet
+
+        // Snapshot open-doc trees first: for a file that is both open and
+        // filelist-hydrated, the open buffer is fresher than the on-disk
+        // tree the workspace cache holds.
+        let open_trees: Vec<(Url, SyntaxTree)> = {
+            let docs = self.documents.read().await;
+            docs.iter()
+                .filter_map(|(u, s)| s.tree.as_ref().map(|t| (u.clone(), t.clone())))
+                .collect()
+        };
+        let open_urls: std::collections::HashSet<Url> =
+            open_trees.iter().map(|(u, _)| u.clone()).collect();
+
+        // Closed-file trees, pre-filtered by the token-presence index: a
+        // file without either class token can't contain a db call. (Calls
+        // hidden behind project macros are invisible to the syntactic scan
+        // anyway — documented v1 limitation.)
+        let closed_trees: Vec<(Url, SyntaxTree)> = {
+            let ws = self.workspace.read().await;
+            let config_files = ws.files_containing("uvm_config_db");
+            let resource_files = ws.files_containing("uvm_resource_db");
+            ws.trees
+                .iter()
+                .filter(|(url, _)| !open_urls.contains(url))
+                .filter(|(url, _)| {
+                    config_files.is_some_and(|s| s.contains(url))
+                        || resource_files.is_some_and(|s| s.contains(url))
+                })
+                .map(|(url, tree)| (url.clone(), tree.clone()))
+                .collect()
+        };
+
+        let all_trees: Vec<(Url, SyntaxTree)> =
+            open_trees.into_iter().chain(closed_trees).collect();
+
+        let response = crate::uvm_db_features::collect_uvm_db(&all_trees);
+        debug!(
+            files = all_trees.len(),
+            groups = response.groups.len(),
+            ungrouped = response.ungrouped.len(),
+            truncated = response.truncated,
+            "uvm_db collected",
+        );
+        Ok(response)
+    }
 }
 
 // --------------------------------------------------------------------------

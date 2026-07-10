@@ -40,6 +40,7 @@ mod references_features;
 mod slang_adapter;
 mod slang_service;
 mod syntax_service;
+mod uvm_db_features;
 mod workspace_index;
 mod workspace_symbols;
 
@@ -95,12 +96,15 @@ async fn main() {
     // returns our `Backend`. The `Client` is how we send notifications back
     // to the editor (e.g. `publishDiagnostics`). We move the optional
     // slang client into the closure so it ends up owned by the `Backend`.
-    // `build(...).custom_method(...)` registers the non-standard
-    // `mimir/expandMacro` request (rust-analyzer-style macro expansion)
-    // alongside the standard LSP surface. The VS Code extension sends it via
-    // `client.sendRequest("mimir/expandMacro", ...)`.
+    // `build(...).custom_method(...)` registers the non-standard requests
+    // alongside the standard LSP surface:
+    //   * `mimir/expandMacro` — rust-analyzer-style macro expansion; the
+    //     VS Code extension sends it via `client.sendRequest(...)`.
+    //   * `mimir/uvmDb` — workspace-wide uvm_config_db / uvm_resource_db
+    //     call listing; feeds the extension's UVM DB tree view.
     let (service, socket) = LspService::build(move |client| backend::Backend::new(client, slang))
         .custom_method("mimir/expandMacro", backend::Backend::expand_macro)
+        .custom_method("mimir/uvmDb", backend::Backend::uvm_db)
         .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 

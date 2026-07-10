@@ -142,6 +142,8 @@ one.
   | `member_features` | AST-driven method-call resolution + member completion (tree-sitter fallback) |
   | `references_features` | Definition ranking + workspace-wide reference scan (references + rename) |
   | `workspace_symbols` | `workspace/symbol` kind filter + fuzzy ranking |
+  | `uvm_db_features` | `mimir/uvmDb` grouping + wire response (uvm_config_db / uvm_resource_db viewer) |
+  | `config_db` (mimir-syntax) | Syntactic `uvm_config_db` / `uvm_resource_db` call-site scanner |
   | `lsp_convert` | Pure internal-type → LSP wire-shape converters (edits, tokens, kinds, items) |
   | `chain_resolve` | Class-member lookup + inheritance walk + multi-hop chain resolution |
   | `paths` | Filesystem path ↔ `file://` URL conversion |

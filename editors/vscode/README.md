@@ -9,6 +9,13 @@ the server has any opinion. It's a stopgap until the server implements
 `textDocument/semanticTokens`; once that ships, semantic tokens will
 take over for anything the grammar gets wrong.
 
+Beyond the standard LSP surface, the extension contributes a
+**"UVM Config/Resource DB"** explorer view (`src/uvmDbView.ts`): a tree of
+every `uvm_config_db` / `uvm_resource_db` call in the workspace, grouped so
+setters pair with getters, fed by the server's custom `mimir/uvmDb`
+request. Groups with a type mismatch or a read-without-write get a warning
+icon; clicking a call jumps to its source line.
+
 ## Build
 
 ```bash
