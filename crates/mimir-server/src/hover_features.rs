@@ -1,5 +1,6 @@
 //! Hover content builders: declaration lines, signatures, macro bodies,
-//! keyword docs, and the macro-expansion footer.
+//! doc-comment paragraphs, provenance footers, keyword docs, and the
+//! macro-expansion footer.
 //!
 //! Pure functions over symbols, ropes, and the open-document store —
 //! the hover handler in [`crate::backend`] resolves *what* to show and
@@ -12,45 +13,74 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Url}
 
 use crate::backend::DocumentState;
 
-/// Build a `Hover` from a resolved [`Symbol`] by:
+/// Build a `Hover` from a resolved [`Symbol`]: the base declaration
+/// content (see [`base_markdown`]) plus, when `rich` is set (the
+/// `[features] rich_hover` toggle, default on), the `//` doc-comment
+/// paragraph found immediately above the declaration and a provenance
+/// footer (`*kind · file.sv:line*`).
 ///
-/// 1. Synthesizing a typed signature for callables (function/task/
-///    method/macro) via [`mimir_syntax::signature::signature_for`].
-/// 2. For macros, additionally appending the full `define` body
-///    captured from the source between `full_range.start` and
-///    `full_range.end`.
-/// 3. Falling back to the raw declaration line for non-callables
-///    (classes, modules, variables, typedefs, parameters, …).
-///
-/// The line is read from the open-doc store first (the editor's
+/// The source is read from the open-doc store first (the editor's
 /// authoritative view of unsaved content), then from disk — mirrors
 /// `completionItem/resolve`'s pattern. Returns `None` only when the
-/// declaration line genuinely can't be found anywhere.
+/// declaration genuinely can't be found anywhere.
 pub(crate) fn hover_for_symbol(
     sym: &Symbol,
     sym_url: &Url,
     docs: &std::collections::HashMap<Url, DocumentState>,
+    rich: bool,
 ) -> Option<Hover> {
-    let rope_from_doc: Option<Rope> = docs
+    // One rope for everything: open-doc rope first (authoritative for
+    // unsaved edits), else a single disk read. The per-branch disk
+    // fallbacks below become no-ops once this is resolved.
+    let rope: Option<Rope> = docs
         .get(sym_url)
-        .map(|s| s.document.rope().clone());
+        .map(|s| s.document.rope().clone())
+        .or_else(|| {
+            let path = sym_url.to_file_path().ok()?;
+            std::fs::read_to_string(&path).ok().map(|t| Rope::from_str(&t))
+        });
 
+    let mut md = base_markdown(sym, sym_url, rope.as_ref())?;
+
+    if rich {
+        if let Some(doc) = rope
+            .as_ref()
+            .and_then(|r| doc_comment_above(r, sym.full_range.start.line))
+        {
+            md.push_str("\n\n");
+            md.push_str(&doc);
+        }
+        md.push_str("\n\n");
+        md.push_str(&provenance_footer(sym, sym_url));
+    }
+
+    Some(hover_from_markdown(md))
+}
+
+/// The base declaration markdown for a symbol — enrichment-free:
+///
+/// 1. Synthesized typed signature for callables (function/task/
+///    method/macro) via [`mimir_syntax::signature::signature_for`].
+/// 2. For macros, additionally the full `define` body captured from the
+///    source between `full_range.start` and `full_range.end`.
+/// 3. Whole-block preview for multi-line typedefs and SVA
+///    property/sequence declarations.
+/// 4. The raw declaration line for everything else (classes, modules,
+///    variables, parameters, …).
+fn base_markdown(sym: &Symbol, sym_url: &Url, rope: Option<&Rope>) -> Option<String> {
     // 1. Callable signatures (function/task/method/macro).
     if let Some(sig) = mimir_syntax::signature::signature_for(sym) {
         if sym.kind == MSymbolKind::Macro {
             // For macros: signature + body.
-            let body = read_macro_body(sym, sym_url, rope_from_doc.as_ref());
-            let value = match body {
+            let body = read_macro_body(sym, sym_url, rope);
+            return Some(match body {
                 Some(b) if !b.trim().is_empty() => {
                     format!("```systemverilog\n{}\n{}\n```", sig.label, b)
                 }
                 _ => format!("```systemverilog\n{}\n```", sig.label),
-            };
-            return Some(hover_from_markdown(value));
+            });
         }
-        return Some(hover_from_markdown(
-            mimir_syntax::hover_format::format_sv_signature(&sig.label),
-        ));
+        return Some(mimir_syntax::hover_format::format_sv_signature(&sig.label));
     }
 
     // 2. Block declarations whose *body* is the payload — shown whole from
@@ -73,40 +103,141 @@ pub(crate) fn hover_for_symbol(
         _ => false,
     };
     if show_full_block {
-        if let Some(block) = read_range_text(sym.full_range, sym_url, rope_from_doc.as_ref()) {
+        if let Some(block) = read_range_text(sym.full_range, sym_url, rope) {
             let block = elide_after_lines(block.trim_end(), 30);
-            return Some(hover_from_markdown(format!(
-                "```systemverilog\n{block}\n```"
-            )));
+            return Some(format!("```systemverilog\n{block}\n```"));
         }
     }
 
     // 3. Non-callables: the declaration line.
     let line_no = sym.name_range.start.line;
-    let line = rope_from_doc
-        .as_ref()
-        .and_then(|r| read_line_trimmed(r, line_no))
-        .or_else(|| {
-            sym_url
-                .to_file_path()
-                .ok()
-                .and_then(|p| std::fs::read_to_string(&p).ok())
-                .and_then(|t| read_line_trimmed(&Rope::from_str(&t), line_no))
-        })?;
+    let line = rope.and_then(|r| read_line_trimmed(r, line_no))?;
 
     // 3a. For single-line typedefs, append the expanded base type after the
     //     declaration (multi-line ones already show their full body above).
     if sym.kind == MSymbolKind::Typedef {
         if let Some(base) = typedef_base_from_line(&line, &sym.name) {
-            let md = format!(
+            return Some(format!(
                 "```systemverilog\n{}\n```\n\n**Expands to:** `{}`",
                 line, base
-            );
-            return Some(hover_from_markdown(md));
+            ));
         }
     }
 
-    Some(hover_markdown(&line))
+    Some(format!("```systemverilog\n{line}\n```"))
+}
+
+/// Maximum `//` comment lines collected above a declaration. Guards
+/// against a license header glued to a top-of-file declaration; the
+/// lines *nearest* the declaration win.
+const MAX_DOC_COMMENT_LINES: usize = 20;
+
+/// The contiguous `//`-comment block immediately above `decl_line`,
+/// rendered as hover prose.
+///
+/// Walks upward from the line above the declaration, collecting lines
+/// whose trimmed text starts with `//`; stops at the first blank or
+/// non-comment line (`/* … */` block comments are not collected — v1
+/// limitation). Each line is stripped of its comment leader (`//`,
+/// `///`, `//!`) and at most one following space, so deliberately
+/// indented continuation lines keep their alignment. Lines with no
+/// alphanumeric content (banner rules like `// ----`) are dropped; a
+/// block that was *only* banners yields `None`.
+pub(crate) fn doc_comment_above(rope: &Rope, decl_line: u32) -> Option<String> {
+    if decl_line == 0 {
+        return None;
+    }
+    let total_lines = rope.len_lines() as u32;
+
+    // Collect upward, nearest-first.
+    let mut collected: Vec<String> = Vec::new();
+    let mut line_no = decl_line - 1;
+    loop {
+        if line_no >= total_lines {
+            break; // symbol ranges from a stale index — bail quietly
+        }
+        let text = rope.line(line_no as usize).to_string();
+        let trimmed = text.trim();
+        if !trimmed.starts_with("//") || collected.len() >= MAX_DOC_COMMENT_LINES {
+            break;
+        }
+        collected.push(strip_comment_leader(trimmed));
+        if line_no == 0 {
+            break;
+        }
+        line_no -= 1;
+    }
+
+    // Back to source order; drop banner rules (`----`, `====`, …).
+    collected.reverse();
+    let prose: Vec<String> = collected
+        .into_iter()
+        .filter(|l| l.chars().any(|c| c.is_ascii_alphanumeric()))
+        .collect();
+    if prose.is_empty() {
+        return None;
+    }
+    Some(prose.join("\n"))
+}
+
+/// Strip a comment leader from a trimmed comment line: `//`, any extra
+/// `/`s (`///`), one optional `!` (`//!`), and at most one space. The
+/// "at most one space" rule preserves deliberate deeper indentation.
+fn strip_comment_leader(trimmed: &str) -> String {
+    let no_slashes = trimmed.trim_start_matches('/');
+    let rest = no_slashes.strip_prefix('!').unwrap_or(no_slashes);
+    rest.strip_prefix(' ').unwrap_or(rest).to_string()
+}
+
+/// The provenance footer: `*class · apb_monitor.sv:42*` — kind label,
+/// file basename, and the 1-based line of the *name* token (the same
+/// line go-to-definition jumps to).
+fn provenance_footer(sym: &Symbol, sym_url: &Url) -> String {
+    let file = sym_url
+        .to_file_path()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| {
+            sym_url
+                .path()
+                .rsplit('/')
+                .next()
+                .unwrap_or("?")
+                .to_string()
+        });
+    format!(
+        "*{} · {}:{}*",
+        kind_label(sym.kind),
+        file,
+        sym.name_range.start.line + 1
+    )
+}
+
+/// Human-readable label for a symbol kind, used in the provenance
+/// footer. Exhaustive on purpose (no wildcard arm): adding a
+/// [`MSymbolKind`] variant must fail the build here so the new kind
+/// gets a deliberate label.
+fn kind_label(kind: MSymbolKind) -> &'static str {
+    match kind {
+        MSymbolKind::Module => "module",
+        MSymbolKind::Interface => "interface",
+        MSymbolKind::Program => "program",
+        MSymbolKind::Package => "package",
+        MSymbolKind::Class => "class",
+        MSymbolKind::Task => "task",
+        MSymbolKind::Function => "function",
+        MSymbolKind::Method => "method",
+        MSymbolKind::Typedef => "typedef",
+        MSymbolKind::EnumMember => "enum member",
+        MSymbolKind::Constraint => "constraint",
+        MSymbolKind::Parameter => "parameter",
+        MSymbolKind::Variable => "variable",
+        MSymbolKind::Port => "port",
+        MSymbolKind::Property => "property",
+        MSymbolKind::Sequence => "sequence",
+        MSymbolKind::Covergroup => "covergroup",
+        MSymbolKind::Macro => "macro",
+    }
 }
 
 /// Read the source slice covering `range` from the open-doc rope first,
@@ -200,13 +331,6 @@ pub(crate) fn read_macro_body(sym: &Symbol, sym_url: &Url, doc_rope: Option<&Rop
         return None;
     }
     Some(body.to_string())
-}
-
-/// Wrap a single line as a SystemVerilog markdown fenced block — the
-/// same format `completionItem/resolve` uses, so hover and resolve
-/// docstrings look identical to the user.
-pub(crate) fn hover_markdown(line: &str) -> Hover {
-    hover_from_markdown(format!("```systemverilog\n{line}\n```"))
 }
 
 /// Final hover fallback: if the cursor sits on a reserved keyword or
@@ -652,7 +776,7 @@ mod tests {
             return_type: None,
             decl_type: None,
         };
-        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
         let md = hover_markdown_value(&h);
         assert!(md.contains("typedef enum logic [1:0] {"), "block start missing: {md}");
         assert!(md.contains("IDLE"), "enum member missing: {md}");
@@ -679,7 +803,7 @@ mod tests {
             return_type: None,
             decl_type: None,
         };
-        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
         let md = hover_markdown_value(&h);
         assert!(md.contains("more lines)"), "long block should be elided: {md}");
         assert!(!md.contains("LAST"), "elided tail should be dropped: {md}");
@@ -710,7 +834,7 @@ endmodule
             return_type: None,
             decl_type: None,
         };
-        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
         let md = hover_markdown_value(&h);
         assert!(md.contains("property p_req_ack;"), "header missing: {md}");
         assert!(md.contains("req |-> ##[1:3] ack;"), "body missing: {md}");
@@ -741,7 +865,7 @@ endmodule
             return_type: None,
             decl_type: None,
         };
-        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
         let md = hover_markdown_value(&h);
         assert!(md.contains("sequence s_handshake;"), "header missing: {md}");
         assert!(md.contains("req ##[1:3] ack;"), "body missing: {md}");
@@ -772,15 +896,14 @@ endmodule
             return_type: None,
             decl_type: None,
         };
-        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
         let md = hover_markdown_value(&h);
         assert!(md.contains("more lines)"), "long property should be elided: {md}");
         assert!(!md.contains("final_clause"), "elided tail should be dropped: {md}");
     }
 
-    /// Bare non-callable symbol (class) → fenced declaration line.
-    #[test]
-    fn hover_for_class_returns_declaration_line() {
+    /// Helper: the class fixture shared by the plain/rich hover tests.
+    fn class_fixture() -> (Url, std::collections::HashMap<Url, DocumentState>, Symbol) {
         let url = url("file:///a.sv");
         let text = "class apb_monitor extends uvm_monitor;\n  int x;\nendclass\n";
         let mut docs = std::collections::HashMap::new();
@@ -796,11 +919,215 @@ endmodule
             return_type: None,
             decl_type: None,
         };
-        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        (url, docs, s)
+    }
+
+    /// Bare non-callable symbol (class), rich hover off → exactly the
+    /// fenced declaration line, nothing else (the pre-feature contract).
+    #[test]
+    fn hover_for_class_returns_declaration_line() {
+        let (url, docs, s) = class_fixture();
+        let h = hover_for_symbol(&s, &url, &docs, false).expect("hover content");
         assert_eq!(
             hover_markdown_value(&h),
             "```systemverilog\nclass apb_monitor extends uvm_monitor;\n```",
         );
+    }
+
+    /// Same fixture with rich hover on: no doc comment above the class, so
+    /// the only addition is the provenance footer (1-based line).
+    #[test]
+    fn hover_for_class_rich_appends_provenance_footer() {
+        let (url, docs, s) = class_fixture();
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
+        assert_eq!(
+            hover_markdown_value(&h),
+            "```systemverilog\nclass apb_monitor extends uvm_monitor;\n```\
+             \n\n*class · a.sv:1*",
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // rich hover — doc_comment_above + provenance footer
+    // ----------------------------------------------------------------------
+
+    /// A two-line comment block collects in source order.
+    #[test]
+    fn doc_comment_two_lines_in_order() {
+        let rope = Rope::from_str("// First line.\n// Second line.\nclass c;\n");
+        assert_eq!(
+            doc_comment_above(&rope, 2).as_deref(),
+            Some("First line.\nSecond line.")
+        );
+    }
+
+    /// A blank line between comment and declaration detaches the comment.
+    #[test]
+    fn doc_comment_stops_at_blank_line() {
+        let rope = Rope::from_str("// Detached banner prose.\n\nclass c;\n");
+        assert_eq!(doc_comment_above(&rope, 2), None);
+    }
+
+    /// A code line above the declaration stops the walk (only the
+    /// contiguous comment block counts).
+    #[test]
+    fn doc_comment_stops_at_code_line() {
+        let rope = Rope::from_str("int unrelated;\n// Attached.\nclass c;\n");
+        assert_eq!(doc_comment_above(&rope, 2).as_deref(), Some("Attached."));
+    }
+
+    /// Declaration on line 0 has nothing above it.
+    #[test]
+    fn doc_comment_at_line_zero_is_none() {
+        let rope = Rope::from_str("class c;\n");
+        assert_eq!(doc_comment_above(&rope, 0), None);
+    }
+
+    /// `///` and `//!` leaders strip like plain `//`; at most one space
+    /// after the leader is eaten so deeper indentation survives.
+    #[test]
+    fn doc_comment_strips_doc_style_leaders() {
+        let rope = Rope::from_str("/// Triple.\n//! Bang.\n//   indented\nclass c;\n");
+        assert_eq!(
+            doc_comment_above(&rope, 3).as_deref(),
+            Some("Triple.\nBang.\n  indented")
+        );
+    }
+
+    /// Punctuation-only banner rules are dropped; a block that is *only*
+    /// banners yields no doc text at all.
+    #[test]
+    fn doc_comment_banner_rules_are_dropped() {
+        let rope = Rope::from_str("// ------------\nclass c;\n");
+        assert_eq!(doc_comment_above(&rope, 1), None);
+
+        let sandwich =
+            Rope::from_str("// ====\n// The real prose.\n// ====\nclass c;\n");
+        assert_eq!(
+            doc_comment_above(&sandwich, 3).as_deref(),
+            Some("The real prose.")
+        );
+    }
+
+    /// Blocks longer than the cap keep the lines nearest the declaration.
+    #[test]
+    fn doc_comment_caps_at_nearest_lines() {
+        let mut lines: Vec<String> = (0..30).map(|i| format!("// L{i}")).collect();
+        lines.push("class c;".to_string());
+        let rope = Rope::from_str(&lines.join("\n"));
+        let doc = doc_comment_above(&rope, 30).expect("doc");
+        // 30 comment lines, cap 20 → L10..L29 survive; L0..L9 dropped.
+        assert!(doc.starts_with("L10\n"), "got {doc:?}");
+        assert!(doc.ends_with("L29"), "got {doc:?}");
+        assert!(!doc.contains("L9\n"), "got {doc:?}");
+    }
+
+    /// End-to-end order: fence, then doc paragraph, then footer.
+    #[test]
+    fn rich_hover_orders_fence_doc_footer() {
+        let url = url("file:///dir/apb_env.sv");
+        let text = "// Watches the APB bus.\n// Reports protocol errors.\nclass apb_env;\nendclass\n";
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(text));
+
+        let s = Symbol {
+            name: "apb_env".to_string(),
+            kind: MSymbolKind::Class,
+            name_range: MRange::new(MPosition::new(2, 6), MPosition::new(2, 13)),
+            full_range: MRange::new(MPosition::new(2, 0), MPosition::new(3, 8)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
+        let md = hover_markdown_value(&h);
+        let fence = md.find("```systemverilog").expect("fence");
+        let doc = md.find("Watches the APB bus.").expect("doc prose");
+        let footer = md.find("*class · apb_env.sv:3*").expect("footer");
+        assert!(fence < doc && doc < footer, "wrong order: {md}");
+        assert!(md.contains("Reports protocol errors."), "got {md}");
+    }
+
+    /// The doc comment anchors on `full_range.start` — the `property` line
+    /// — so SVA expansion previews gain their doc paragraph too.
+    #[test]
+    fn rich_hover_doc_above_property_block() {
+        let url = url("file:///a.sv");
+        let text = "\
+module m;
+  // Req must be acked within 3 cycles.
+  property p_req_ack;
+    req |-> ##[1:3] ack;
+  endproperty
+endmodule
+";
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(text));
+
+        let s = Symbol {
+            name: "p_req_ack".to_string(),
+            kind: MSymbolKind::Property,
+            name_range: MRange::new(MPosition::new(2, 11), MPosition::new(2, 20)),
+            full_range: MRange::new(MPosition::new(2, 2), MPosition::new(4, 13)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
+        let md = hover_markdown_value(&h);
+        assert!(md.contains("endproperty"), "block missing: {md}");
+        assert!(
+            md.contains("Req must be acked within 3 cycles."),
+            "doc missing: {md}"
+        );
+        assert!(md.contains("*property · a.sv:3*"), "footer missing: {md}");
+    }
+
+    /// rich = false suppresses both enrichments even when a doc comment
+    /// exists — the pre-feature hover, byte for byte.
+    #[test]
+    fn rich_false_suppresses_doc_and_footer() {
+        let url = url("file:///a.sv");
+        let text = "// Documented.\nclass c;\nendclass\n";
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(text));
+
+        let s = Symbol {
+            name: "c".to_string(),
+            kind: MSymbolKind::Class,
+            name_range: MRange::new(MPosition::new(1, 6), MPosition::new(1, 7)),
+            full_range: MRange::new(MPosition::new(1, 0), MPosition::new(2, 8)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs, false).expect("hover content");
+        assert_eq!(
+            hover_markdown_value(&h),
+            "```systemverilog\nclass c;\n```",
+        );
+    }
+
+    /// Footer format: kind label, URL basename, 1-based name-token line.
+    #[test]
+    fn provenance_footer_shape() {
+        let s = Symbol {
+            name: "f".to_string(),
+            kind: MSymbolKind::Function,
+            name_range: MRange::new(MPosition::new(41, 2), MPosition::new(41, 3)),
+            full_range: MRange::new(MPosition::new(41, 0), MPosition::new(44, 0)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let footer = provenance_footer(&s, &url("file:///deep/dir/apb_monitor.sv"));
+        assert_eq!(footer, "*function · apb_monitor.sv:42*");
+        assert_eq!(kind_label(MSymbolKind::EnumMember), "enum member");
+        assert_eq!(kind_label(MSymbolKind::Covergroup), "covergroup");
     }
 
 
@@ -830,7 +1157,7 @@ endmodule
             return_type: None,
             decl_type: None,
         };
-        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
         let v = hover_markdown_value(&h);
         // Signature is now rich markdown rather than a fenced code block.
         assert!(v.contains("**function**"), "keyword not bolded: {v:?}");
@@ -863,7 +1190,7 @@ endmodule
             return_type: None,
             decl_type: None,
         };
-        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let h = hover_for_symbol(&s, &url, &docs, true).expect("hover content");
         let v = hover_markdown_value(&h);
         // Header is the synthesized signature; body is the trimmed body.
         assert!(
@@ -896,7 +1223,7 @@ endmodule
             decl_type: None,
         };
         // No doc, and the path doesn't exist on disk either → None.
-        assert!(hover_for_symbol(&s, &url, &docs).is_none());
+        assert!(hover_for_symbol(&s, &url, &docs, true).is_none());
     }
 
 

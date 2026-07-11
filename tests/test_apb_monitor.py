@@ -254,7 +254,9 @@ class ApbMonitorTest(unittest.TestCase):
     def test_hover_class_name_shows_declaration_line(self) -> None:
         """Cursor on the `apb_monitor` class identifier (line 36 / 0-idx 35
         column 9 is `apb_monitor`) returns the class declaration as a
-        fenced systemverilog block."""
+        fenced systemverilog block. Since v0.7.48 rich hover (default on)
+        appends a provenance footer after the fence, so the value ends
+        with `*class · <file>:<line>*` rather than the fence itself."""
         result = self._hover(35, 9)
         self.assertIsNotNone(result, "no hover for class name")
         contents = result["contents"]
@@ -262,7 +264,13 @@ class ApbMonitorTest(unittest.TestCase):
         value = contents["value"]
         self.assertIn("class apb_monitor", value)
         self.assertTrue(value.startswith("```systemverilog"))
-        self.assertTrue(value.endswith("```"))
+        lines = value.splitlines()
+        self.assertIn("```", lines, "closing fence missing")
+        self.assertTrue(
+            lines[-1].startswith("*class ·"),
+            f"expected provenance footer as last line, got: {lines[-1]!r}",
+        )
+        self.assertIn("apb_monitor.sv:36", lines[-1])
 
     def test_hover_field_reference_shows_declaration(self) -> None:
         """Cursor on `cfg` (line 40 / 0-idx 39) returns its declaration

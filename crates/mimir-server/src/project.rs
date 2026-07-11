@@ -148,6 +148,7 @@ pub struct ProjectConfig {
     /// format_specs_in_strings = false   # whole-string color instead of per-`%fmt`
     /// keyword_hover = false             # no popup on `always_ff` / `$display` / …
     /// formatting    = false             # disable LSP formatting even if verible is present
+    /// rich_hover    = false             # plain declaration-only hovers (no doc comment / footer)
     /// hover_macro_expansion = true      # add an expansion footer to `macro hovers (off by default)
     /// ```
     #[serde(default)]
@@ -347,6 +348,15 @@ pub struct FeatureToggles {
     #[serde(default = "default_true")]
     pub formatting: bool,
 
+    /// Enrich symbol hovers (tree-sitter path) with the `//` doc-comment
+    /// paragraph found immediately above the declaration and a provenance
+    /// footer (`*kind · file.sv:line*`). Applies to every hover built by
+    /// `hover_for_symbol`; the slang-first AST hover and the keyword /
+    /// builtin-method fallbacks are unaffected. When `false`, hovers show
+    /// only the bare declaration (the pre-feature behaviour).
+    #[serde(default = "default_true")]
+    pub rich_hover: bool,
+
     /// Append a macro-expansion footer to `textDocument/hover` when the cursor
     /// is on a `` `macro `` usage. Unlike the other toggles this defaults to
     /// **`false`**: an expansion footer costs a sidecar preprocessor
@@ -373,6 +383,7 @@ impl Default for FeatureToggles {
             format_specs_in_strings: true,
             keyword_hover: true,
             formatting: true,
+            rich_hover: true,
             hover_macro_expansion: false,
         }
     }
@@ -913,6 +924,7 @@ mod tests {
         assert!(cfg.features.format_specs_in_strings);
         assert!(cfg.features.keyword_hover);
         assert!(cfg.features.formatting);
+        assert!(cfg.features.rich_hover);
         // …except the macro-expansion hover footer, which is opt-in.
         assert!(!cfg.features.hover_macro_expansion);
     }
@@ -940,6 +952,7 @@ mod tests {
         assert!(!cfg.features.format_specs_in_strings);
         // Not specified — picks up the default.
         assert!(cfg.features.keyword_hover);
+        assert!(cfg.features.rich_hover);
     }
 
     /// Unknown keys inside `[features]` are rejected — same `deny_unknown_fields`

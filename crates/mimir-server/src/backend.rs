@@ -597,8 +597,11 @@ impl Backend {
         }
 
         let (sym_url, sym) = resolved?;
+        // Read the toggle before taking the documents lock — never hold a
+        // store lock across an unrelated await.
+        let rich = self.current_features().await.rich_hover;
         let docs = self.documents.read().await;
-        hover_for_symbol(&sym, &sym_url, &docs)
+        hover_for_symbol(&sym, &sym_url, &docs, rich)
     }
 
     /// Stage 1 + Stage 2 syntax-based resolver, factored out so the
