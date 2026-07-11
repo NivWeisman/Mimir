@@ -805,7 +805,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 - 🚧 UVM phase awareness — jump to an overridden phase via the `textDocument/codeLens` "overrides Base::method" lens (see above; default scope is UVM phase methods). Phase-graph ordering / phase-jump-by-name is still pending.
 - ⬜ UVM factory registration validation (`uvm_object_utils`, `uvm_component_utils`)
 - ⬜ UVM sequence ↔ sequencer ↔ driver navigation
-- ⬜ SVA property/sequence index, hover-preview of expansion
+- ✅ SVA property/sequence index, hover-preview of expansion — `property … endproperty` / `sequence … endsequence` declarations are first-class symbols (documentSymbol outline, workspace symbols, go-to-definition on uses, all fed by the tree-sitter index). Hovering a property/sequence name — at its declaration, in `assert/assume/cover property (…)`, or a sequence referenced inside another property expression — shows the **whole declaration block** as the expansion preview (elided past 30 lines), because the name line alone (`property p;`) says nothing. Tree-sitter path, so it works without slang. Limitation: no formal-argument substitution — a parameterized `p_check(a, b)` hover shows the declared body verbatim, not the actualized instance.
 - ⬜ Functional coverage: covergroup/coverpoint/cross structure view
 - ⬜ Constraint blocks: list `rand` variables, navigate constraint references
 - ⬜ Test/testbench discovery & runner integration

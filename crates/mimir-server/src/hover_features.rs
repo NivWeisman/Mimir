@@ -53,13 +53,26 @@ pub(crate) fn hover_for_symbol(
         ));
     }
 
-    // 2. Multi-line typedefs (`typedef enum {...} state_e;`): the *name*
-    //    token sits on the closing line, so a single-line read would show
-    //    a broken `"} state_e;"` snippet. Show the whole declaration block
-    //    from `full_range` instead (elided when very long).
-    if sym.kind == MSymbolKind::Typedef
-        && sym.full_range.end.line > sym.full_range.start.line
-    {
+    // 2. Block declarations whose *body* is the payload — shown whole from
+    //    `full_range` (elided when very long):
+    //
+    //    * Multi-line typedefs (`typedef enum {...} state_e;`): the name
+    //      token sits on the closing line, so a single-line read would show
+    //      a broken `"} state_e;"` snippet.
+    //    * SVA `property` / `sequence` declarations: this is the
+    //      hover-preview of the expansion. Hovering `p_req_ack` in
+    //      `assert property (p_req_ack);` (or a sequence name inside
+    //      another property expression) must show the full
+    //      `property … endproperty` body — the name line alone
+    //      (`property p_req_ack;`) says nothing. Unconditional on line
+    //      count: even for these, the name sits on the block's first
+    //      line, so the single-line fallback would drop the body.
+    let show_full_block = match sym.kind {
+        MSymbolKind::Property | MSymbolKind::Sequence => true,
+        MSymbolKind::Typedef => sym.full_range.end.line > sym.full_range.start.line,
+        _ => false,
+    };
+    if show_full_block {
         if let Some(block) = read_range_text(sym.full_range, sym_url, rope_from_doc.as_ref()) {
             let block = elide_after_lines(block.trim_end(), 30);
             return Some(hover_from_markdown(format!(
@@ -670,6 +683,99 @@ mod tests {
         let md = hover_markdown_value(&h);
         assert!(md.contains("more lines)"), "long block should be elided: {md}");
         assert!(!md.contains("LAST"), "elided tail should be dropped: {md}");
+    }
+
+    /// SVA property: hover shows the whole `property … endproperty` block
+    /// (the expansion preview), not just the `property p;` name line.
+    #[test]
+    fn hover_for_property_shows_full_expansion() {
+        let url = url("file:///a.sv");
+        let text = "\
+module m;
+  property p_req_ack;
+    @(posedge clk) req |-> ##[1:3] ack;
+  endproperty
+endmodule
+";
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(text));
+
+        let s = Symbol {
+            name: "p_req_ack".to_string(),
+            kind: MSymbolKind::Property,
+            name_range: MRange::new(MPosition::new(1, 11), MPosition::new(1, 20)),
+            full_range: MRange::new(MPosition::new(1, 2), MPosition::new(3, 13)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let md = hover_markdown_value(&h);
+        assert!(md.contains("property p_req_ack;"), "header missing: {md}");
+        assert!(md.contains("req |-> ##[1:3] ack;"), "body missing: {md}");
+        assert!(md.contains("endproperty"), "block end missing: {md}");
+    }
+
+    /// SVA sequence: same expansion-preview contract as properties.
+    #[test]
+    fn hover_for_sequence_shows_full_expansion() {
+        let url = url("file:///a.sv");
+        let text = "\
+module m;
+  sequence s_handshake;
+    req ##[1:3] ack;
+  endsequence
+endmodule
+";
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(text));
+
+        let s = Symbol {
+            name: "s_handshake".to_string(),
+            kind: MSymbolKind::Sequence,
+            name_range: MRange::new(MPosition::new(1, 11), MPosition::new(1, 22)),
+            full_range: MRange::new(MPosition::new(1, 2), MPosition::new(3, 13)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let md = hover_markdown_value(&h);
+        assert!(md.contains("sequence s_handshake;"), "header missing: {md}");
+        assert!(md.contains("req ##[1:3] ack;"), "body missing: {md}");
+        assert!(md.contains("endsequence"), "block end missing: {md}");
+    }
+
+    /// A property that grew past the elision cap is truncated like a long
+    /// typedef — the popup stays readable.
+    #[test]
+    fn hover_for_long_property_is_elided() {
+        let url = url("file:///a.sv");
+        let clauses: Vec<String> = (0..40).map(|i| format!("    req{i} |-> ack{i};")).collect();
+        let text = format!(
+            "property p_big;\n{}\n  final_clause;\nendproperty\n",
+            clauses.join("\n")
+        );
+        let mut docs = std::collections::HashMap::new();
+        docs.insert(url.clone(), doc_state(&text));
+
+        let last_line = text.lines().count() as u32 - 1;
+        let s = Symbol {
+            name: "p_big".to_string(),
+            kind: MSymbolKind::Property,
+            name_range: MRange::new(MPosition::new(0, 9), MPosition::new(0, 14)),
+            full_range: MRange::new(MPosition::new(0, 0), MPosition::new(last_line, 11)),
+            params: None,
+            parent_class_name: None,
+            return_type: None,
+            decl_type: None,
+        };
+        let h = hover_for_symbol(&s, &url, &docs).expect("hover content");
+        let md = hover_markdown_value(&h);
+        assert!(md.contains("more lines)"), "long property should be elided: {md}");
+        assert!(!md.contains("final_clause"), "elided tail should be dropped: {md}");
     }
 
     /// Bare non-callable symbol (class) → fenced declaration line.
