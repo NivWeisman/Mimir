@@ -39,6 +39,7 @@ mod project;
 mod references_features;
 mod slang_adapter;
 mod slang_service;
+mod source_io;
 mod syntax_service;
 mod uvm_db_features;
 mod workspace_index;
@@ -50,6 +51,11 @@ mod workspace_symbols;
 /// spawn fails, the server falls back to tree-sitter-only mode and logs
 /// the reason so the user knows why deeper diagnostics are quiet.
 pub const SLANG_PATH_ENV: &str = "MIMIR_SLANG_PATH";
+
+/// Environment variable that enables fault-injection requests used by the
+/// integration tests (currently just `mimir/debug/panic`). Never set it in
+/// an editor configuration.
+pub const DEBUG_HOOKS_ENV: &str = "MIMIR_DEBUG_HOOKS";
 
 #[tokio::main]
 async fn main() {
@@ -64,6 +70,18 @@ async fn main() {
     // the editor's perspective, making crashes very hard to diagnose.
     // `RUST_BACKTRACE=1` (or "full") must be set for the backtrace to be
     // populated; editors can set it via their server-env configuration.
+    //
+    // The hook also *ends the process* when the panic is on the main thread.
+    // Every LSP handler is polled there (it is the thread inside
+    // `block_on`), so a panic on it means the request loop is gone. Left to
+    // unwind, the runtime's shutdown then waits for its blocking-pool
+    // threads — one of which is parked in a `read` on stdin — and the
+    // process lingers indefinitely: no responses, no exit, sidecar children
+    // still running, and the editor never sees the "server died" event that
+    // makes it restart us. Exiting is the recovery path.
+    //
+    // Panics on other threads (background tasks — tokio contains those to
+    // the task) are only logged.
     std::panic::set_hook(Box::new(|info| {
         let backtrace = std::backtrace::Backtrace::capture();
         tracing::error!(
@@ -72,6 +90,11 @@ async fn main() {
             "mimir-server panicked — please report this at \
              https://github.com/nvweisman/mimir/issues",
         );
+        if panic_is_fatal(std::thread::current().name()) {
+            // 101 is what an unwinding Rust `main` exits with. stderr is
+            // unbuffered, so the log line above is already out.
+            std::process::exit(101);
+        }
     }));
 
     tracing::info!(
@@ -105,10 +128,18 @@ async fn main() {
     let (service, socket) = LspService::build(move |client| backend::Backend::new(client, slang))
         .custom_method("mimir/expandMacro", backend::Backend::expand_macro)
         .custom_method("mimir/uvmDb", backend::Backend::uvm_db)
+        .custom_method("mimir/debug/panic", backend::Backend::debug_panic)
         .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 
     tracing::info!("mimir-server shutting down");
+}
+
+/// Whether a panic on the thread named `thread_name` takes the LSP request
+/// loop down with it (see the panic hook in [`main`]): true for the main
+/// thread, false for runtime worker / blocking-pool threads.
+fn panic_is_fatal(thread_name: Option<&str>) -> bool {
+    thread_name == Some("main")
 }
 
 /// Read [`SLANG_PATH_ENV`] and spawn the sidecar if set. Logs at info on
@@ -136,5 +167,19 @@ async fn spawn_slang_if_configured() -> Option<Arc<mimir_slang::Client>> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a main-thread panic ends the process; background-task panics on
+    /// runtime threads are survivable and merely logged.
+    #[test]
+    fn only_main_thread_panics_are_fatal() {
+        assert!(panic_is_fatal(Some("main")));
+        assert!(!panic_is_fatal(Some("tokio-runtime-worker")));
+        assert!(!panic_is_fatal(None));
     }
 }

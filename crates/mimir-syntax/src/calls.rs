@@ -38,6 +38,7 @@ use tracing::debug;
 use tree_sitter::Node;
 
 use crate::symbols::{node_range, SymbolKind};
+use crate::walk::Walk;
 use crate::SyntaxTree;
 
 // --------------------------------------------------------------------------
@@ -106,9 +107,10 @@ pub fn call_site_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> Option<Cal
     let root = tree.tree.root_node();
     let leaf = root.descendant_for_byte_range(byte, byte)?;
 
-    // Walk up from the leaf; pick the innermost call-site ancestor.
-    let mut cur = Some(leaf);
-    while let Some(n) = cur {
+    // Walk up from the leaf; pick the innermost call-site ancestor. The
+    // chain comes from one descent (`walk::self_and_ancestors`) rather than
+    // repeated `parent()` calls, each of which re-walks from the root.
+    for n in crate::walk::self_and_ancestors(root, leaf) {
         if let Some(site) = call_site_from_node(n, tree.source(), rope) {
             // Verify the cursor is inside the call (name or args).
             let call_start = n.start_byte();
@@ -118,7 +120,6 @@ pub fn call_site_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> Option<Cal
                 return Some(site);
             }
         }
-        cur = n.parent();
     }
     None
 }
@@ -126,8 +127,10 @@ pub fn call_site_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> Option<Cal
 /// Return the 0-based index of the argument the cursor is currently inside.
 ///
 /// Counts top-level commas between the opening `(` and `pos`, ignoring commas
-/// inside nested parentheses, brackets, or braces. Returns `0` when the cursor
-/// is before or at the first argument.
+/// inside nested parentheses, brackets, or braces, and commas inside string
+/// literals (`"a, b"` is one argument). Returns `0` when the cursor is before
+/// or at the first argument, and for calls that have no argument list at all
+/// (`my_task;` — there is no `(` to count from).
 #[must_use]
 pub fn active_arg_index(call: &CallSite, rope: &Rope, pos: Position) -> usize {
     let Ok(pos_byte) = pos.to_byte_offset(rope) else {
@@ -137,21 +140,45 @@ pub fn active_arg_index(call: &CallSite, rope: &Rope, pos: Position) -> usize {
         return 0;
     };
 
-    if pos_byte <= open_byte {
+    if pos_byte <= open_byte || open_byte >= rope.len_bytes() {
+        return 0;
+    }
+    // `paren_open` is only a real paren when the call has an argument list;
+    // a paren-less call carries a placeholder position. Counting commas from
+    // a placeholder yields garbage (and `open_byte + 1` may not even be a
+    // char boundary), so insist on an actual `(` before scanning.
+    if rope.byte(open_byte) != b'(' {
         return 0;
     }
 
-    let start = open_byte + 1; // skip the '('
+    let start = open_byte + 1; // skip the '(' — one byte, so still a boundary
     let end = pos_byte.min(rope.len_bytes());
     if start >= end {
         return 0;
     }
+    let Some(slice) = rope.get_byte_slice(start..end) else {
+        return 0;
+    };
 
-    let slice = rope.byte_slice(start..end);
     let mut depth: usize = 0;
     let mut count: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
     for ch in slice.chars() {
+        if in_string {
+            // Inside a string literal nothing is structural; just find the
+            // closing quote, honouring backslash escapes.
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => count += 1,
@@ -483,30 +510,30 @@ fn call_site_from_macro_usage(node: Node<'_>, source: &str, rope: &Rope) -> Opti
 // --------------------------------------------------------------------------
 
 fn collect_call_sites(
-    node: Node<'_>,
+    root: Node<'_>,
     source: &str,
     rope: &Rope,
     start_byte: usize,
     end_byte: usize,
     out: &mut Vec<CallSite>,
 ) {
-    // Prune nodes that don't overlap the target range at all.
-    if node.end_byte() < start_byte || node.start_byte() > end_byte {
-        return;
-    }
-
-    if let Some(site) = call_site_from_node(node, source, rope) {
-        out.push(site);
-        // Don't descend: the children of a call node are its arguments
-        // and the callee name — those are part of this call, not nested calls.
-        // Actually, arguments CAN contain nested calls; we do want to descend
-        // into argument expressions. But not into the same node again.
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_call_sites(child, source, rope, start_byte, end_byte, out);
-    }
+    // Iterative walk (see `crate::walk`) — call arguments are arbitrary
+    // expressions, so the nesting depth is unbounded.
+    crate::walk::preorder(root, |node| {
+        if !node.is_named() {
+            return Walk::Skip;
+        }
+        // Prune nodes that don't overlap the target range at all.
+        if node.end_byte() < start_byte || node.start_byte() > end_byte {
+            return Walk::Skip;
+        }
+        if let Some(site) = call_site_from_node(node, source, rope) {
+            out.push(site);
+        }
+        // Keep descending even below a call: its arguments can contain
+        // nested calls.
+        Walk::Descend
+    });
 }
 
 // --------------------------------------------------------------------------
@@ -599,45 +626,28 @@ fn named_children_as_arg_spans(list: Node<'_>, rope: &Rope) -> Vec<ArgSpan> {
 /// Used to get just the function name from a `hierarchical_identifier` chain
 /// like `pkg.class.method`.
 fn last_identifier_in(node: Node<'_>, source: &str, rope: &Rope) -> Option<(String, Range)> {
-    let mut last_range: Option<(String, Range)> = None;
-    collect_simple_ids(node, source, rope, &mut last_range);
-    last_range
-}
-
-fn collect_simple_ids(
-    node: Node<'_>,
-    source: &str,
-    rope: &Rope,
-    last: &mut Option<(String, Range)>,
-) {
-    if node.kind() == "simple_identifier" {
-        if let Ok(text) = node.utf8_text(source.as_bytes()) {
-            *last = Some((text.to_owned(), node_range(node, rope)));
-        }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_simple_ids(child, source, rope, last);
-    }
+    let last = last_simple_id_node(node)?;
+    let text = last.utf8_text(source.as_bytes()).ok()?;
+    Some((text.to_owned(), node_range(last, rope)))
 }
 
 /// Get the text of the last `simple_identifier` inside `node`, or `None`.
 fn last_simple_id_text<'s>(node: Node<'_>, source: &'s str) -> Option<&'s str> {
-    let mut last: Option<std::ops::Range<usize>> = None;
-    collect_simple_id_ranges(node, &mut last);
-    last.and_then(|r| source.get(r))
+    source.get(last_simple_id_node(node)?.byte_range())
 }
 
-fn collect_simple_id_ranges(node: Node<'_>, last: &mut Option<std::ops::Range<usize>>) {
-    if node.kind() == "simple_identifier" {
-        *last = Some(node.byte_range());
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_simple_id_ranges(child, last);
-    }
+/// The last `simple_identifier` (in document order) in `node`'s subtree,
+/// `node` itself included.
+fn last_simple_id_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut last = None;
+    crate::walk::preorder(node, |n| {
+        if n.kind() == "simple_identifier" {
+            last = Some(n);
+            return Walk::Skip;
+        }
+        Walk::Descend
+    });
+    last
 }
 
 /// Find the byte offset of the `(` anonymous token before `ref_byte` in the
@@ -708,8 +718,7 @@ pub fn find_enclosing_callable(
     let root = tree.tree.root_node();
     let leaf = root.descendant_for_byte_range(byte, byte)?;
 
-    let mut cur = Some(leaf);
-    while let Some(node) = cur {
+    for node in crate::walk::self_and_ancestors(root, leaf) {
         match node.kind() {
             "function_body_declaration" | "function_prototype" => {
                 let name_node = node.child_by_field_name("name")?;
@@ -741,7 +750,6 @@ pub fn find_enclosing_callable(
             }
             _ => {}
         }
-        cur = node.parent();
     }
     None
 }

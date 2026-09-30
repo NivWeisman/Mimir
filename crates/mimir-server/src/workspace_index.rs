@@ -114,6 +114,16 @@ impl WorkspaceState {
         self.per_url_names.insert(url, names);
     }
 
+    /// Forget everything known about `url`: its declarations, its cached
+    /// parse tree, and its identifier-presence entries. Used when a file is
+    /// deleted, or a buffer with no file behind it is closed.
+    pub fn evict(&mut self, url: &Url) {
+        self.index.update(url.clone(), &[]);
+        self.trees.remove(url);
+        self.update_presence(url.clone(), HashSet::new());
+        self.per_url_names.remove(url);
+    }
+
     /// Return the set of URLs that contain `name` as any identifier token,
     /// or `None` if `name` has never been seen in any indexed file.
     ///

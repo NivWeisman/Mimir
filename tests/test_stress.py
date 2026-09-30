@@ -63,7 +63,14 @@ _OP_NAMES  = [n for n, _ in _OPS]
 _OP_WEIGHTS = [w for _, w in _OPS]
 
 
-@unittest.skip("run manually: MIMIR_STRESS_DURATION=120 python3 -m unittest tests.test_stress -v")
+# Opt-in: the run takes as long as `MIMIR_STRESS_DURATION` says, so it only
+# runs when that variable is set — which is exactly how the pre-commit
+# protocol invokes it. (It used to be skipped unconditionally, so the
+# documented command ran nothing.)
+@unittest.skipUnless(
+    os.environ.get("MIMIR_STRESS_DURATION"),
+    "run manually: MIMIR_STRESS_DURATION=120 python3 -m unittest tests.test_stress -v",
+)
 class StressTest(unittest.TestCase):
     """Drive the LSP server for several minutes with random mixed workloads."""
 

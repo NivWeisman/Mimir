@@ -218,6 +218,17 @@ where
     /// buffer into its future and loses the partial bytes on cancellation,
     /// which would corrupt the framing undetectably.
     line_buf: Vec<u8>,
+    /// The encoded request line currently (or most recently) being written,
+    /// and how much of it has reached the writer. Kept on the connection
+    /// rather than in the `request` future for the same reason as
+    /// `line_buf`: a request cancelled *mid-write* (deadline, debounce
+    /// abort) must leave enough state behind for the next caller to finish
+    /// the line. Abandoning a half-written line would splice the next
+    /// request onto it and hand the sidecar one unparseable line — to which
+    /// it replies nothing, stalling the connection until a deadline fires.
+    out_buf: Vec<u8>,
+    /// Bytes of `out_buf` already accepted by the writer.
+    out_pos: usize,
 }
 
 impl<R, W> Connection<R, W>
@@ -233,6 +244,8 @@ where
             writer,
             next_id: 1,
             line_buf: Vec::new(),
+            out_buf: Vec::new(),
+            out_pos: 0,
         }
     }
 
@@ -248,7 +261,30 @@ where
             writer,
             next_id,
             line_buf: Vec::new(),
+            out_buf: Vec::new(),
+            out_pos: 0,
         }
+    }
+
+    /// Write whatever is left of `out_buf` and flush.
+    ///
+    /// Cancellation-safe: progress lives in `self.out_pos`, and each
+    /// [`AsyncWriteExt::write`] either completes (and is recorded before the
+    /// next `await`) or, if the future is dropped first, is guaranteed to
+    /// have written nothing. Calling this again after a cancellation resumes
+    /// exactly where the interrupted call stopped.
+    async fn finish_pending_write(&mut self) -> std::io::Result<()> {
+        while self.out_pos < self.out_buf.len() {
+            let n = self.writer.write(&self.out_buf[self.out_pos..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "sidecar stdin accepted zero bytes",
+                ));
+            }
+            self.out_pos += n;
+        }
+        self.writer.flush().await
     }
 
     /// Send a request and wait for its matching response.
@@ -270,6 +306,20 @@ where
         // line and discard it. A line that is already complete is the
         // previous (processed or stale) response — discard without touching
         // the reader.
+        //
+        // Same story on the write side: a request cancelled while its bytes
+        // were still going out left a partial line in the sidecar's stdin.
+        // Complete it first so the sidecar only ever sees whole lines; the
+        // response it eventually produces for that abandoned request carries
+        // an older id and is drained by the stale-response loop below.
+        if self.out_pos < self.out_buf.len() {
+            debug!(
+                remaining = self.out_buf.len() - self.out_pos,
+                "completing a request line interrupted mid-write",
+            );
+            self.finish_pending_write().await?;
+        }
+
         if !self.line_buf.is_empty() {
             if self.line_buf.last() != Some(&b'\n') {
                 self.reader.read_until(b'\n', &mut self.line_buf).await?;
@@ -304,8 +354,11 @@ where
         debug!(bytes = line.len(), "sending request");
         {
             mimir_core::time_scope!("slang.ipc.write_to_sidecar");
-            self.writer.write_all(line.as_bytes()).await?;
-            self.writer.flush().await?;
+            // Stage the line on the connection before the first `await` so
+            // a cancellation can't lose track of how much was sent.
+            self.out_buf = line.into_bytes();
+            self.out_pos = 0;
+            self.finish_pending_write().await?;
         }
 
         // Read lines until we find the response for `id`.
@@ -1265,6 +1318,83 @@ mod tests {
             .await;
         sidecar.await.unwrap();
         assert!(second.is_ok(), "expected resync + success, got {second:?}");
+    }
+
+    /// Regression: a request cancelled *while its bytes were still being
+    /// written* (debounce abort or deadline on a multi-megabyte `compile`)
+    /// used to leave half a JSON line in the sidecar's stdin. The next
+    /// request's line was appended straight onto it, the sidecar saw one
+    /// unparseable line, answered nothing, and the client sat on the
+    /// connection until the 300 s compile deadline.
+    ///
+    /// The connection must finish flushing an interrupted request before it
+    /// sends the next one, so the sidecar only ever sees whole lines.
+    #[tokio::test]
+    async fn regression_request_cancelled_mid_write_does_not_corrupt_framing() {
+        // A tiny client→sidecar pipe: the large first request can't fit, so
+        // its write is still in flight when the deadline cancels it.
+        let (client_to_sidecar_w, client_to_sidecar_r) = duplex(64);
+        let (mut sidecar_to_client_w, sidecar_to_client_r) = duplex(64 * 1024);
+        let mut conn = Connection::new(BufReader::new(sidecar_to_client_r), client_to_sidecar_w);
+
+        let big = serde_json::json!({ "files": [], "padding": "x".repeat(16 * 1024) });
+        let first = conn
+            .request_with_deadline::<_, CompileResult>(
+                methods::COMPILE,
+                &big,
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            matches!(first, Err(ConnectionError::Timeout { .. })),
+            "nobody is reading, so the first request must time out mid-write; got {first:?}",
+        );
+
+        // Only now does the "sidecar" start reading. It behaves like the
+        // real one: a line that isn't valid JSON gets no reply at all.
+        let sidecar = tokio::spawn(async move {
+            let mut s_r = BufReader::new(client_to_sidecar_r);
+            let mut bad_lines = 0usize;
+            let mut seen_ids: Vec<u64> = Vec::new();
+            loop {
+                let mut line = String::new();
+                if s_r.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let Ok(req) = serde_json::from_str::<Request>(&line) else {
+                    bad_lines += 1;
+                    continue;
+                };
+                seen_ids.push(req.id);
+                let resp = Response {
+                    id: req.id,
+                    result: Some(serde_json::json!({"ast": {"files": []}, "diagnostics": []})),
+                    error: None,
+                };
+                let mut out = serde_json::to_string(&resp).unwrap();
+                out.push('\n');
+                sidecar_to_client_w.write_all(out.as_bytes()).await.unwrap();
+            }
+            (bad_lines, seen_ids)
+        });
+
+        let small = serde_json::json!({ "files": [] });
+        let second = conn
+            .request_with_deadline::<_, CompileResult>(
+                methods::COMPILE,
+                &small,
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            second.is_ok(),
+            "the request after a mid-write cancellation must still succeed, got {second:?}",
+        );
+
+        drop(conn); // closes the pipe so the fake sidecar's loop ends
+        let (bad_lines, seen_ids) = sidecar.await.unwrap();
+        assert_eq!(bad_lines, 0, "sidecar received a corrupted (spliced) request line");
+        assert_eq!(seen_ids, vec![1, 2], "both requests must arrive whole and in order");
     }
 
     /// One canned `ExpandMacroParams` for the negotiation tests.

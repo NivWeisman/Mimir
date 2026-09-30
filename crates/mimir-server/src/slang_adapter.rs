@@ -84,7 +84,7 @@ fn slang_diag_to_mimir(d: SlangDiag) -> (String, MimirDiag) {
 /// in [`crate::elaborate_service::ElaborateService`].
 pub(crate) struct SlangAdapter {
     slang: Arc<SlangService>,
-    cached_ast: Arc<RwLock<Option<Arc<MimirAst>>>>,
+    cached_ast: Arc<RwLock<Option<CachedAst>>>,
     /// Per-document cache of recent macro expansions, keyed by URL. Unlike the
     /// AST cache this is *not* wiped on every edit: entries from older document
     /// versions are retained (up to [`MAX_EXPANSIONS_PER_DOC`]) so a hover
@@ -92,6 +92,18 @@ pub(crate) struct SlangAdapter {
     /// expansion. Lets the hover footer and the panel command share a single
     /// preprocessor run when both land on the same macro usage.
     expansion_cache: Arc<RwLock<HashMap<Url, CachedExpansions>>>,
+}
+
+/// The AST from the last successful compile, plus the state of the open
+/// buffers it was compiled from.
+struct CachedAst {
+    /// The elaborated symbol table + reference map.
+    ast: Arc<MimirAst>,
+    /// `DocumentState::revision` of each open document whose text went into
+    /// the compile. Every position in `ast` for such a document is in the
+    /// coordinates of *that* revision; once the document moves on, those
+    /// coordinates point at different text.
+    revisions: HashMap<Url, u64>,
 }
 
 /// Max expansions retained per document. Bounds memory while keeping enough
@@ -150,6 +162,7 @@ impl SlangAdapter {
         &self,
         params: &ElaborateParams,
         files_in_request: Vec<Url>,
+        open_revisions: HashMap<Url, u64>,
     ) -> Option<CompileOutcome> {
         mimir_core::time_scope!("slang.compile.adapter_total");
         let compile_result = {
@@ -160,7 +173,10 @@ impl SlangAdapter {
             Ok(result) => {
                 {
                     mimir_core::time_scope!("slang.compile.adapter.cache_ast_write");
-                    *self.cached_ast.write().await = Some(Arc::new(result.ast));
+                    *self.cached_ast.write().await = Some(CachedAst {
+                        ast: Arc::new(result.ast),
+                        revisions: open_revisions,
+                    });
                 }
                 mimir_core::time_scope!("slang.compile.adapter.diag_walk");
 
@@ -381,8 +397,49 @@ impl SlangAdapter {
     ///
     /// Returns `None` if no compile has completed yet (e.g. on startup before
     /// the first background elaboration fires).
+    ///
+    /// This is the AST regardless of how far the open buffers have moved on
+    /// since the compile. Use it only for lookups that don't depend on
+    /// source positions (name-keyed completion, inheritance). Anything that
+    /// maps a cursor position into the AST must use [`Self::fresh_ast`].
     pub(crate) async fn cached_ast(&self) -> Option<Arc<MimirAst>> {
-        self.cached_ast.read().await.clone()
+        self.cached_ast.read().await.as_ref().map(|c| c.ast.clone())
+    }
+
+    /// Return the cached [`MimirAst`] only while the open document `uri` —
+    /// currently at `revision` — is still the text that AST was compiled
+    /// from.
+    ///
+    /// The AST's reference map and declaration ranges are positions in the
+    /// *compiled* text. After an edit they describe a document that no
+    /// longer exists until the debounced re-compile lands; a position-keyed
+    /// lookup in that window answers for whatever used to be at those
+    /// coordinates. Returning `None` sends the caller down its tree-sitter
+    /// fallback, which always tracks the live buffer.
+    ///
+    /// A document the compile never saw as an open buffer (it was opened
+    /// afterwards) was compiled from disk, which is what a freshly opened
+    /// buffer holds — so it counts as fresh until its first edit
+    /// (`revision == 0`).
+    pub(crate) async fn fresh_ast(&self, uri: &Url, revision: u64) -> Option<Arc<MimirAst>> {
+        let guard = self.cached_ast.read().await;
+        let cached = guard.as_ref()?;
+        let compiled = cached.revisions.get(uri).copied().unwrap_or(0);
+        (compiled == revision).then(|| cached.ast.clone())
+    }
+
+    /// Record that the cached AST is (still) valid for the open documents at
+    /// `revisions`.
+    ///
+    /// Called when an elaborate round finds its inputs byte-identical to the
+    /// last compile and skips the sidecar: the AST is unchanged, but buffer
+    /// revisions may not be (type a character and delete it; close and
+    /// reopen a file). Without this the AST would stay "stale" for those
+    /// documents until the next real compile.
+    pub(crate) async fn confirm_revisions(&self, revisions: HashMap<Url, u64>) {
+        if let Some(cached) = self.cached_ast.write().await.as_mut() {
+            cached.revisions = revisions;
+        }
     }
 
     /// Discard the cached AST.
@@ -403,6 +460,22 @@ impl SlangAdapter {
         if self.expansion_cache.write().await.remove(uri).is_some() {
             debug!(uri = %uri, "expansion cache: evicted closed document");
         }
+    }
+}
+
+#[cfg(test)]
+impl SlangAdapter {
+    /// Test hook: install `ast` as if a compile had just produced it from
+    /// the open documents at `revisions`.
+    pub(crate) async fn set_cached_ast_for_test(
+        &self,
+        ast: MimirAst,
+        revisions: HashMap<Url, u64>,
+    ) {
+        *self.cached_ast.write().await = Some(CachedAst {
+            ast: Arc::new(ast),
+            revisions,
+        });
     }
 }
 

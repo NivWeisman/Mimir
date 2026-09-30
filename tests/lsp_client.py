@@ -24,7 +24,34 @@ from typing import Any
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-DEFAULT_BINARY = REPO_ROOT / "target" / "release" / "mimir-server"
+# `MIMIR_SERVER_BIN` points the whole suite at a different build — e.g. a
+# debug binary, or an older release when bisecting a regression.
+DEFAULT_BINARY = pathlib.Path(
+    os.environ.get("MIMIR_SERVER_BIN")
+    or REPO_ROOT / "target" / "release" / "mimir-server"
+)
+
+
+# Logged (at info level) by the server each time a workspace-index pass
+# completes — see `hydrate_workspace_index` in `backend.rs`.
+INDEX_HYDRATED_MARKER = "workspace index hydrated"
+
+# How far up the server walks looking for `.mimir.toml` (`DISCOVER_MAX_PARENTS`
+# in `project.rs`).
+_DISCOVER_MAX_PARENTS = 8
+
+
+def _has_project_config(workspace_root: pathlib.Path | str) -> bool:
+    """True when the server will find a ``.mimir.toml`` for this workspace
+    (and therefore run an indexing pass at startup)."""
+    current = pathlib.Path(workspace_root).resolve()
+    for _ in range(_DISCOVER_MAX_PARENTS):
+        if (current / ".mimir.toml").is_file():
+            return True
+        if current.parent == current:
+            break
+        current = current.parent
+    return False
 
 
 class LspError(RuntimeError):
@@ -102,7 +129,14 @@ class MimirLspClient:
         self,
         workspace_root: pathlib.Path | str | None = None,
     ) -> dict[str, Any]:
-        """Run the LSP `initialize` + `initialized` handshake."""
+        """Run the LSP `initialize` + `initialized` handshake.
+
+        When the workspace has a ``.mimir.toml`` the server starts indexing
+        the project's files in the background and answers requests while it
+        does. Tests of cross-file features (workspace symbols, cross-file
+        definition / completion, …) must call :meth:`wait_for_index` before
+        asserting, or they race that pass.
+        """
         params: dict[str, Any] = {
             "processId": os.getpid(),
             "rootUri": _path_to_uri(workspace_root) if workspace_root else None,
@@ -117,7 +151,20 @@ class MimirLspClient:
             ]
         result = self.request("initialize", params)
         self.notify("initialized", {})
+        self._expects_index = bool(workspace_root) and _has_project_config(workspace_root)
         return result
+
+    def wait_for_index(self, timeout: float = 120.0) -> bool:
+        """Block until the startup workspace-index pass has finished.
+
+        A no-op (returns ``True``) when the workspace has no ``.mimir.toml``
+        — there is no index pass to wait for. Returns ``False`` on timeout,
+        e.g. when ``RUST_LOG`` filters out the server's info-level log; the
+        caller carries on with an index that may still be warming up.
+        """
+        if not getattr(self, "_expects_index", False):
+            return True
+        return self.wait_for_log(INDEX_HYDRATED_MARKER, timeout=timeout)
 
     def did_open(
         self,

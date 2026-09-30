@@ -393,9 +393,16 @@ Every commercial simulator (VCS, Xcelium, Questa) and Verilator reads it,
 so most projects already have one. Mimir parses the same dialect.
 
 Whitespace-separated tokens. `\` followed by newline continues a line.
-`//` and `#` start line comments. `${VAR}` interpolates from the `[env]`
-table first, then the process environment — unknown variables expand to
-empty (matches `make` / most simulators).
+`//` and `#` start line comments when they begin a token — inside a token
+they are part of it, so a path like `rtl//core/top.sv` is kept whole.
+`${VAR}` interpolates from the `[env]` table first, then the process
+environment — unknown variables expand to empty (matches `make` / most
+simulators).
+
+Every resolved path is normalised (`.` removed, `..` resolved against the
+preceding component), so `../rtl/dut.sv` in a filelist and the same file
+opened in the editor are recognised as one file: unsaved edits reach
+elaboration and diagnostics land on the editor's buffer.
 
 | Token                            | Meaning                                                 |
 | -------------------------------- | ------------------------------------------------------- |
@@ -549,7 +556,7 @@ For hacking on Mimir itself (not just installing it):
 
 ```bash
 cargo build  --workspace                    # debug build of all crates
-cargo test   --workspace                    # run all unit tests (436 today)
+cargo test   --workspace                    # run all unit tests (676 today)
 cargo clippy --workspace --all-targets -- -D warnings   # lint (incl. tests) with warnings as errors
 cargo fmt    --all                          # format
 make integration                            # python LSP integration tests (builds release binary first)
@@ -567,10 +574,27 @@ runs `python3 -m unittest discover` on every `test_*.py` file. Tests cover:
 - `test_interfaces.py` — interface and modport features
 - `test_elaborate_cache.py` — input-hash dedup logic
 - `test_hierarchy.py` — `callHierarchy/*` and `typeHierarchy/*` (hermetic, no example repo)
+- `test_regressions.py` — **the regression suite**: one end-to-end test per
+  bug that was found (crashes, hangs, wrong answers), each reproducing the
+  original failure through real LSP traffic. Hermetic — it builds throw-away
+  workspaces and uses `tests/fake_sidecar.py` / `tests/fake_formatter.py` in
+  place of slang and Verible, so it runs on a bare checkout.
+- `test_sidecar_robustness.py` — inputs that used to kill the slang sidecar,
+  sent to it directly over NDJSON (skipped when the sidecar isn't built)
+
+Unit-level regressions sit next to the code they guard, as tests named
+`regression_*` (`cargo test --workspace regression_` runs just those);
+`crates/mimir-syntax/tests/regressions.rs` collects the parser-side ones.
+**When you fix a bug, add its reproduction to one of these first** — watch
+it fail, then fix.
+
+Set `MIMIR_SERVER_BIN=/path/to/mimir-server` to point the Python suite at a
+different build (a debug binary, or an older release when bisecting).
 
 A randomised long-running stress test (`test_stress.py`) simulates extended
-editing sessions against three large riscv-dv files. Run it manually (not
-part of `make integration`):
+editing sessions against three large riscv-dv files. It is opt-in — it only
+runs when `MIMIR_STRESS_DURATION` is set (so a plain `make integration`
+skips it):
 
 ```bash
 cargo build --release -p mimir-server
@@ -649,6 +673,16 @@ silently on the OS console). Enable backtraces:
 Every `#[instrument]`-decorated handler emits an "enter" breadcrumb at
 `debug` level, so the last line of the log before a crash identifies the
 exact handler that triggered it.
+
+A panic in a request handler **terminates the server** (exit code 101)
+right after it is logged. That is deliberate: a process that survives the
+panic can neither answer requests nor exit on its own, and the editor only
+restarts a language server it sees die. Panics in background tasks
+(indexing, elaboration) are logged and contained to that task.
+
+For testing that behaviour there is a fault-injection request,
+`mimir/debug/panic`. It is inert unless the server was started with
+`MIMIR_DEBUG_HOOKS` set — never set that in an editor configuration.
 
 ### Per-scope wall-clock timing (finding bottlenecks)
 
@@ -794,7 +828,7 @@ Legend: ✅ implemented · 🚧 in progress · ⬜ not yet · ❌ won't do
 
 ### Refactoring
 
-- ✅ `textDocument/rename` + `textDocument/prepareRename` — workspace-wide rename using the same reference engine as `textDocument/references` (scope-aware within a file, workspace-wide across open buffers and filelist-hydrated files). `prepareRename` validates the cursor is on an identifier and returns its span so the editor can pre-fill the input box. One `TextEdit` per occurrence per file, returned as a `WorkspaceEdit`. v1 limitations: tree-sitter only — no slang-backed scope/type-aware resolution (`pkg_a::foo` and `pkg_b::foo` are conflated by name); no hierarchical-name support; capped at 1 000 occurrences matching the `references` limit.
+- ✅ `textDocument/rename` + `textDocument/prepareRename` — workspace-wide rename using the same reference engine as `textDocument/references` (scope-aware within a file, workspace-wide across open buffers and filelist-hydrated files). A name bound inside a function, task, `begin…end` block, loop, or procedure — a local, a formal argument, a loop variable — is renamed **only in its own file**: nothing outside can refer to it, so same-named symbols elsewhere are left alone. `prepareRename` validates the cursor is on an identifier and returns its span so the editor can pre-fill the input box. One `TextEdit` per occurrence per file, returned as a `WorkspaceEdit`. v1 limitations: tree-sitter only — no slang-backed scope/type-aware resolution (`pkg_a::foo` and `pkg_b::foo` are conflated by name); no hierarchical-name support; capped at 1 000 occurrences matching the `references` limit.
 - ⬜ `textDocument/codeAction` (quick-fixes)
 - ✅ `textDocument/formatting` — whole-file via `verible-verilog-format` (see [docs/formatter.md](docs/formatter.md))
 - ✅ `textDocument/rangeFormatting` — selection snapped to whole lines, same backend

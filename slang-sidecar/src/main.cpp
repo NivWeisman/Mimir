@@ -28,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1891,15 +1892,31 @@ int main() {
             continue;
         }
 
+        // Everything that touches the request — including reading its `id`
+        // and `method` — happens inside the try-block. nlohmann's accessors
+        // throw on a type mismatch (`[1,2,3]` is valid JSON but has no
+        // members; `"id": "x"` isn't a number), and an exception that
+        // escapes this loop is `std::terminate`: the sidecar dies and takes
+        // every slang-backed editor feature with it.
         json resp;
-        resp["id"] = req.value("id", static_cast<uint64_t>(0));
-
-        const auto method = req.value("method", std::string{});
+        resp["id"] = static_cast<uint64_t>(0);
+        std::string method;
+        bool shutdown_requested = false;
         try {
+            if (!req.is_object()) {
+                throw std::invalid_argument("request is not a JSON object");
+            }
+            resp["id"] = req.value("id", static_cast<uint64_t>(0));
+            method = req.value("method", std::string{});
+            json params = req.contains("params") ? req["params"] : json::object();
+            if (!params.is_object()) {
+                throw std::invalid_argument("`params` must be a JSON object");
+            }
+
             if (method == "compile") {
-                resp["result"] = handle_compile(req.value("params", json::object()));
+                resp["result"] = handle_compile(params);
             } else if (method == "expandMacro") {
-                json r = handle_expand_macro(req.value("params", json::object()));
+                json r = handle_expand_macro(params);
                 if (r.is_object() && r.contains("__expand_cache_stale")) {
                     // Slim request against a stale cache: the client retries
                     // once with full file payloads on this exact code.
@@ -1911,12 +1928,11 @@ int main() {
                     resp["result"] = std::move(r);
                 }
             } else if (method == "shutdown") {
-                // Acknowledge, flush, exit. Keeps the client from seeing
-                // a "Closed" before its shutdown response lands.
+                // Acknowledge, flush, exit (below, after the reply is sent).
+                // Keeps the client from seeing a "Closed" before its
+                // shutdown response lands.
                 resp["result"] = nullptr;
-                std::cout << resp.dump() << '\n';
-                std::cout.flush();
-                return 0;
+                shutdown_requested = true;
             } else {
                 resp["error"] = {
                     {"code", -32601},
@@ -1928,6 +1944,7 @@ int main() {
             // assertion) becomes an error reply rather than a sidecar
             // crash. Keeping the process alive lets the editor recover
             // by sending the next edit.
+            resp.erase("result");
             resp["error"] = {
                 {"code", -1},
                 {"message", std::string{"sidecar exception: "} + e.what()},
@@ -1940,7 +1957,13 @@ int main() {
         // serialises slowly (allocation-heavy on deep AST trees).
         const bool tm_dump = timing_enabled() && method == "compile";
         Stopwatch sw_dump;
-        std::string dumped = resp.dump();
+        // `error_handler_t::replace`: strings in the reply can carry bytes
+        // that aren't valid UTF-8 — slang reads `` `include ``d headers from
+        // disk verbatim, and Latin-1 in a comment, string, or macro body
+        // flows straight into expansion text and diagnostic messages. The
+        // default handler *throws* on such a byte; with `replace` it becomes
+        // U+FFFD and the reply is still well-formed JSON.
+        std::string dumped = resp.dump(-1, ' ', false, json::error_handler_t::replace);
         if (tm_dump) {
             int64_t ms = sw_dump.lap();
             std::cerr << "[mimir-slang-sidecar] timing json_dump=" << ms
@@ -1948,6 +1971,9 @@ int main() {
         }
         std::cout << dumped << '\n';
         std::cout.flush();
+        if (shutdown_requested) {
+            return 0;
+        }
     }
 
     return 0;

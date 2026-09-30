@@ -56,12 +56,19 @@ APB_SV = APB_DIR / "apb.sv"
 # headroom against scheduler jitter without making the suite painful.
 DEBOUNCE_WAIT_S = 1.0
 
-# Marker strings emitted by `schedule_elaborate` in
-# crates/mimir-server/src/backend.rs. Tests grep stderr for them.
-LOG_INDEXED = "indexed by startup slang elaborate"
-LOG_CACHE_HIT = "slang inputs unchanged since last elaborate; skipping"
-LOG_SENDING = "sending elaborate request"
+# Marker strings emitted by `ElaborateService::schedule` in
+# crates/mimir-server/src/elaborate_service.rs. Tests grep stderr for them.
+# (The RPC was renamed from `elaborate` to `compile`; these strings went
+# stale at that point and the suite silently skipped itself ever since,
+# because `setUpClass` never saw its "indexed" marker. Keep them in sync
+# with `elaborate_service.rs`.)
+LOG_INDEXED = "indexed by startup slang compile"
+LOG_CACHE_HIT = "slang inputs unchanged since last compile; skipping"
+LOG_SENDING = "sending compile request"
 LOG_RECEIVED = "received response"
+# Logged once a compile's result has been fully processed and published —
+# the input-hash cache is updated immediately afterwards.
+LOG_APPLIED = "applied slang elaborate result"
 
 
 def _require_slang() -> str:
@@ -136,6 +143,21 @@ def _wait_for_log(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if needle in lsp.stderr_text:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _wait_for_count(
+    lsp: MimirLspClient, needle: str, at_least: int, timeout: float = 30.0
+) -> bool:
+    """Poll until ``needle`` has appeared at least ``at_least`` times in the
+    server's stderr. A compile's duration depends on the machine (and on
+    how much the project pulls in), so tests wait for the *event* rather
+    than sleeping a fixed time and hoping the round has finished."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if lsp.stderr_text.count(needle) >= at_least:
             return True
         time.sleep(0.05)
     return False
@@ -262,6 +284,7 @@ class ElaborateInputCacheTest(unittest.TestCase):
         time.sleep(DEBOUNCE_WAIT_S)
 
         recv_before_edit = self.lsp.stderr_text.count(LOG_RECEIVED)
+        applied_before_edit = self.lsp.stderr_text.count(LOG_APPLIED)
 
         # Apply a full-sync edit that appends a harmless comment. Using
         # the full-sync variant (no `range`) sidesteps having to compute
@@ -274,7 +297,15 @@ class ElaborateInputCacheTest(unittest.TestCase):
                 "contentChanges": [{"text": edited}],
             },
         )
-        time.sleep(DEBOUNCE_WAIT_S)
+        # Wait for that compile to be *fully* processed — not merely sent.
+        # Replaying the edit while the round is still in flight would
+        # (correctly) cancel it, and the replay would then have nothing
+        # cached to hit.
+        self.assertTrue(
+            _wait_for_count(self.lsp, LOG_APPLIED, applied_before_edit + 1),
+            "edit changed the input hash but no compile result was applied",
+        )
+        time.sleep(0.2)
 
         recv_after_edit = self.lsp.stderr_text.count(LOG_RECEIVED)
         self.assertGreater(
@@ -314,6 +345,7 @@ class ElaborateInputCacheTest(unittest.TestCase):
         # Restore the original text so the next test starts from a
         # known cache state (hash = original). The cache is single-entry,
         # so order-dependent tests need to leave it where they found it.
+        applied_before_restore = self.lsp.stderr_text.count(LOG_APPLIED)
         self.lsp.notify(
             "textDocument/didChange",
             {
@@ -321,7 +353,11 @@ class ElaborateInputCacheTest(unittest.TestCase):
                 "contentChanges": [{"text": self.text}],
             },
         )
-        time.sleep(DEBOUNCE_WAIT_S)
+        self.assertTrue(
+            _wait_for_count(self.lsp, LOG_APPLIED, applied_before_restore + 1),
+            "restoring the original text should have triggered one more compile",
+        )
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":

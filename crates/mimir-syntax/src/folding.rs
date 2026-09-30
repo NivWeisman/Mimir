@@ -24,8 +24,8 @@
 //! out — there's nothing to collapse.
 
 use tracing::trace;
-use tree_sitter::Node;
 
+use crate::walk::{self, Walk};
 use crate::SyntaxTree;
 
 /// One foldable region in the source, in LSP line coordinates.
@@ -82,28 +82,26 @@ const FOLDABLE_KINDS: &[&str] = &[
 #[must_use]
 pub fn folding_ranges(tree: &SyntaxTree) -> Vec<FoldRange> {
     let mut out = Vec::new();
-    walk(tree.tree.root_node(), &mut out);
+    // Iterative walk (see `crate::walk`). Always descends — nested foldables
+    // (a class's methods, a package's classes) need their own ranges.
+    walk::preorder(tree.tree.root_node(), |node| {
+        if !node.is_named() {
+            return Walk::Skip;
+        }
+        if FOLDABLE_KINDS.contains(&node.kind()) {
+            let start_line = node.start_position().row as u32;
+            let end_line = node.end_position().row as u32;
+            if end_line > start_line {
+                out.push(FoldRange {
+                    start_line,
+                    end_line,
+                });
+            }
+        }
+        Walk::Descend
+    });
     trace!(count = out.len(), "collected folding ranges");
     out
-}
-
-/// Recursive walker. Always descends — nested foldables (a class's methods,
-/// a package's classes) need their own ranges.
-fn walk(node: Node<'_>, out: &mut Vec<FoldRange>) {
-    if FOLDABLE_KINDS.contains(&node.kind()) {
-        let start_line = node.start_position().row as u32;
-        let end_line = node.end_position().row as u32;
-        if end_line > start_line {
-            out.push(FoldRange {
-                start_line,
-                end_line,
-            });
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk(child, out);
-    }
 }
 
 // --------------------------------------------------------------------------

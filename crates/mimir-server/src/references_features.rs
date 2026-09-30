@@ -151,6 +151,22 @@ pub(crate) fn collect_references(
         }
     }
 
+    // A name bound inside a function, task, `begin…end` block, loop or
+    // procedure is invisible to every other file. Fanning out by *name*
+    // from such a binding returns unrelated symbols that merely share it —
+    // and `rename` would then rewrite them. The cursor file's scope-aware
+    // hits above are the complete answer.
+    if mimir_syntax::symbols::is_local_binding_at(cursor_tree, cursor_rope, cursor_pos) {
+        if truncated {
+            warn!(
+                limit = REFERENCES_LIMIT,
+                name = %name,
+                "references truncated at limit",
+            );
+        }
+        return out;
+    }
+
     // 2. Other trees (open buffers + closed filelist files) — scope-pruned
     //    file-wide match. occurrences_of_scoped skips occurrences inside
     //    nested scopes that locally re-declare `name`, so a local
@@ -605,5 +621,97 @@ mod tests {
             .map(|e| e.new_text.as_str())
             .collect();
         assert!(all_new.iter().all(|&s| s == "renamed_class"));
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// Regression: renaming (or finding references to) a *function-local*
+    /// variable used to fan out across the workspace by name. Every other
+    /// file's file-scope `i` — and every declaration named `i` the workspace
+    /// index knew about — was returned too, so a rename rewrote unrelated
+    /// declarations in files the user never looked at (without touching
+    /// their uses: instant compile errors). A local binding is invisible to
+    /// other files; the operation must stay inside the cursor file.
+    #[test]
+    fn regression_local_variable_references_stay_in_the_cursor_file() {
+        let here = url("file:///a.sv");
+        let other = url("file:///b.sv");
+        let cursor_text = "\
+module a;
+  function void f();
+    int idx;
+    idx = 1;
+  endfunction
+endmodule
+";
+        // Another file with its own, unrelated `idx`: a module-level
+        // variable (indexed as a declaration) plus a file-scope use.
+        let other_text = "\
+int idx;
+module b;
+  initial $display(idx);
+endmodule
+";
+        let wi = workspace_index_from(&[(&here, cursor_text), (&other, other_text)]);
+        let locs =
+            run_references("idx", &here, cursor_text, &[(other.clone(), other_text)], &wi, true);
+
+        assert!(
+            locs.iter().all(|l| l.uri == here),
+            "a function-local `idx` must not reach into other files: {locs:#?}",
+        );
+        assert_eq!(locs.len(), 2, "declaration + the one use: {locs:#?}");
+    }
+
+    /// The same for a function *argument*, which is the everyday UVM case
+    /// (`phase` is an argument of every phase method in every component).
+    #[test]
+    fn regression_function_argument_rename_does_not_touch_other_files() {
+        let here = url("file:///a.sv");
+        let other = url("file:///b.sv");
+        let cursor_text = "\
+class a;
+  function void build(int phase);
+    phase = 1;
+  endfunction
+endclass
+";
+        let other_text = "\
+class b;
+  int phase;
+endclass
+module m;
+  b h;
+  initial h.phase = 2;
+endmodule
+";
+        let wi = workspace_index_from(&[(&here, cursor_text), (&other, other_text)]);
+        let locs =
+            run_references("phase", &here, cursor_text, &[(other.clone(), other_text)], &wi, true);
+        let edit = locations_to_workspace_edit(locs, "ph");
+        let file_edits = edit.changes.unwrap();
+        assert_eq!(
+            file_edits.keys().collect::<Vec<_>>(),
+            vec![&here],
+            "only the cursor file may be edited",
+        );
+        assert_eq!(file_edits[&here].len(), 2);
+    }
+
+    /// Guard against over-correcting: a *class member* is reachable from
+    /// other files, so its references still span the workspace.
+    #[test]
+    fn class_member_references_still_span_the_workspace() {
+        let here = url("file:///a.sv");
+        let other = url("file:///b.sv");
+        let cursor_text = "class a;\n  int cfg;\nendclass\n";
+        let other_text = "module b;\n  a h;\n  initial h.cfg = 1;\nendmodule\n";
+        let wi = workspace_index_from(&[(&here, cursor_text), (&other, other_text)]);
+        let locs =
+            run_references("cfg", &here, cursor_text, &[(other.clone(), other_text)], &wi, true);
+        assert!(locs.iter().any(|l| l.uri == other), "cross-file use must be found: {locs:#?}");
+        assert!(locs.iter().any(|l| l.uri == here));
     }
 }

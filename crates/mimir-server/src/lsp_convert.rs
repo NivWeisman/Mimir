@@ -42,60 +42,76 @@ pub(crate) fn whole_file_edit(rope: &ropey::Rope, new_text: &str) -> Vec<TextEdi
     }]
 }
 
-/// Build a [`TextEdit`] that replaces only lines `lsp_start..=lsp_end`
-/// (0-based, inclusive) in the document with the corresponding lines from
-/// `formatted_text` (the full Verible output).
+/// Build the [`TextEdit`] that turns `original` into `formatted_text` by
+/// replacing only the lines that actually differ.
 ///
-/// Used by `range_formatting` so that the returned edit is confined to the
-/// requested range — clients validate that edits don't escape the viewport.
+/// Used by `range_formatting`: Verible emits the whole file but (with
+/// `--lines`) only rewrites the requested lines, so everything outside them
+/// is a common prefix / suffix. We strip the identical leading and trailing
+/// lines and replace the block in between — whole lines, from the start of
+/// the first changed line to the start of the first unchanged line after it.
 ///
-/// Returns `None` when the two snippets are identical (no change needed).
+/// Pairing "lines s..=e of the original" with "lines s..=e of the output"
+/// does **not** work: the formatter is free to join or split lines, so the
+/// two blocks have different line counts — code below the range got
+/// duplicated, or the tail of the reformatted block was dropped. Diffing
+/// makes the edit correct by construction, whatever the formatter did.
+///
+/// `lsp_start` / `lsp_end` (the requested 0-based inclusive line range) are
+/// only used to flag a formatter that strayed outside the selection.
+///
+/// Returns `None` when the two texts are identical (no change needed).
 pub(crate) fn range_lines_edit(
     original: &ropey::Rope,
     formatted_text: &str,
     lsp_start: u32,
     lsp_end: u32,
 ) -> Option<Vec<TextEdit>> {
-    let fmt_rope = ropey::Rope::from_str(formatted_text);
-
-    let orig_lines = original.len_lines();
-    let fmt_lines = fmt_rope.len_lines();
-
-    let s = lsp_start as usize;
-    // `lsp_end` is inclusive in the LSP range; the edit covers through the
-    // *start* of line lsp_end+1 so that the trailing newline is included.
-    let e = (lsp_end as usize + 1).min(orig_lines).min(fmt_lines);
-
-    let orig_start_byte = original.line_to_byte(s);
-    let orig_end_byte = original.line_to_byte(e.min(orig_lines));
-    let fmt_start_byte = fmt_rope.line_to_byte(s.min(fmt_lines));
-    let fmt_end_byte = fmt_rope.line_to_byte(e.min(fmt_lines));
-
-    let orig_slice = &original.to_string()[orig_start_byte..orig_end_byte];
-    let fmt_slice = &formatted_text[fmt_start_byte..fmt_end_byte];
-
-    if orig_slice == fmt_slice {
+    let original_text = original.to_string();
+    if original_text == formatted_text {
         return None;
     }
 
-    // End the edit at the last character of lsp_end (not the start of
-    // lsp_end+1) so that the edit range stays within the requested viewport.
-    // Use the formatted line's length in UTF-16 code units (the LSP wire
-    // format) to handle non-ASCII identifiers correctly.
-    let end_line_content = fmt_rope
-        .line(e.saturating_sub(1).min(fmt_lines.saturating_sub(1)));
-    let end_char: u32 = end_line_content
-        .chars()
-        .filter(|&c| c != '\n' && c != '\r')
-        .map(|c| c.len_utf16() as u32)
-        .sum();
+    // Lines *with* their terminators, so concatenating a run of them
+    // reproduces the text byte-for-byte.
+    let orig_lines: Vec<&str> = original_text.split_inclusive('\n').collect();
+    let fmt_lines: Vec<&str> = formatted_text.split_inclusive('\n').collect();
+
+    let max_common = orig_lines.len().min(fmt_lines.len());
+    let prefix = orig_lines
+        .iter()
+        .zip(&fmt_lines)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = orig_lines
+        .iter()
+        .rev()
+        .zip(fmt_lines.iter().rev())
+        .take(max_common - prefix) // never let the suffix overlap the prefix
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let orig_changed = &orig_lines[prefix..orig_lines.len() - suffix];
+    let fmt_changed = &fmt_lines[prefix..fmt_lines.len() - suffix];
+
+    let start_byte: usize = orig_lines[..prefix].iter().map(|l| l.len()).sum();
+    let end_byte: usize = start_byte + orig_changed.iter().map(|l| l.len()).sum::<usize>();
+    let start = mimir_core::Position::from_byte_offset(original, start_byte);
+    let end = mimir_core::Position::from_byte_offset(original, end_byte);
+
+    if start.line < lsp_start || end.line > lsp_end.saturating_add(1) {
+        tracing::debug!(
+            requested_start = lsp_start,
+            requested_end = lsp_end,
+            edit_start = start.line,
+            edit_end = end.line,
+            "range format: formatter changed lines outside the requested range",
+        );
+    }
 
     Some(vec![TextEdit {
-        range: Range {
-            start: Position { line: lsp_start, character: 0 },
-            end: Position { line: lsp_end, character: end_char },
-        },
-        new_text: fmt_slice.to_owned(),
+        range: m_range_to_lsp(MRange::new(start, end)),
+        new_text: fmt_changed.concat(),
     }])
 }
 
@@ -115,6 +131,16 @@ pub(crate) fn m_fold_to_lsp(f: mimir_syntax::FoldRange) -> FoldingRange {
     }
 }
 
+/// Upper bound on the number of links in a `SelectionRange` chain we send.
+///
+/// The LSP type is a linked list (`parent: Box<SelectionRange>`), one link
+/// per enclosing syntax node. Nobody presses "expand selection" hundreds of
+/// times, but a cursor inside a generated `a | b | c | …` expression has
+/// tens of thousands of enclosing nodes — and building, serialising, and
+/// dropping a list that long each recurse once per link. That overflows the
+/// stack, which aborts the whole server.
+pub(crate) const MAX_SELECTION_DEPTH: usize = 256;
+
 /// Link an innermost-first range chain into an `lsp_types::SelectionRange`,
 /// where each entry's `parent` is the next-larger range. The returned value
 /// is the innermost range with its parent chain attached. An empty chain
@@ -122,10 +148,27 @@ pub(crate) fn m_fold_to_lsp(f: mimir_syntax::FoldRange) -> FoldingRange {
 /// implied position — but since we can't recover the position here, callers
 /// pass at least the leaf range; an empty chain yields a single empty range
 /// at (0,0) which the editor harmlessly ignores.
+///
+/// Chains longer than [`MAX_SELECTION_DEPTH`] are thinned from the middle:
+/// the innermost steps (token → expression → statement, what the first few
+/// keypresses select) and the outermost ones (…→ function → class → file)
+/// are kept, the run of near-identical intermediate expression levels is
+/// dropped.
 pub(crate) fn build_selection_range(chain: &[MRange]) -> SelectionRange {
+    // How many of the kept links come from the outer end.
+    const OUTER_KEPT: usize = MAX_SELECTION_DEPTH / 4;
+    let (inner, outer): (&[MRange], &[MRange]) = if chain.len() > MAX_SELECTION_DEPTH {
+        (
+            &chain[..MAX_SELECTION_DEPTH - OUTER_KEPT],
+            &chain[chain.len() - OUTER_KEPT..],
+        )
+    } else {
+        (chain, &[])
+    };
+
     let mut acc: Option<SelectionRange> = None;
     // Walk outermost → innermost so each inner range points at the outer one.
-    for r in chain.iter().rev() {
+    for r in outer.iter().rev().chain(inner.iter().rev()) {
         acc = Some(SelectionRange {
             range: m_range_to_lsp(*r),
             parent: acc.map(Box::new),
@@ -453,6 +496,168 @@ mod tests {
         }
     }
 
+
+    // ------------------------------------------------------------------
+    // Regression: range-formatting edits
+    // ------------------------------------------------------------------
+
+    /// Apply LSP text edits to `original` the way an editor would.
+    fn apply_edits(original: &str, edits: &[TextEdit]) -> String {
+        let mut doc = mimir_core::TextDocument::new(original, 1);
+        // Editors apply edits back-to-front so earlier ranges stay valid.
+        let mut sorted: Vec<&TextEdit> = edits.iter().collect();
+        sorted.sort_by_key(|e| std::cmp::Reverse((e.range.start.line, e.range.start.character)));
+        for e in sorted {
+            let range = MRange::new(
+                MPosition::new(e.range.start.line, e.range.start.character),
+                MPosition::new(e.range.end.line, e.range.end.character),
+            );
+            doc.apply_incremental_edit(range, &e.new_text, 2).unwrap();
+        }
+        doc.text()
+    }
+
+    /// The edit a range-format returns, applied to the original document,
+    /// must reproduce the formatter's output exactly.
+    fn assert_range_edit_reproduces(original: &str, formatted: &str, start: u32, end: u32) {
+        let rope = ropey::Rope::from_str(original);
+        let edits = range_lines_edit(&rope, formatted, start, end)
+            .expect("texts differ, so an edit is expected");
+        assert_eq!(
+            apply_edits(original, &edits),
+            formatted,
+            "applying {edits:#?} must yield the formatter's output",
+        );
+    }
+
+    /// Regression: the formatter *shortens* a line in the range. The edit's
+    /// end column used to be taken from the formatted line, so the tail of
+    /// the original line survived behind the replacement — and the
+    /// replacement carried its own newline while the original's was kept,
+    /// inserting a blank line on every format.
+    #[test]
+    fn regression_range_format_edit_when_line_gets_shorter() {
+        assert_range_edit_reproduces(
+            "module m;\n  assign   a  =  b;\n  assign c = d;\nendmodule\n",
+            "module m;\n  assign a = b;\n  assign c = d;\nendmodule\n",
+            1,
+            1,
+        );
+    }
+
+    /// Regression: the formatter *joins* lines. Pairing "lines s..=e of the
+    /// original" with "lines s..=e of the output" then pulled lines from
+    /// below the range into the replacement, duplicating them.
+    #[test]
+    fn regression_range_format_edit_when_lines_are_joined() {
+        assert_range_edit_reproduces(
+            "module m;\n  assign a =\n    b +\n    c;\n  wire w;\nendmodule\n",
+            "module m;\n  assign a = b + c;\n  wire w;\nendmodule\n",
+            1,
+            3,
+        );
+    }
+
+    /// Regression: the formatter *splits* a line. The replacement used to be
+    /// cut off at the original line count, silently deleting code.
+    #[test]
+    fn regression_range_format_edit_when_a_line_is_split() {
+        assert_range_edit_reproduces(
+            "module m;\n  always_comb begin a = b; end\n  wire w;\nendmodule\n",
+            "module m;\n  always_comb begin\n    a = b;\n  end\n  wire w;\nendmodule\n",
+            1,
+            1,
+        );
+    }
+
+    /// Edge cases: change on the very last line, with and without a trailing
+    /// newline, and non-ASCII text ahead of the change on the same line.
+    #[test]
+    fn regression_range_format_edit_at_end_of_document() {
+        assert_range_edit_reproduces("module m;\nendmodule   \n", "module m;\nendmodule\n", 1, 1);
+        assert_range_edit_reproduces("module m;\nendmodule   ", "module m;\nendmodule", 1, 1);
+        assert_range_edit_reproduces(
+            "// é\nassign  a=b; // ünïcödé\n",
+            "// é\nassign a = b;  // ünïcödé\n",
+            1,
+            1,
+        );
+    }
+
+    /// Identical output ⇒ no edit at all.
+    #[test]
+    fn range_format_edit_is_none_when_nothing_changed() {
+        let text = "module m;\n  wire w;\nendmodule\n";
+        assert!(range_lines_edit(&ropey::Rope::from_str(text), text, 0, 2).is_none());
+    }
+
+    /// The edit is minimal: untouched lines above and below are not part of
+    /// the replaced range.
+    #[test]
+    fn range_format_edit_is_confined_to_changed_lines() {
+        let original = "module m;\n  assign   a  =  b;\n  wire w;\nendmodule\n";
+        let formatted = "module m;\n  assign a = b;\n  wire w;\nendmodule\n";
+        let edits = range_lines_edit(&ropey::Rope::from_str(original), formatted, 1, 1).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range.start, Position::new(1, 0));
+        assert_eq!(edits[0].range.end, Position::new(2, 0));
+        assert_eq!(edits[0].new_text, "  assign a = b;\n");
+    }
+
+    /// Regression: `SelectionRange` is a linked list (`parent: Box<…>`), one
+    /// link per enclosing syntax node. For a cursor inside a pathologically
+    /// deep expression that was tens of thousands of links — and building,
+    /// serialising and dropping such a list all recurse once per link, so
+    /// the response overflowed the stack and aborted the server. The chain
+    /// is capped; the innermost and outermost ranges (the useful ones) stay.
+    #[test]
+    fn regression_selection_range_chain_is_depth_capped() {
+        let depth = 200_000u32;
+        let chain: Vec<MRange> = (0..depth)
+            .map(|i| MRange::new(MPosition::new(0, depth - i), MPosition::new(0, depth + 1 + i)))
+            .collect();
+
+        // Small stack on purpose: the default test stack hides the problem.
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let sel = build_selection_range(&chain);
+                let json = serde_json::to_string(&sel).expect("serialises");
+                let mut links = 0usize;
+                let mut cur = Some(&sel);
+                let mut outermost = sel.range;
+                while let Some(s) = cur {
+                    links += 1;
+                    outermost = s.range;
+                    cur = s.parent.as_deref();
+                }
+                (links, sel.range, outermost, json.len())
+            })
+            .unwrap();
+        let (links, innermost, outermost, json_len) =
+            handle.join().expect("must not overflow the stack");
+
+        assert!(links <= MAX_SELECTION_DEPTH, "{links} links");
+        assert_eq!(innermost.start.character, depth, "innermost range is kept");
+        assert_eq!(outermost.start.character, 1, "outermost range is kept");
+        assert!(json_len > 0);
+    }
+
+    /// Ordinary chains are passed through untouched, innermost first.
+    #[test]
+    fn selection_range_chain_short_is_unchanged() {
+        let chain: Vec<MRange> = (0..5u32)
+            .map(|i| MRange::new(MPosition::new(0, 10 - i), MPosition::new(0, 11 + i)))
+            .collect();
+        let sel = build_selection_range(&chain);
+        let mut got = Vec::new();
+        let mut cur = Some(&sel);
+        while let Some(s) = cur {
+            got.push(s.range.start.character);
+            cur = s.parent.as_deref();
+        }
+        assert_eq!(got, vec![10, 9, 8, 7, 6]);
+    }
 
     /// tree-sitter → LSP conversion preserves all the fields the editor needs.
     #[test]

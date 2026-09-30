@@ -492,14 +492,33 @@ pub async fn invoke_verible(
             source,
         })?;
 
-    // Write source to stdin then close the pipe so Verible sees EOF.
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(source.as_bytes()).await?;
-        // `stdin` drops here, closing the fd.
-    }
-
-    // Wait for completion with a hard timeout.
-    let output = tokio::time::timeout(FORMAT_TIMEOUT, child.wait_with_output())
+    // Feed stdin and collect stdout/stderr *concurrently*, all inside one
+    // deadline.
+    //
+    // Doing these in sequence ("write everything, then read") only works
+    // while the input fits in the pipe buffer or the child politely reads
+    // all of it before producing output. Otherwise we block writing while
+    // the child blocks writing — a deadlock — and a child that never reads
+    // at all hangs us forever, because the write wasn't covered by the
+    // timeout. On timeout both futures are dropped, which drops the child
+    // and (`kill_on_drop`) kills it.
+    let stdin = child.stdin.take();
+    let exchange = async {
+        let feed = async {
+            if let Some(mut stdin) = stdin {
+                if let Err(e) = stdin.write_all(source.as_bytes()).await {
+                    // Typically EPIPE: the formatter exited (or closed
+                    // stdin) before reading everything. Not our error to
+                    // report — its exit status and stderr say why.
+                    debug!(error = %e, "formatter stopped reading its input early");
+                }
+                // `stdin` drops here, closing the fd so the child sees EOF.
+            }
+        };
+        let (_, output) = tokio::join!(feed, child.wait_with_output());
+        output
+    };
+    let output = tokio::time::timeout(FORMAT_TIMEOUT, exchange)
         .await
         .map_err(|_| FormatError::Timeout {
             secs: FORMAT_TIMEOUT.as_secs(),
@@ -550,6 +569,87 @@ pub async fn invoke_verible(
 mod tests {
     use super::*;
     use crate::project::FormatterConfig;
+
+    /// Write an executable shell script standing in for the formatter.
+    #[cfg(unix)]
+    fn fake_formatter(dir: &std::path::Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-format.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Regression: the source was written to the formatter's stdin *before*
+    /// the timeout started, and nothing drained its stdout meanwhile. A
+    /// formatter that stalls without reading — or one that starts writing
+    /// output while we are still writing input, once either pipe fills —
+    /// blocked that `write_all` forever and the format request never
+    /// returned. The whole exchange must be bounded by the timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regression_formatter_that_never_reads_stdin_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FormatterConfig {
+            binary: fake_formatter(dir.path(), "sleep 60"),
+            ..default_cfg()
+        };
+        // Far larger than a pipe buffer, so the write can't complete.
+        let source = "module m; endmodule\n".repeat(50_000);
+
+        let outcome = tokio::time::timeout(
+            FORMAT_TIMEOUT + Duration::from_secs(5),
+            invoke_verible(&cfg, &source, None),
+        )
+        .await
+        .expect("invoke_verible must give up on its own instead of hanging");
+        assert!(
+            matches!(outcome, Err(FormatError::Timeout { .. })),
+            "expected a timeout, got {outcome:?}",
+        );
+    }
+
+    /// Regression: a formatter that streams output while input is still
+    /// arriving (any filter does) deadlocked against us once both pipes were
+    /// full — we were blocked writing, it was blocked writing. Input and
+    /// output must be pumped concurrently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regression_streaming_formatter_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FormatterConfig {
+            binary: fake_formatter(dir.path(), "exec cat"),
+            ..default_cfg()
+        };
+        let source = "module m; endmodule\n".repeat(50_000);
+        let formatted = invoke_verible(&cfg, &source, None)
+            .await
+            .expect("cat echoes its input");
+        assert_eq!(formatted.len(), source.len());
+        assert!(formatted == source);
+    }
+
+    /// Regression: a formatter that exits before consuming its input (bad
+    /// flag, crash) made the stdin write fail with `EPIPE`, and that I/O
+    /// error was reported instead of the formatter's own exit code and
+    /// stderr — hiding the actual reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regression_early_exit_reports_formatter_error_not_broken_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FormatterConfig {
+            binary: fake_formatter(dir.path(), "echo 'unknown flag --bogus' >&2; exit 3"),
+            ..default_cfg()
+        };
+        let source = "module m; endmodule\n".repeat(50_000);
+        match invoke_verible(&cfg, &source, None).await {
+            Err(FormatError::VeribleFailed { exit_code, stderr }) => {
+                assert_eq!(exit_code, 3);
+                assert!(stderr.contains("unknown flag"), "stderr lost: {stderr:?}");
+            }
+            other => panic!("expected VeribleFailed, got {other:?}"),
+        }
+    }
 
     fn default_cfg() -> FormatterConfig {
         FormatterConfig::default()

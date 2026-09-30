@@ -50,7 +50,7 @@ Don't introduce cycles; don't pull `tower-lsp` or `tokio` into the lower crates.
 
 ```bash
 cargo check  --workspace
-cargo test   --workspace                   # 436 unit tests today
+cargo test   --workspace                   # 676 unit tests today
 cargo clippy --workspace --all-targets -- -D warnings   # lints test code too
 cargo build  --release                     # produces target/release/mimir-server
 ```
@@ -68,6 +68,14 @@ Per-crate test entry points (unit tests co-located with source):
 - `mimir-slang`: [crates/mimir-slang/src/client.rs](./crates/mimir-slang/src/client.rs), [crates/mimir-slang/src/protocol.rs](./crates/mimir-slang/src/protocol.rs)
 - `mimir-server`: [crates/mimir-server/src/backend.rs](./crates/mimir-server/src/backend.rs), [crates/mimir-server/src/filelist.rs](./crates/mimir-server/src/filelist.rs), [crates/mimir-server/src/project.rs](./crates/mimir-server/src/project.rs)
 - Integration / semantic-token tests: [crates/mimir-syntax/tests/semantic_tokens.rs](./crates/mimir-syntax/tests/semantic_tokens.rs)
+- **Regression suite** (one test per fixed bug — add to it *before* fixing the next one):
+  - unit level: tests named `regression_*` next to the code they guard
+    (`cargo test --workspace regression_`), plus
+    [crates/mimir-syntax/tests/regressions.rs](./crates/mimir-syntax/tests/regressions.rs)
+  - end to end: [tests/test_regressions.py](./tests/test_regressions.py) (hermetic;
+    uses [tests/fake_sidecar.py](./tests/fake_sidecar.py) and
+    [tests/fake_formatter.py](./tests/fake_formatter.py)) and
+    [tests/test_sidecar_robustness.py](./tests/test_sidecar_robustness.py)
 
 ## Pre-commit test protocol
 
@@ -90,7 +98,14 @@ automatically — this is expected on CI and fresh checkouts. The hermetic tests
 (`test_hello_world.py`, `test_hierarchy.py`) always run regardless.
 
 Tier 3 is optional for purely mechanical changes (doc edits, formatting
-fixes) but required whenever the server's hot-path logic changes.
+fixes) but required whenever the server's hot-path logic changes. The stress
+test only runs when `MIMIR_STRESS_DURATION` is set, so Tier 2's
+`make integration` skips it.
+
+Tier 2 picks up the slang sidecar from `MIMIR_SLANG_PATH` / `.mimir.toml`
+when it is built (`make sidecar`) and Verible from `$PATH` (`make verible`);
+without them the slang- and formatter-dependent suites skip themselves.
+`MIMIR_SERVER_BIN` points the Python suite at a different server binary.
 
 ## Critical invariants
 
@@ -104,6 +119,25 @@ fixes) but required whenever the server's hot-path logic changes.
   Don't try to share without the lock.
 - **Heavy comments are a product requirement.** `missing_docs = "warn"` is on
   in every crate. Don't strip module-level `//!` blocks.
+- **No recursive tree walkers.** A parse tree is as deep as the source is
+  nested (a generated `a | b | c | …` is thousands of levels), and a stack
+  overflow is an abort, not a panic. Traverse with
+  [`mimir_syntax::walk`](./crates/mimir-syntax/src/walk.rs) (`walk` /
+  `preorder` / `self_and_ancestors`); don't loop on `Node::parent()` either —
+  each call re-descends from the root.
+- **A tree and its text travel together.** Byte offsets from a `SyntaxTree`
+  are only valid in `tree.source()`. Build the rope for a tree-driven lookup
+  from that (`Rope::from_str(tree.source())`), never from the live buffer,
+  which may already be an edit ahead. Likewise, positions in the cached
+  slang AST are only valid while the buffer is at the revision that was
+  compiled — go through `Backend::fresh_ast`.
+- **Edits are recorded on the document, not passed to the re-parse.**
+  `DocumentState::pending_edits` is the history between the cached tree and
+  the current text; re-parses can overlap, and one that carries only its own
+  edit corrupts the tree.
+- **A handler panic kills the process** (see the hook in
+  [main.rs](./crates/mimir-server/src/main.rs)) so the editor can restart
+  it. Never index/slice text with positions you haven't validated.
 
 ## Single responsibility
 
@@ -144,9 +178,11 @@ one.
   | `workspace_symbols` | `workspace/symbol` kind filter + fuzzy ranking |
   | `uvm_db_features` | `mimir/uvmDb` grouping + wire response (uvm_config_db / uvm_resource_db viewer) |
   | `config_db` (mimir-syntax) | Syntactic `uvm_config_db` / `uvm_resource_db` call-site scanner |
+  | `walk` (mimir-syntax) | Stack-safe (iterative) tree traversal used by every walker |
   | `lsp_convert` | Pure internal-type → LSP wire-shape converters (edits, tokens, kinds, items) |
   | `chain_resolve` | Class-member lookup + inheritance walk + multi-hop chain resolution |
   | `paths` | Filesystem path ↔ `file://` URL conversion |
+  | `source_io` | Reading closed source files from disk as text (tolerating invalid UTF-8) |
   | `diagnostics` | `MimirDiag` → LSP `Diagnostic` conversion (one place, all backends) |
   | `workspace_index` | Tree-sitter symbol index + identifier presence index |
   | `filelist` | `.f` tokenization + path resolution + `${VAR}` expansion |

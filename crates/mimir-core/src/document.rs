@@ -151,6 +151,39 @@ impl Position {
         Ok(rope.line_to_byte(self.line as usize) + byte_in_line)
     }
 
+    /// Lenient counterpart of [`Self::to_byte_offset`] that never fails.
+    ///
+    /// Applies the clamping rules the LSP spec mandates for positions a
+    /// client sends us:
+    ///
+    /// * a `character` past the end of its line "defaults back to the line
+    ///   length" — we stop *before* the line terminator (`\n`, `\r\n`, `\r`);
+    /// * a `line` past the last line clamps to the end of the document
+    ///   (editors express "to end of file" this way);
+    /// * a `character` that lands inside a surrogate pair rounds up to the
+    ///   end of that character, so the result is always a char boundary.
+    ///
+    /// Use this wherever a client-supplied position must be *applied* (text
+    /// edits); keep the strict variant for lookups, where "not a valid
+    /// position" is a useful answer.
+    #[must_use]
+    pub fn to_byte_offset_clamped(self, rope: &Rope) -> usize {
+        if (self.line as usize) >= rope.len_lines() {
+            return rope.len_bytes();
+        }
+        let line_slice = rope.line(self.line as usize);
+        let mut utf16_consumed: u32 = 0;
+        let mut byte_in_line: usize = 0;
+        for ch in line_slice.chars() {
+            if ch == '\n' || ch == '\r' || utf16_consumed >= self.character {
+                break;
+            }
+            utf16_consumed += ch.len_utf16() as u32;
+            byte_in_line += ch.len_utf8();
+        }
+        rope.line_to_byte(self.line as usize) + byte_in_line
+    }
+
     /// Convert a byte offset into an LSP `(line, utf16-char)` position.
     ///
     /// Used to translate parser node spans (which are byte ranges) back into
@@ -159,22 +192,21 @@ impl Position {
     pub fn from_byte_offset(rope: &Rope, byte: usize) -> Self {
         let byte = byte.min(rope.len_bytes());
         let line = rope.byte_to_line(byte);
-        let line_start = rope.line_to_byte(line);
-        let line_slice = rope.line(line);
-
-        let mut utf16: u32 = 0;
-        let mut bytes_seen: usize = 0;
-        for ch in line_slice.chars() {
-            if bytes_seen + ch.len_utf8() > byte - line_start {
-                break;
-            }
-            utf16 += ch.len_utf16() as u32;
-            bytes_seen += ch.len_utf8();
-        }
+        // All three conversions are O(log n) rope lookups. Walking the line
+        // char-by-char instead is O(column), which turns into quadratic time
+        // for callers that convert every token on one very long line
+        // (generated or minified sources).
+        //
+        // `byte_to_char` maps a byte in the middle of a multi-byte character
+        // to that character's index, so such an offset rounds *down* to the
+        // character's start — a position can never split a character.
+        let char_idx = rope.byte_to_char(byte);
+        let line_start_char = rope.line_to_char(line);
+        let utf16 = rope.char_to_utf16_cu(char_idx) - rope.char_to_utf16_cu(line_start_char);
 
         Self {
             line: line as u32,
-            character: utf16,
+            character: utf16 as u32,
         }
     }
 }
@@ -215,6 +247,24 @@ impl Range {
     #[must_use]
     pub fn contains_range(self, other: Range) -> bool {
         self.start <= other.start && other.end <= self.end
+    }
+
+    /// Lenient counterpart of [`Self::to_byte_range`]: both endpoints go
+    /// through [`Position::to_byte_offset_clamped`], so out-of-bounds
+    /// positions are clamped per the LSP spec instead of rejected. The only
+    /// remaining failure is a genuinely inverted range.
+    pub fn to_byte_range_clamped(self, rope: &Rope) -> Result<StdRange<usize>, TextDocumentError> {
+        let start = self.start.to_byte_offset_clamped(rope);
+        let end = self.end.to_byte_offset_clamped(rope);
+        if self.end < self.start || end < start {
+            return Err(TextDocumentError::InvertedRange {
+                start_line: self.start.line,
+                start_character: self.start.character,
+                end_line: self.end.line,
+                end_character: self.end.character,
+            });
+        }
+        Ok(start..end)
     }
 
     /// Convert this LSP range into a byte range in the rope.
@@ -310,13 +360,18 @@ impl TextDocument {
     /// `range` is in LSP coordinates (UTF-16, line+char). `new_text` replaces
     /// the contents of `range`. After the edit we bump `self.version` to
     /// `new_version`.
+    ///
+    /// Out-of-bounds positions are clamped (see
+    /// [`Position::to_byte_offset_clamped`]) rather than rejected: dropping
+    /// an edit the editor has already applied desynchronises the two buffers
+    /// for the rest of the session. Only an inverted range is an error.
     pub fn apply_incremental_edit(
         &mut self,
         range: Range,
         new_text: &str,
         new_version: i32,
     ) -> Result<(), TextDocumentError> {
-        let byte_range = range.to_byte_range(&self.rope)?;
+        let byte_range = range.to_byte_range_clamped(&self.rope)?;
         trace!(
             byte_start = byte_range.start,
             byte_end   = byte_range.end,
@@ -457,6 +512,111 @@ mod tests {
         assert!(!outer.contains_range(r(1, 3, 5, 10)), "starts before outer");
         assert!(!outer.contains_range(r(1, 4, 5, 11)), "ends after outer");
         assert!(!outer.contains_range(r(0, 0, 9, 0)), "encloses outer");
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// Regression: only `\n`, `\r\n` and `\r` are line terminators in LSP.
+    /// A form feed (`^L` page break, common in legacy Verilog) or a Unicode
+    /// line/paragraph separator must NOT start a new line — otherwise every
+    /// position after it is off by one line relative to the editor and
+    /// incremental edits land in the wrong place.
+    #[test]
+    fn regression_form_feed_and_unicode_separators_are_not_line_breaks() {
+        let rope = Rope::from_str("a\u{000C}b\nc\u{2028}d\u{0085}e\u{000B}f\ng\n");
+        // Editor view: line 0 = "a<FF>b", line 1 = "c<LS>d<NEL>e<VT>f", line 2 = "g".
+        assert_eq!(Position::new(1, 0).to_byte_offset(&rope).unwrap(), 4);
+        let g = Position::new(2, 0).to_byte_offset(&rope).unwrap();
+        assert_eq!(rope.byte_slice(g..g + 1).to_string(), "g");
+        assert_eq!(Position::from_byte_offset(&rope, g), Position::new(2, 0));
+    }
+
+    /// Regression: the LSP spec says a `character` past the end of its line
+    /// "defaults back to the line length". Rejecting such an edit dropped it
+    /// on the floor, leaving the server's buffer out of sync with the editor.
+    #[test]
+    fn regression_incremental_edit_clamps_character_past_line_end() {
+        let mut doc = TextDocument::new("abc\ndef\n", 1);
+        let range = Range::new(Position::new(0, 1), Position::new(0, 99));
+        doc.apply_incremental_edit(range, "X", 2).unwrap();
+        assert_eq!(doc.text(), "aX\ndef\n");
+        assert_eq!(doc.version(), 2);
+    }
+
+    /// Regression: clamping must stop *before* a CRLF terminator, never
+    /// between the `\r` and the `\n`.
+    #[test]
+    fn regression_clamp_stops_before_crlf() {
+        let mut doc = TextDocument::new("abc\r\ndef\r\n", 1);
+        let range = Range::new(Position::new(0, 50), Position::new(0, 60));
+        doc.apply_incremental_edit(range, "!", 2).unwrap();
+        assert_eq!(doc.text(), "abc!\r\ndef\r\n");
+    }
+
+    /// Regression: editors routinely express "to end of document" as a
+    /// position on the line *after* the last one. That must clamp to the end
+    /// of the document instead of failing the whole edit.
+    #[test]
+    fn regression_incremental_edit_clamps_line_past_document_end() {
+        let mut doc = TextDocument::new("abc\ndef", 1);
+        let range = Range::new(Position::new(1, 0), Position::new(7, 0));
+        doc.apply_incremental_edit(range, "", 2).unwrap();
+        assert_eq!(doc.text(), "abc\n");
+    }
+
+    /// The clamped conversion never lands inside a surrogate pair.
+    #[test]
+    fn regression_clamped_offset_never_splits_a_char() {
+        let rope = Rope::from_str("a😀b");
+        let byte = Position::new(0, 2).to_byte_offset_clamped(&rope);
+        assert!(rope.to_string().is_char_boundary(byte), "byte {byte} splits a char");
+    }
+
+    /// `from_byte_offset` must agree with a straightforward char-by-char
+    /// count for every byte of a text mixing 1-, 2-, 3- and 4-byte characters
+    /// and all three line terminators — including bytes *inside* a character,
+    /// which round down to the character's start.
+    #[test]
+    fn from_byte_offset_matches_reference_for_every_byte() {
+        let text = "ab\ncé→😀d\r\nxy\rz\n\nq";
+        let rope = Rope::from_str(text);
+        for byte in 0..=text.len() {
+            // Reference: floor to a char boundary, then count lines/UTF-16.
+            let mut floor = byte;
+            while !text.is_char_boundary(floor) {
+                floor -= 1;
+            }
+            let before = &text[..floor];
+            let mut line = 0u32;
+            let mut col = 0u32;
+            let mut chars = before.chars().peekable();
+            while let Some(c) = chars.next() {
+                let is_break = match c {
+                    '\n' => true,
+                    // `\r\n` is one terminator; a lone `\r` is one too.
+                    '\r' => match chars.peek() {
+                        Some(&next) => next != '\n',
+                        // Last char before the offset: it only terminates
+                        // the line if the offset isn't inside a `\r\n`.
+                        None => !text[floor..].starts_with('\n'),
+                    },
+                    _ => false,
+                };
+                if is_break {
+                    line += 1;
+                    col = 0;
+                } else {
+                    col += c.len_utf16() as u32;
+                }
+            }
+            assert_eq!(
+                Position::from_byte_offset(&rope, byte),
+                Position::new(line, col),
+                "byte {byte} (floor {floor})",
+            );
+        }
     }
 
     /// Inverted range is rejected.

@@ -503,6 +503,12 @@ pub fn methods_for_suffix(suffix: &str) -> &'static [BuiltinMethod] {
     } else if s == "[]" {
         DYNAMIC_ARRAY_METHODS
     } else if s.starts_with('[') && s.ends_with(']') && s.len() > 2 && !s.contains(':') {
+        let key = s[1..s.len() - 1].trim();
+        if key.is_empty() || key.bytes().all(|b| b.is_ascii_digit()) {
+            // `[10]` is a fixed-size unpacked array — an integer literal is
+            // a size, never an associative index *type*.
+            return &[];
+        }
         // Non-empty bracketed key without `:`: associative array.
         // `[3:0]` (packed dimension) contains `:` and is excluded.
         ASSOC_ARRAY_METHODS

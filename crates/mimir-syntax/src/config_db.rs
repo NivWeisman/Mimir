@@ -128,8 +128,22 @@ pub struct DbCall {
 /// omits the call.
 #[must_use]
 pub fn db_calls(tree: &SyntaxTree, rope: &Rope) -> Vec<DbCall> {
+    let source = tree.source();
     let mut out = Vec::new();
-    collect(tree.tree.root_node(), tree.source(), rope, &mut out);
+    // Iterative walk (see `crate::walk`): try to read a [`DbCall`] out of
+    // every `method_call`, and always keep descending — nested db calls
+    // live in argument subtrees.
+    crate::walk::preorder(tree.tree.root_node(), |node| {
+        if !node.is_named() {
+            return crate::walk::Walk::Skip;
+        }
+        if node.kind() == "method_call" {
+            if let Some(call) = db_call_from_method_call(node, source, rope) {
+                out.push(call);
+            }
+        }
+        crate::walk::Walk::Descend
+    });
     debug!(count = out.len(), "db_calls collected");
     out
 }
@@ -137,20 +151,6 @@ pub fn db_calls(tree: &SyntaxTree, rope: &Rope) -> Vec<DbCall> {
 // --------------------------------------------------------------------------
 // Internal helpers
 // --------------------------------------------------------------------------
-
-/// Recursive DFS: try to read a [`DbCall`] out of `node`, then always
-/// recurse into named children (nested db calls live in argument subtrees).
-fn collect(node: Node<'_>, source: &str, rope: &Rope, out: &mut Vec<DbCall>) {
-    if node.kind() == "method_call" {
-        if let Some(call) = db_call_from_method_call(node, source, rope) {
-            out.push(call);
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect(child, source, rope, out);
-    }
-}
 
 /// Classify `method` for `kind`, or `None` when the method isn't part of
 /// the recognised db API (which also filters out unrelated classes that
@@ -322,16 +322,7 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
 /// Pre-order search for the first descendant (including `node` itself) of
 /// the given kind.
 fn first_descendant_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    if node.kind() == kind {
-        return Some(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = first_descendant_of_kind(child, kind) {
-            return Some(found);
-        }
-    }
-    None
+    crate::walk::first_descendant_of_kind(node, kind)
 }
 
 // --------------------------------------------------------------------------

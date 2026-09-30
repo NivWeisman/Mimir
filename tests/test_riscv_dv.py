@@ -66,10 +66,18 @@ MOD_READONLY    = 0x2
 
 
 def _wait_for_parse(lsp: MimirLspClient, uri: str, timeout: float = 8.0) -> None:
-    """Block until the server publishes ``publishDiagnostics`` for ``uri``."""
+    """Block until the server publishes ``publishDiagnostics`` for ``uri``
+    *and* the startup workspace-index pass has finished.
+
+    The second half matters for every cross-file assertion in this file
+    (workspace symbols, cross-file completion / definition / references):
+    the server answers requests while it is still indexing, so a test that
+    only waits for its own file's parse races the index.
+    """
     diag = lsp.wait_for_fresh_diagnostics(uri, timeout=timeout)
     time.sleep(0.15)
     assert diag is not None, "server never published initial diagnostics"
+    lsp.wait_for_index()
 
 
 def _range(sl: int, sc: int, el: int, ec: int) -> dict:
@@ -467,13 +475,29 @@ class RiscvDvSemanticTokensTest(unittest.TestCase):
         self.assertGreater(len(tokens), 0, "semanticTokens/full returned no tokens")
 
     def test_range_tokens_is_subset_of_full(self) -> None:
-        """Range tokens are all within the requested viewport lines."""
+        """Range tokens are all within the requested viewport lines, and
+        each one also appears in the full-document result.
+
+        The requested range ends at ``(50, 999)`` — a column far past the end
+        of line 50, which is how editors express "to the end of this line".
+        The server must clamp it, so line 50 is *inside* the viewport. (It
+        used to reject the whole range as out of bounds and return nothing,
+        which made the old version of this test pass vacuously on an empty
+        list.)
+        """
         tokens = self._range_tokens(self.seq_uri, 35, 50)
-        for line, char, length, ttype, mods in tokens:
+        self.assertGreater(len(tokens), 0,
+                           "a viewport ending past end-of-line must still return tokens")
+        full = set(self._full_tokens(self.seq_uri))
+        for tok in tokens:
+            line = tok[0]
             self.assertGreaterEqual(line, 35,
                                     f"token on line {line} is before requested range start 35")
-            self.assertLess(line, 50,
-                            f"token on line {line} is past requested range end 50")
+            self.assertLessEqual(line, 50,
+                                 f"token on line {line} is past requested range end 50")
+            self.assertIn(tok, full, f"ranged token {tok} is not in the full result")
+        self.assertTrue(any(t[0] == 50 for t in tokens),
+                        "line 50 lies inside the range and has tokens")
 
     def test_range_has_fewer_tokens_than_full(self) -> None:
         full   = self._full_tokens(self.seq_uri)

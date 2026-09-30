@@ -96,10 +96,14 @@ pub(crate) fn collect_incoming_calls(
 
     'trees: for (url, tree) in trees {
         let rope = Rope::from_str(tree.source());
-        // len_lines() counts the implicit empty line after a trailing newline;
-        // saturate to stay within bounds accepted by to_byte_offset.
-        let last_line = rope.len_lines().saturating_sub(1) as u32;
-        let full_file = MRange::new(MPosition::new(0, 0), MPosition::new(last_line, 0));
+        // The whole file, end position included: derive it from the byte
+        // length so the final line is covered even when the file doesn't
+        // end in a newline (a range ending at column 0 of the last line
+        // would stop just short of it).
+        let full_file = MRange::new(
+            MPosition::new(0, 0),
+            MPosition::from_byte_offset(&rope, rope.len_bytes()),
+        );
 
         for site in call_sites_in(tree, &rope, full_file)
             .into_iter()
@@ -411,6 +415,26 @@ endclass
         let trees = vec![(url.clone(), tree)];
         let result = collect_incoming_calls("callee", &trees, &wi);
         assert_eq!(result.len(), 1, "expected one caller, got {:?}", result.len());
+        assert_eq!(result[0].from.name, "caller");
+    }
+
+    /// Regression: the "whole file" scan range ended at column 0 of the
+    /// last line, so a call on the final line of a file with no trailing
+    /// newline was never seen.
+    #[test]
+    fn regression_incoming_calls_include_the_last_line_without_trailing_newline() {
+        init_for_tests();
+        let src = "function int callee(); return 0; endfunction\n\
+                   function void caller(); int r = callee(); endfunction";
+        assert!(!src.ends_with('\n'));
+        let mut parser = SyntaxParser::new().unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let url = test_url("/tmp/last_line.sv");
+        let syms = mimir_syntax::symbols::index(&tree, &Rope::from_str(src));
+        let wi = index_with(&url, &syms);
+
+        let result = collect_incoming_calls("callee", &[(url.clone(), tree)], &wi);
+        assert_eq!(result.len(), 1, "the call on the last line must be found");
         assert_eq!(result[0].from.name, "caller");
     }
 

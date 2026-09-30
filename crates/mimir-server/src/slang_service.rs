@@ -80,6 +80,24 @@ pub(crate) struct ClosedFileDiskCache {
 }
 
 // --------------------------------------------------------------------------
+// ElaborateInputs
+// --------------------------------------------------------------------------
+
+/// Everything one elaborate round needs, captured as a single consistent
+/// snapshot of the project and the open buffers.
+pub(crate) struct ElaborateInputs {
+    /// The request envelope for the sidecar.
+    pub(crate) params: ElaborateParams,
+    /// URLs of the files in `params.files`, in request order.
+    pub(crate) files_in_request: Vec<Url>,
+    /// [`DocumentState::revision`] of every open document at the moment its
+    /// text was snapshotted into `params`. The AST a compile produces is
+    /// only valid for a document while that document is still at this
+    /// revision — see [`crate::slang_adapter::SlangAdapter::fresh_ast`].
+    pub(crate) open_revisions: HashMap<Url, u64>,
+}
+
+// --------------------------------------------------------------------------
 // SlangService
 // --------------------------------------------------------------------------
 
@@ -296,17 +314,29 @@ impl SlangService {
     pub(crate) async fn build_elaborate_params(&self)
     -> Option<(ElaborateParams, Vec<Url>)>
     {
+        self.build_elaborate_inputs()
+            .await
+            .map(|inputs| (inputs.params, inputs.files_in_request))
+    }
+
+    /// Like [`Self::build_elaborate_params`], but also reports which
+    /// revision of every open document the snapshot captured (see
+    /// [`ElaborateInputs::open_revisions`]). Text and revision are read
+    /// under one lock hold, so they describe the same buffer state.
+    pub(crate) async fn build_elaborate_inputs(&self) -> Option<ElaborateInputs> {
         mimir_core::time_scope!("elaborate.build_params");
         if self.slang.read().await.is_none() {
             return None;
         }
         let project = self.project.read().await.clone()?;
 
+        let mut open_revisions: HashMap<Url, u64> = HashMap::new();
         let open_text: HashMap<PathBuf, (Url, String)> = {
             mimir_core::time_scope!("elaborate.build_params.snapshot_open_docs");
             let docs = self.documents.read().await;
             docs.iter()
                 .filter_map(|(uri, state)| {
+                    open_revisions.insert(uri.clone(), state.revision);
                     uri.to_file_path()
                         .ok()
                         .map(|p| (p, (uri.clone(), state.document.text())))
@@ -314,7 +344,13 @@ impl SlangService {
                 .collect()
         };
 
-        Some(assemble_with_cache(&project, &open_text, &self.closed_file_cache).await)
+        let (params, files_in_request) =
+            assemble_with_cache(&project, &open_text, &self.closed_file_cache).await;
+        Some(ElaborateInputs {
+            params,
+            files_in_request,
+            open_revisions,
+        })
     }
 
     /// Hash the inputs of an [`ElaborateParams`] for cache-keying.
@@ -526,7 +562,7 @@ pub(crate) async fn assemble_with_cache(
             if let Some(text) = cached_texts.get(path) {
                 return Some(text.clone());
             }
-            let text: Arc<str> = Arc::from(std::fs::read_to_string(path).ok()?);
+            let text: Arc<str> = Arc::from(crate::source_io::read_source_lossy(path)?);
             new_entries.insert(path.to_path_buf(), text.clone());
             Some(text)
         })

@@ -119,6 +119,80 @@ pub(crate) struct DocumentState {
     /// fresh `did_change` has bumped the version, in which case we must
     /// not overwrite the live cache with the stale parse's results.
     pub(crate) index_version: i32,
+    /// Every edit applied to `document` since `tree` was parsed, in order,
+    /// as tree-sitter `InputEdit`s — i.e. the exact history that turns the
+    /// text `tree` was parsed from into the current text.
+    ///
+    /// Kept here, next to the tree it is relative to, rather than passed
+    /// from `did_change` to the re-parse: re-parses can overlap (the parser
+    /// mutex may be busy), and a re-parse that carries only *its own* edit
+    /// would patch a tree that is already several edits behind. Whoever
+    /// parses next takes the whole list; it is emptied when that parse's
+    /// tree is stored.
+    ///
+    /// `None` means the history can't be expressed incrementally (no tree
+    /// yet, a full-document sync, an edit we couldn't map) — the next parse
+    /// must start from scratch.
+    pub(crate) pending_edits: Option<Vec<InputEdit>>,
+    /// Bumped on every mutation of `document`. A re-parse snapshots it and
+    /// only stores its result if it is unchanged — unlike the client's
+    /// `version`, it can't repeat or go backwards.
+    pub(crate) revision: u64,
+}
+
+impl DocumentState {
+    /// State for a freshly opened document: text only, nothing parsed yet.
+    pub(crate) fn new(text: &str, version: i32, language_id: String) -> Self {
+        Self {
+            document: TextDocument::new(text, version),
+            language_id,
+            index: Vec::new(),
+            tree: None,
+            index_version: i32::MIN,
+            pending_edits: None,
+            revision: 0,
+        }
+    }
+
+    /// Apply one LSP content change to the buffer and record it in
+    /// [`Self::pending_edits`] so the next re-parse can replay it onto the
+    /// cached tree.
+    pub(crate) fn apply_change(&mut self, change: &TextDocumentContentChangeEvent, new_version: i32) {
+        self.revision += 1;
+        match change.range {
+            None => {
+                // Full sync (only happens if the client opted out of
+                // incremental sync — we advertise INCREMENTAL, but be
+                // defensive). The cached tree is no longer a usable base.
+                self.pending_edits = None;
+                self.document.replace_all(&change.text, new_version);
+            }
+            Some(range) => {
+                let m_range = MRange::new(
+                    MPosition::new(range.start.line, range.start.character),
+                    MPosition::new(range.end.line, range.end.character),
+                );
+                // Compute the InputEdit before mutating the rope so byte
+                // offsets still refer to the pre-edit text.
+                let edit = make_input_edit(self.document.rope(), m_range, &change.text);
+                match self.document.apply_incremental_edit(m_range, &change.text, new_version) {
+                    Ok(()) => match (edit, self.pending_edits.as_mut()) {
+                        (Some(edit), Some(pending)) => pending.push(edit),
+                        // No expressible edit ⇒ incremental history is broken.
+                        (None, _) => self.pending_edits = None,
+                        // Already in "full re-parse" mode; nothing to record.
+                        (Some(_), None) => {}
+                    },
+                    Err(e) => {
+                        // Only an inverted range gets here (out-of-bounds
+                        // positions are clamped). The buffer is untouched,
+                        // so the recorded history is still exact.
+                        error!(error = %e, "incremental edit rejected; ignoring it");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The tower-lsp [`LanguageServer`] implementation.
@@ -215,21 +289,28 @@ impl Backend {
     /// we never propagate a parse failure back to the editor as an LSP
     /// error, because the editor doesn't know what to do with it.
     ///
-    /// `edits` are `tree_sitter::InputEdit`s that correspond to the changes
-    /// already applied to the rope. When non-empty and a prior tree exists,
-    /// we mutate the tree with each edit and pass it as `previous` to the
-    /// parser so tree-sitter can reuse unchanged subtrees. When empty (full
-    /// sync or first open), we do a full re-parse from scratch.
+    /// The parse is incremental whenever the document carries a complete
+    /// edit history relative to its cached tree
+    /// ([`DocumentState::pending_edits`]): text, tree and history are
+    /// snapshotted together under one lock, so they always describe each
+    /// other no matter how many edits or re-parses are in flight. Otherwise
+    /// (first open, full sync) we parse from scratch.
     #[instrument(level = "debug", skip(self), fields(uri = %uri))]
-    async fn reparse_and_publish(&self, uri: Url, edits: Vec<InputEdit>) {
+    async fn reparse_and_publish(&self, uri: Url) {
         mimir_core::time_scope!("syntax.reparse_and_publish");
-        let (text, version, prior_tree) = {
+        let (text, version, revision, incremental_base) = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
                 Some(state) => (
                     state.document.text(),
                     state.document.version(),
-                    state.tree.clone(),
+                    state.revision,
+                    // Tree + the edits that bring it up to `text`. Both or
+                    // neither: a tree without its history is not a base.
+                    match (&state.tree, &state.pending_edits) {
+                        (Some(tree), Some(edits)) => Some((tree.clone(), edits.clone())),
+                        _ => None,
+                    },
                 ),
                 None => {
                     // Race: document was closed between the edit and our
@@ -248,7 +329,10 @@ impl Backend {
         // last-known-good results.
         let parse_result = {
             mimir_core::time_scope!("syntax.parse");
-            self.ts.parse(&text, &edits, prior_tree).await
+            match incremental_base {
+                Some((tree, edits)) => self.ts.parse(&text, &edits, Some(tree)).await,
+                None => self.ts.parse(&text, &[], None).await,
+            }
         };
         let (mut diags, new_state) = match parse_result {
             Some(r) => (r.diagnostics, Some((r.symbols, r.tree))),
@@ -273,8 +357,9 @@ impl Backend {
         }
 
         // Write the fresh index + tree back into the doc store, but only if
-        // the version we parsed is still the live one — otherwise a
-        // `did_change` landed mid-parse and our results are already stale.
+        // the revision we parsed is still the live one — otherwise a
+        // `did_change` landed mid-parse and our results are already stale
+        // (that change's own re-parse will pick up the full edit history).
         // When the write does happen, also fold the new symbols into the
         // workspace index and update the workspace tree cache so that
         // closing this file after editing it doesn't leave a stale tree.
@@ -287,10 +372,12 @@ impl Backend {
             let updated = {
                 let mut docs = self.documents.write().await;
                 match docs.get_mut(&uri) {
-                    Some(state) if state.document.version() == version => {
+                    Some(state) if state.revision == revision => {
                         state.index = index.clone();
                         state.tree = Some(tree);
                         state.index_version = version;
+                        // The stored tree now matches the text exactly.
+                        state.pending_edits = Some(Vec::new());
                         true
                     }
                     _ => false,
@@ -321,6 +408,23 @@ impl Backend {
         self.client
             .publish_diagnostics(uri, lsp_diags, Some(version))
             .await;
+    }
+
+    /// The cached slang AST, but only while the open document `uri` is
+    /// still the text that AST was compiled from.
+    ///
+    /// Every handler that maps a *cursor position* into the AST (reference
+    /// map, declaration ranges) must go through this rather than
+    /// `adapter.cached_ast()`: after an edit the AST's coordinates describe
+    /// the pre-edit document, and a positional lookup would answer for
+    /// whatever used to sit there. `None` sends the handler to its
+    /// tree-sitter fallback until the debounced re-compile catches up.
+    async fn fresh_ast(&self, uri: &Url) -> Option<Arc<mimir_ast::MimirAst>> {
+        let revision = {
+            let docs = self.documents.read().await;
+            docs.get(uri)?.revision
+        };
+        self.adapter.fresh_ast(uri, revision).await
     }
 
     /// Snapshot the cached parse tree for `uri`.
@@ -447,8 +551,9 @@ impl Backend {
 
                 let ts = self.ts.clone();
                 let workspace = self.workspace.clone();
+                let documents = self.documents.clone();
                 tokio::spawn(async move {
-                    hydrate_workspace_index(paths, include_dirs, ts, workspace).await;
+                    hydrate_workspace_index(paths, include_dirs, ts, workspace, documents).await;
                 });
 
                 // Re-elaborate now rather than on the next edit — a
@@ -500,12 +605,20 @@ impl Backend {
     /// initial hydration uses the same skipping policy via
     /// `hydrate_from_paths`.
     async fn rehydrate_single_file(&self, path: &Path) {
-        let include_dirs: Vec<PathBuf> = match self.slang.build_elaborate_params().await {
-            Some((params, _)) => params.include_dirs.into_iter().map(PathBuf::from).collect(),
-            None => Vec::new(),
-        };
+        // Only the include search path is needed here — read it straight
+        // from the project config instead of assembling a whole elaborate
+        // request (which snapshots every project file's text) to get it.
+        let include_dirs: Vec<PathBuf> = self.slang.current_include_dirs().await;
         let entries = self.ts.hydrate_paths(&[path.to_path_buf()], &include_dirs).await;
         let mut ws = self.workspace.write().await;
+        // The file itself could not be read (deleted, or it never existed —
+        // a closed scratch buffer): whatever we knew about it is stale.
+        if let Ok(own_url) = Url::from_file_path(path) {
+            if !entries.iter().any(|(url, _, _)| *url == own_url) {
+                debug!(url = %own_url, "file unreadable on re-hydrate; evicting from index");
+                ws.evict(&own_url);
+            }
+        }
         for (url, syms, tree) in entries {
             debug!(url = %url, count = syms.len(), "re-hydrated single file");
             let names = mimir_syntax::symbols::identifier_names(tree.source());
@@ -923,44 +1036,46 @@ impl Backend {
 ///
 /// Must be called on the **pre-edit** rope so that `start_byte` and
 /// `old_end_byte` refer to offsets in the old text, as tree-sitter requires.
-/// Returns `None` when the LSP range is out of bounds (we fall back to a
-/// full re-parse in that case).
+///
+/// Positions go through the same clamping
+/// ([`MRange::to_byte_range_clamped`]) the buffer edit itself uses, so the
+/// recorded edit always describes exactly what happened to the text.
+/// Returns `None` only for an inverted range — which the buffer rejects too.
 fn make_input_edit(rope: &Rope, range: MRange, new_text: &str) -> Option<InputEdit> {
-    let start_byte = range.start.to_byte_offset(rope).ok()?;
-    let old_end_byte = range.end.to_byte_offset(rope).ok()?;
+    let bytes = range.to_byte_range_clamped(rope).ok()?;
+    let (start_byte, old_end_byte) = (bytes.start, bytes.end);
     let new_end_byte = start_byte + new_text.len();
 
-    let start_row = range.start.line as usize;
-    let start_col = start_byte - rope.line_to_byte(start_row);
-
-    let old_end_row = range.end.line as usize;
-    let old_end_col = old_end_byte - rope.line_to_byte(old_end_row);
+    // tree-sitter points are (row, byte column within the row).
+    let point_at = |byte: usize| {
+        let row = rope.byte_to_line(byte);
+        tree_sitter::Point {
+            row,
+            column: byte - rope.line_to_byte(row),
+        }
+    };
+    let start_position = point_at(start_byte);
+    let old_end_position = point_at(old_end_byte);
 
     // Where does the inserted text end in the new document?
-    let newline_count = new_text.bytes().filter(|&b| b == b'\n').count();
-    let (new_end_row, new_end_col) = if newline_count == 0 {
-        (start_row, start_col + new_text.len())
-    } else {
-        let last_nl = new_text.rfind('\n').unwrap();
-        (start_row + newline_count, new_text.len() - last_nl - 1)
+    let new_end_position = match new_text.rfind('\n') {
+        None => tree_sitter::Point {
+            row: start_position.row,
+            column: start_position.column + new_text.len(),
+        },
+        Some(last_nl) => tree_sitter::Point {
+            row: start_position.row + new_text.bytes().filter(|&b| b == b'\n').count(),
+            column: new_text.len() - last_nl - 1,
+        },
     };
 
     Some(InputEdit {
         start_byte,
         old_end_byte,
         new_end_byte,
-        start_position: tree_sitter::Point {
-            row: start_row,
-            column: start_col,
-        },
-        old_end_position: tree_sitter::Point {
-            row: old_end_row,
-            column: old_end_col,
-        },
-        new_end_position: tree_sitter::Point {
-            row: new_end_row,
-            column: new_end_col,
-        },
+        start_position,
+        old_end_position,
+        new_end_position,
     })
 }
 
@@ -989,7 +1104,7 @@ impl Backend {
             debug!("hover: no cached parse for this URI");
             return Ok(None);
         };
-        let rope = {
+        let live_rope = {
             let docs = self.documents.read().await;
             match docs.get(&uri) {
                 Some(state) => state.document.rope().clone(),
@@ -1000,15 +1115,22 @@ impl Backend {
             }
         };
 
-        // AST path: use cached MimirAst for type info and docs.
-        if let Some(ast) = self.adapter.cached_ast().await {
+        // AST path: use cached MimirAst for type info and docs. It reads the
+        // word under the cursor from the live buffer.
+        if let Some(ast) = self.fresh_ast(&uri).await {
             let file_path = crate::paths::uri_to_path_string(&uri);
             if let Some(path) = file_path {
-                if let Some(hover) = ast_features::hover(&ast, &path, mimir_pos, &rope) {
+                if let Some(hover) = ast_features::hover(&ast, &path, mimir_pos, &live_rope) {
                     return Ok(Some(hover));
                 }
             }
         }
+
+        // Everything below walks the parse tree, so it must use the text
+        // that tree was parsed from — not the live buffer, which may already
+        // be an edit ahead. Mixing the two applies the tree's byte offsets
+        // to a rope they don't fit.
+        let rope = Rope::from_str(tree.source());
 
         if let Some(hover) =
             Box::pin(self.hover_via_tree_sitter(&uri, &tree, &rope, &index, target)).await
@@ -1156,6 +1278,20 @@ impl Backend {
         }
     }
 
+    /// Handler for the custom `mimir/debug/panic` request: panic on purpose.
+    ///
+    /// A fault-injection hook for the integration suite, which needs a way
+    /// to check what the *process* does when a handler panics (it must exit
+    /// so the editor can restart it — see the panic hook in `main.rs`).
+    /// Inert unless the server was started with `MIMIR_DEBUG_HOOKS` set, in
+    /// which case it answers "method not found" like any unknown request.
+    pub(crate) async fn debug_panic(&self, _params: Option<serde_json::Value>) -> LspResult<()> {
+        if std::env::var_os(crate::DEBUG_HOOKS_ENV).is_none() {
+            return Err(tower_lsp::jsonrpc::Error::method_not_found());
+        }
+        panic!("mimir/debug/panic requested ({} is set)", crate::DEBUG_HOOKS_ENV);
+    }
+
     /// Handler for the custom `mimir/uvmDb` LSP request (registered in
     /// `main.rs` via `LspService::build(...).custom_method(...)`).
     ///
@@ -1301,11 +1437,13 @@ impl LanguageServer for Backend {
                     let include_dirs = resolved.include_dirs.clone();
                     let ts = self.ts.clone();
                     let workspace = self.workspace.clone();
+                    let documents = self.documents.clone();
                     // Snapshot the first project file before the move so we
                     // can build a stable startup-elaborate trigger URI.
                     let first_project_file = paths.first().cloned();
                     tokio::spawn(async move {
-                        hydrate_workspace_index(paths, include_dirs, ts, workspace).await;
+                        hydrate_workspace_index(paths, include_dirs, ts, workspace, documents)
+                            .await;
                     });
                     self.slang.set_project(Some(resolved)).await;
 
@@ -1624,19 +1762,10 @@ impl LanguageServer for Backend {
 
         {
             let mut docs = self.documents.write().await;
-            docs.insert(
-                uri.clone(),
-                DocumentState {
-                    document: TextDocument::new(&text, version),
-                    language_id,
-                    index: Vec::new(),
-                    tree: None,
-                    index_version: i32::MIN,
-                },
-            );
+            docs.insert(uri.clone(), DocumentState::new(&text, version, language_id));
         }
 
-        self.reparse_and_publish(uri.clone(), Vec::new()).await;
+        self.reparse_and_publish(uri.clone()).await;
         self.elaborate.schedule(uri).await;
     }
 
@@ -1651,61 +1780,22 @@ impl LanguageServer for Backend {
         // later ones. We use a write lock for the whole batch so partial
         // states aren't observable to a concurrent reparse.
         //
-        // We also build `tree_sitter::InputEdit`s so `reparse_and_publish`
-        // can hand them to the parser for incremental reuse of unchanged
-        // subtrees. A full-sync change (no `range`) resets the edits to
-        // empty, signalling a full re-parse.
-        let mut edits: Vec<InputEdit> = Vec::new();
+        // Each change is also recorded on the document as a
+        // `tree_sitter::InputEdit` (see `DocumentState::pending_edits`) so
+        // the re-parse can replay the complete history onto the cached tree
+        // and reuse unchanged subtrees.
         {
             let mut docs = self.documents.write().await;
             let Some(state) = docs.get_mut(&uri) else {
                 warn!("did_change for unknown URI; ignoring");
                 return;
             };
-
-            for change in params.content_changes {
-                match change.range {
-                    None => {
-                        // Full sync (only happens if the client opted out
-                        // of incremental sync — we advertise INCREMENTAL,
-                        // but be defensive). Reset edits; full re-parse.
-                        edits.clear();
-                        state.document.replace_all(&change.text, new_version);
-                    }
-                    Some(range) => {
-                        let m_range = MRange::new(
-                            MPosition::new(range.start.line, range.start.character),
-                            MPosition::new(range.end.line, range.end.character),
-                        );
-                        // Compute the InputEdit before mutating the rope so
-                        // byte offsets still refer to the pre-edit text.
-                        if let Some(edit) =
-                            make_input_edit(state.document.rope(), m_range, &change.text)
-                        {
-                            edits.push(edit);
-                        } else {
-                            // Could not compute edit (out-of-bounds position).
-                            // Fall back to full re-parse for safety.
-                            edits.clear();
-                        }
-                        if let Err(e) = state.document.apply_incremental_edit(
-                            m_range,
-                            &change.text,
-                            new_version,
-                        ) {
-                            // A bad edit means the editor and us disagree
-                            // about document state. Log loudly; the
-                            // diagnostics for this version will be wrong
-                            // but the next full sync should resync us.
-                            error!(error = %e, "incremental edit failed");
-                            edits.clear();
-                        }
-                    }
-                }
+            for change in &params.content_changes {
+                state.apply_change(change, new_version);
             }
         }
 
-        self.reparse_and_publish(uri.clone(), edits).await;
+        self.reparse_and_publish(uri.clone()).await;
         self.elaborate.schedule(uri).await;
     }
 
@@ -1725,8 +1815,51 @@ impl LanguageServer for Backend {
         // history is dead weight — drop it or the map grows unbounded
         // across a long session.
         self.adapter.evict_expansions(&uri).await;
-        // LSP spec: clear diagnostics for closed docs by publishing empty.
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+
+        // The workspace index still holds what the *buffer* contained,
+        // including edits that were discarded on close. Put the on-disk
+        // contents back (or, for a buffer with no file behind it, remove
+        // the entry altogether).
+        let from_disk = match uri.to_file_path() {
+            Ok(path) => self.ts.hydrate_file_only(&path).await,
+            Err(()) => None,
+        };
+        // The disk read ran off-thread; if the document was re-opened in the
+        // meantime its buffer is authoritative again — leave the index alone.
+        let reopened = self.documents.read().await.contains_key(&uri);
+        if !reopened {
+            let mut ws = self.workspace.write().await;
+            match from_disk {
+                Some((url, syms, tree)) => {
+                    if url != uri {
+                        // Same file, differently spelled URL: don't leave
+                        // the buffer's entry behind under the old spelling.
+                        ws.evict(&uri);
+                    }
+                    let names = mimir_syntax::symbols::identifier_names(tree.source());
+                    ws.update_presence(url.clone(), names);
+                    ws.index.update(url.clone(), &syms);
+                    ws.trees.insert(url, tree);
+                }
+                None => ws.evict(&uri),
+            }
+        }
+
+        // Tree-sitter diagnostics belonged to the buffer: clear them (LSP
+        // convention for closed docs). But a file that is part of the slang
+        // compilation keeps its elaboration diagnostics whether or not it is
+        // open — publishing an empty list here used to wipe them from the
+        // Problems panel until some later compile happened to change.
+        let remaining = self
+            .elaborate
+            .last_slang_diagnostics(&uri)
+            .await
+            .unwrap_or_default();
+        self.client.publish_diagnostics(uri.clone(), remaining, None).await;
+
+        // The compilation's view of this file just changed from buffer text
+        // to disk text. Re-elaborate (a no-op when the two are identical).
+        self.elaborate.schedule(uri).await;
     }
 
     /// File saved by the editor. We don't re-parse — `did_change` has
@@ -1779,8 +1912,7 @@ impl LanguageServer for Backend {
                 FileChangeType::DELETED => {
                     debug!(path = %path.display(), "watched file deleted; evicting");
                     let mut ws = self.workspace.write().await;
-                    ws.index.update(evt.uri.clone(), &[]);
-                    ws.trees.remove(&evt.uri);
+                    ws.evict(&evt.uri);
                 }
                 FileChangeType::CREATED | FileChangeType::CHANGED => {
                     if is_mimir_toml {
@@ -1824,7 +1956,7 @@ impl LanguageServer for Backend {
         let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
         // AST path: MimirAst from the last successful compile.
-        if let Some(ast) = self.adapter.cached_ast().await {
+        if let Some(ast) = self.fresh_ast(&uri).await {
             let rope = {
                 let docs = self.documents.read().await;
                 docs.get(&uri).map(|s| s.document.rope().clone())
@@ -1857,7 +1989,7 @@ impl LanguageServer for Backend {
         let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
         // AST path: same as definition — MimirDecl.range points to the name token.
-        if let Some(ast) = self.adapter.cached_ast().await {
+        if let Some(ast) = self.fresh_ast(&uri).await {
             let rope = {
                 let docs = self.documents.read().await;
                 docs.get(&uri).map(|s| s.document.rope().clone())
@@ -1889,7 +2021,7 @@ impl LanguageServer for Backend {
         let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
         // AST path: find the type of the symbol and jump to its declaration.
-        if let Some(ast) = self.adapter.cached_ast().await {
+        if let Some(ast) = self.fresh_ast(&uri).await {
             let rope = {
                 let docs = self.documents.read().await;
                 docs.get(&uri).map(|s| s.document.rope().clone())
@@ -2077,7 +2209,7 @@ impl LanguageServer for Backend {
         // declared type is the class — resolve that via the AST and try it as
         // a fallback so the type hierarchy can be opened on a concrete object.
         let mut candidates = vec![name.clone()];
-        if let Some(ast) = self.adapter.cached_ast().await {
+        if let Some(ast) = self.fresh_ast(&uri).await {
             if let Some(path) =
                 crate::paths::uri_to_path_string(&uri)
             {
@@ -2698,16 +2830,10 @@ impl LanguageServer for Backend {
             debug!("semantic_tokens_full: no tree available");
             return Ok(None);
         };
-        let rope = {
-            let docs = self.documents.read().await;
-            match docs.get(&uri) {
-                Some(state) => state.document.rope().clone(),
-                None => {
-                    debug!("semantic_tokens_full: URI not in open-doc store");
-                    return Ok(None);
-                }
-            }
-        };
+        // The rope must be the text the tree was parsed from: token byte
+        // spans come from the tree, and the live buffer may already be an
+        // edit ahead of it (see `hover_impl`).
+        let rope = Rope::from_str(tree.source());
         let raw = mimir_syntax::semantic_tokens::semantic_tokens(
             &tree,
             &rope,
@@ -2743,27 +2869,18 @@ impl LanguageServer for Backend {
             debug!("semantic_tokens_range: no tree available");
             return Ok(None);
         };
-        let rope = {
-            let docs = self.documents.read().await;
-            match docs.get(&uri) {
-                Some(state) => state.document.rope().clone(),
-                None => {
-                    debug!("semantic_tokens_range: URI not in open-doc store");
-                    return Ok(None);
-                }
-            }
-        };
-        let start =
-            MPosition::new(params.range.start.line, params.range.start.character)
-                .to_byte_offset(&rope)
-                .ok();
-        let end = MPosition::new(params.range.end.line, params.range.end.character)
-            .to_byte_offset(&rope)
-            .ok();
-        let (Some(start_byte), Some(end_byte)) = (start, end) else {
-            debug!("semantic_tokens_range: range out of bounds");
+        // Same snapshot rule as `semantic_tokens_full`: the tree's own text.
+        let rope = Rope::from_str(tree.source());
+        // Clamp rather than reject: editors routinely ask for a viewport
+        // that ends on the line after the last one.
+        let start_byte = MPosition::new(params.range.start.line, params.range.start.character)
+            .to_byte_offset_clamped(&rope);
+        let end_byte = MPosition::new(params.range.end.line, params.range.end.character)
+            .to_byte_offset_clamped(&rope);
+        if end_byte < start_byte {
+            debug!("semantic_tokens_range: inverted range");
             return Ok(None);
-        };
+        }
         let raw = mimir_syntax::semantic_tokens::semantic_tokens_in_range(
             &tree,
             &rope,
@@ -2794,7 +2911,7 @@ impl LanguageServer for Backend {
         let mimir_pos = ast_features::lsp_to_mimir_pos(pos);
 
         // --- AST path ---
-        if let Some(ast) = self.adapter.cached_ast().await {
+        if let Some(ast) = self.fresh_ast(&uri).await {
             let rope = {
                 let docs = self.documents.read().await;
                 docs.get(&uri).map(|s| s.document.rope().clone())
@@ -2892,9 +3009,10 @@ impl LanguageServer for Backend {
         let rope = Rope::from_str(tree.source());
 
         // Slang reference map (receiver-aware method resolution). Fetched
-        // once for the whole viewport; `None` when no compile has landed or
-        // the URI isn't a real file path.
-        let cached_ast = self.adapter.cached_ast().await;
+        // once for the whole viewport; `None` when no compile has landed,
+        // the buffer has been edited since the last compile (the map's
+        // positions would be stale), or the URI isn't a real file path.
+        let cached_ast = self.fresh_ast(&uri).await;
         let file_path = uri
             .to_file_path()
             .ok()
@@ -3355,7 +3473,7 @@ impl LanguageServer for Backend {
                 .url
                 .to_file_path()
                 .ok()
-                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .and_then(|p| crate::source_io::read_source_lossy(&p))
                 .and_then(|text| read_line_trimmed(&Rope::from_str(&text), resolve.line))
         });
 
@@ -3420,14 +3538,27 @@ async fn hydrate_workspace_index(
     include_dirs: Vec<PathBuf>,
     ts: Arc<TreeSitterProvider>,
     workspace: Arc<RwLock<WorkspaceState>>,
+    documents: Arc<RwLock<HashMap<Url, DocumentState>>>,
 ) {
     let count_requested = paths.len();
     let entries = ts.hydrate_paths(&paths, &include_dirs).await;
 
+    // Hydration read every file from *disk*, possibly seconds ago. Anything
+    // the editor has open in the meantime is authoritative (and has been —
+    // or is about to be — indexed from its buffer by `reparse_and_publish`),
+    // so its on-disk parse must not overwrite it. Snapshot the open set
+    // first; the two locks are never held together.
+    let open: HashSet<Url> = documents.read().await.keys().cloned().collect();
+
     let parsed = entries.len();
+    let mut skipped_open = 0usize;
     {
         let mut ws = workspace.write().await;
         for (url, syms, tree) in entries {
+            if open.contains(&url) {
+                skipped_open += 1;
+                continue;
+            }
             let names = mimir_syntax::symbols::identifier_names(tree.source());
             ws.update_presence(url.clone(), names);
             ws.index.update(url.clone(), &syms);
@@ -3437,17 +3568,10 @@ async fn hydrate_workspace_index(
     info!(
         files = parsed,
         requested = count_requested,
+        skipped_open,
         "workspace index hydrated",
     );
 }
-
-
-
-
-
-
-
-
 
 //
 // These tests cover the *pure-logic* helpers. The full `Backend` requires
@@ -3722,6 +3846,397 @@ mod tests {
         // No assertion needed beyond "didn't panic" — the workspace
         // index remains empty.
         assert_eq!(backend.workspace.read().await.index.entries().count(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    fn open_params(uri: &Url, text: &str) -> DidOpenTextDocumentParams {
+        DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "systemverilog".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        }
+    }
+
+    fn change(uri: &Url, version: i32, range: Option<Range>, text: &str) -> DidChangeTextDocumentParams {
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range,
+                range_length: None,
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn lsp_range(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
+        Range::new(Position::new(sl, sc), Position::new(el, ec))
+    }
+
+    /// S-expression of a from-scratch parse of `text` — the ground truth an
+    /// incrementally maintained tree must match.
+    fn cold_sexp(text: &str) -> String {
+        let mut parser = mimir_syntax::SyntaxParser::new().unwrap();
+        parser.parse(text, None).unwrap().tree.root_node().to_sexp()
+    }
+
+    /// Regression: two `didChange`s whose re-parses overlap (the parser
+    /// mutex was busy — workspace hydration holds it for seconds at startup)
+    /// used to corrupt the cached tree. Each re-parse carried only *its own*
+    /// edit and applied it to whatever tree happened to be cached, so the
+    /// second one patched the pre-first-edit tree with half the history.
+    /// tree-sitter then reused nodes at stale byte offsets: wrong symbols,
+    /// wrong highlights, and node ranges past the end of the text (a panic
+    /// for anything that slices the source).
+    #[tokio::test]
+    async fn regression_overlapping_reparses_keep_the_tree_consistent() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/race.sv").unwrap();
+        let v1 = "module a;\n  int x;\nendmodule\nmodule b;\n  int y;\nendmodule\n";
+        backend.did_open(open_params(&uri, v1)).await;
+
+        // Park every parse until both edits have been applied to the rope.
+        let parked = backend.ts.lock_parser_for_test().await;
+        // Edit A (v2): delete the whole of `module a` (lines 0..3).
+        let edit_a = backend.did_change(change(&uri, 2, Some(lsp_range(0, 0, 3, 0)), ""));
+        // Edit B (v3), in v2 coordinates: add a declaration inside `module b`.
+        let edit_b =
+            backend.did_change(change(&uri, 3, Some(lsp_range(1, 0, 1, 0)), "  logic z;\n"));
+        let release = async {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            drop(parked);
+        };
+        tokio::join!(edit_a, edit_b, release);
+
+        let expected_text = "module b;\n  logic z;\n  int y;\nendmodule\n";
+        let docs = backend.documents.read().await;
+        let state = docs.get(&uri).unwrap();
+        assert_eq!(state.document.text(), expected_text, "both edits applied to the buffer");
+        let tree = state.tree.as_ref().expect("tree cached");
+        assert_eq!(tree.source(), expected_text, "cached tree is for the current text");
+        assert_eq!(
+            tree.tree.root_node().to_sexp(),
+            cold_sexp(expected_text),
+            "incrementally maintained tree must equal a from-scratch parse",
+        );
+        let names: Vec<&str> = state.index.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "z", "y"], "symbol index reflects the final text");
+    }
+
+    /// Regression: a change batch that mixes a full-document replacement
+    /// with a later ranged edit used to hand tree-sitter the *old* tree plus
+    /// only the ranged edit — an edit list that doesn't describe how the old
+    /// text became the new one.
+    #[tokio::test]
+    async fn regression_full_sync_followed_by_ranged_edit_reparses_from_scratch() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/mixed-sync.sv").unwrap();
+        backend
+            .did_open(open_params(&uri, "module a;\n  int x;\nendmodule\nmodule b;\nendmodule\n"))
+            .await;
+
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri: uri.clone(), version: 2 },
+                content_changes: vec![
+                    TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: "class c;\nendclass\n".to_string(),
+                    },
+                    TextDocumentContentChangeEvent {
+                        range: Some(lsp_range(1, 0, 1, 0)),
+                        range_length: None,
+                        text: "  int field;\n".to_string(),
+                    },
+                ],
+            })
+            .await;
+
+        let expected_text = "class c;\n  int field;\nendclass\n";
+        let docs = backend.documents.read().await;
+        let state = docs.get(&uri).unwrap();
+        assert_eq!(state.document.text(), expected_text);
+        let tree = state.tree.as_ref().unwrap();
+        assert_eq!(tree.tree.root_node().to_sexp(), cold_sexp(expected_text));
+        let names: Vec<&str> = state.index.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["c", "field"]);
+    }
+
+    /// Regression: a ranged edit whose end position lies past the end of the
+    /// line / document (legal per the LSP spec, which clamps) used to be
+    /// rejected and dropped, leaving the server's buffer permanently out of
+    /// sync with the editor.
+    #[tokio::test]
+    async fn regression_out_of_range_edit_is_clamped_not_dropped() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/clamp.sv").unwrap();
+        backend.did_open(open_params(&uri, "module a;\nendmodule")).await;
+
+        // "Replace from line 1 to the end of the document", end expressed as
+        // the start of the (non-existent) line after the last one.
+        backend
+            .did_change(change(&uri, 2, Some(lsp_range(1, 0, 2, 0)), "  int q;\nendmodule\n"))
+            .await;
+
+        let expected_text = "module a;\n  int q;\nendmodule\n";
+        let docs = backend.documents.read().await;
+        let state = docs.get(&uri).unwrap();
+        assert_eq!(state.document.text(), expected_text);
+        assert_eq!(
+            state.tree.as_ref().unwrap().tree.root_node().to_sexp(),
+            cold_sexp(expected_text),
+        );
+    }
+
+    /// Regression: feature handlers paired the *cached* parse tree with the
+    /// *live* text buffer. Between a `didChange` and its re-parse landing
+    /// those describe different texts, so byte offsets from the tree were
+    /// applied to a rope they don't fit — out-of-bounds rope access (a
+    /// crash) when the buffer shrank, garbage columns otherwise. A handler
+    /// must answer from one consistent snapshot: the tree and the text it
+    /// was parsed from.
+    #[tokio::test]
+    async fn regression_semantic_tokens_use_a_consistent_tree_and_text_snapshot() {
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/stale-tree.sv").unwrap();
+        let v1 = "// héllo wörld\nmodule a;\n  int x;\n  int y;\n  int z;\nendmodule\n";
+        backend.did_open(open_params(&uri, v1)).await;
+
+        let expected = {
+            let docs = backend.documents.read().await;
+            let tree = docs.get(&uri).unwrap().tree.clone().unwrap();
+            let rope = Rope::from_str(tree.source());
+            encode_semantic_tokens(&mimir_syntax::semantic_tokens::semantic_tokens(&tree, &rope, true))
+        };
+
+        // Simulate the window where the buffer has moved on (it shrank) but
+        // the re-parse hasn't landed: the cached tree still describes `v1`.
+        {
+            let mut docs = backend.documents.write().await;
+            docs.get_mut(&uri).unwrap().document.replace_all("module a;\n", 2);
+        }
+
+        let full = backend
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("handler must not fail");
+        let Some(SemanticTokensResult::Tokens(tokens)) = full else {
+            panic!("expected tokens, got {full:?}");
+        };
+        assert_eq!(tokens.data, expected, "tokens must be computed against the tree's own text");
+
+        // Hover over a position that only exists in the tree's text must not
+        // panic either.
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(3, 6),
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .await;
+        assert!(hover.is_ok());
+    }
+
+    /// Regression: the slang AST (reference map, declaration ranges) is a
+    /// snapshot of the text that was *compiled*. After an edit, its
+    /// positions describe a document that no longer exists until the
+    /// debounced re-compile lands — but position-keyed lookups kept using
+    /// it, so go-to-definition / hover on one identifier answered for
+    /// whatever identifier used to sit at those coordinates. While a file is
+    /// ahead of its last compile, those features must fall back to the
+    /// (always current) tree-sitter path.
+    #[tokio::test]
+    async fn regression_stale_ast_is_not_used_after_an_edit() {
+        use mimir_ast::{DeclKind, MimirAst, MimirFile, MimirPos, MimirRange, MimirRef, MimirScope};
+
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::parse("file:///tmp/stale-ast.sv").unwrap();
+        let v1 = "module m;\n  int foo;\n  int bar;\n  initial foo = bar;\nendmodule\n";
+        backend.did_open(open_params(&uri, v1)).await;
+
+        // The AST slang produced for v1: the `foo` on line 3 resolves to a
+        // declaration in another file (so its answer is distinguishable
+        // from tree-sitter's same-file one).
+        let mrange = |sl, sc, el, ec| MimirRange {
+            start: MimirPos { line: sl, character: sc },
+            end: MimirPos { line: el, character: ec },
+        };
+        let ast = MimirAst {
+            files: vec![MimirFile {
+                uri: "/tmp/stale-ast.sv".to_string(),
+                diagnostics: vec![],
+                top_scope: MimirScope {
+                    range: mrange(0, 0, 100, 0),
+                    declarations: vec![],
+                    children: vec![],
+                    imported_packages: vec![],
+                },
+                references: vec![MimirRef {
+                    use_range: mrange(3, 10, 3, 13),
+                    target_path: "/tmp/elsewhere.sv".to_string(),
+                    target_range: mrange(7, 4, 7, 7),
+                    target_kind: DeclKind::Variable,
+                    target_type_str: Some("int".to_string()),
+                    target_params: vec![],
+                    target_parent_class: None,
+                }],
+            }],
+        };
+        backend
+            .adapter
+            .set_cached_ast_for_test(ast, HashMap::from([(uri.clone(), 0u64)]))
+            .await;
+
+        let definition_at = |line: u32, character: u32| {
+            backend.goto_definition(GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(line, character),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+        };
+        let targets = |resp: Option<GotoDefinitionResponse>| -> Vec<(String, u32)> {
+            match resp {
+                Some(GotoDefinitionResponse::Scalar(l)) => vec![(l.uri.path().to_string(), l.range.start.line)],
+                Some(GotoDefinitionResponse::Array(ls)) => ls
+                    .into_iter()
+                    .map(|l| (l.uri.path().to_string(), l.range.start.line))
+                    .collect(),
+                _ => vec![],
+            }
+        };
+
+        // While the buffer still matches the compile, the AST answers.
+        assert_eq!(
+            targets(definition_at(3, 10).await.unwrap()),
+            vec![("/tmp/elsewhere.sv".to_string(), 7)],
+            "fresh AST must be used",
+        );
+
+        // Insert a line above: (3, 10) now sits on `bar`, not `foo`.
+        backend
+            .did_change(change(&uri, 2, Some(lsp_range(3, 0, 3, 0)), "  initial bar = foo;\n"))
+            .await;
+        assert_eq!(
+            targets(definition_at(3, 10).await.unwrap()),
+            vec![("/tmp/stale-ast.sv".to_string(), 2)],
+            "after an edit the stale reference map must not answer for `bar`",
+        );
+    }
+
+    /// Regression: startup hydration parses every filelist entry *from
+    /// disk* and folded the results into the workspace index when it
+    /// finished — overwriting the entries of files the user had meanwhile
+    /// opened and edited. Cross-file features then answered from the stale
+    /// on-disk text until the next keystroke in that file. Open buffers are
+    /// authoritative; hydration must leave them alone.
+    #[tokio::test]
+    async fn regression_hydration_does_not_clobber_open_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let open_path = dir.path().join("open.sv");
+        let closed_path = dir.path().join("closed.sv");
+        std::fs::write(&open_path, "module disk_version; endmodule\n").unwrap();
+        std::fs::write(&closed_path, "module closed_mod; endmodule\n").unwrap();
+
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::from_file_path(&open_path).unwrap();
+        // The editor has the file open with unsaved changes.
+        backend
+            .did_open(open_params(&uri, "module buffer_version; endmodule\n"))
+            .await;
+
+        hydrate_workspace_index(
+            vec![open_path.clone(), closed_path.clone()],
+            Vec::new(),
+            backend.ts.clone(),
+            backend.workspace.clone(),
+            backend.documents.clone(),
+        )
+        .await;
+
+        let ws = backend.workspace.read().await;
+        assert!(
+            !ws.index.lookup("buffer_version").is_empty(),
+            "the open buffer's symbols must survive hydration",
+        );
+        assert!(
+            ws.index.lookup("disk_version").is_empty(),
+            "stale on-disk symbols must not replace the open buffer's",
+        );
+        assert!(
+            ws.trees[&uri].source().contains("buffer_version"),
+            "the cached tree must still be the open buffer's",
+        );
+        assert!(!ws.index.lookup("closed_mod").is_empty(), "closed files are still hydrated");
+    }
+
+    /// Regression: closing a document left its *buffer* contents in the
+    /// workspace index forever. Unsaved edits that were discarded on close
+    /// kept answering go-to-definition / references / completion, and a
+    /// scratch buffer that never existed on disk kept its symbols. After
+    /// `didClose` the disk is the truth again.
+    #[tokio::test]
+    async fn regression_did_close_restores_the_on_disk_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.sv");
+        std::fs::write(&path, "module saved_mod; endmodule\n").unwrap();
+
+        let (service, _socket) = tower_lsp::LspService::new(|client| Backend::new(client, None));
+        let backend = service.inner();
+        let uri = Url::from_file_path(&path).unwrap();
+        backend
+            .did_open(open_params(&uri, "module unsaved_mod; endmodule\n"))
+            .await;
+        assert!(!backend.workspace.read().await.index.lookup("unsaved_mod").is_empty());
+
+        // A buffer that has no file behind it at all.
+        let scratch = Url::from_file_path(dir.path().join("scratch.sv")).unwrap();
+        backend
+            .did_open(open_params(&scratch, "module scratch_mod; endmodule\n"))
+            .await;
+
+        for u in [&uri, &scratch] {
+            backend
+                .did_close(DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier { uri: u.clone() },
+                })
+                .await;
+        }
+
+        let ws = backend.workspace.read().await;
+        assert!(ws.index.lookup("unsaved_mod").is_empty(), "discarded edits must leave the index");
+        assert!(!ws.index.lookup("saved_mod").is_empty(), "on-disk contents are indexed again");
+        assert!(ws.index.lookup("scratch_mod").is_empty(), "a file-less buffer leaves no trace");
+        assert!(!ws.trees.contains_key(&scratch));
+        assert!(
+            ws.files_containing("scratch_mod").map_or(true, |s| s.is_empty()),
+            "presence index must be cleaned up too",
+        );
     }
 
     /// `rename` must advertise prepare support in `initialize`.

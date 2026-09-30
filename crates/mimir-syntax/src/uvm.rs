@@ -144,13 +144,17 @@ fn has_super_call(node: Node<'_>, source: &str, name: &str) -> bool {
     found
 }
 
-/// Pre-order walk invoking `f` on every node in the subtree.
+/// Pre-order walk invoking `f` on every named node in the subtree.
+/// Iterative (see [`crate::walk`]) so a deeply nested body can't overflow
+/// the stack.
 fn visit<'a>(node: Node<'a>, f: &mut impl FnMut(Node<'a>)) {
-    f(node);
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit(child, f);
-    }
+    crate::walk::preorder(node, |n| {
+        if !n.is_named() {
+            return crate::walk::Walk::Skip;
+        }
+        f(n);
+        crate::walk::Walk::Descend
+    });
 }
 
 /// Text of the first `simple_identifier` descendant of `node`, if any.

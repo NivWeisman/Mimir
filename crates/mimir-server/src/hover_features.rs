@@ -37,7 +37,7 @@ pub(crate) fn hover_for_symbol(
         .map(|s| s.document.rope().clone())
         .or_else(|| {
             let path = sym_url.to_file_path().ok()?;
-            std::fs::read_to_string(&path).ok().map(|t| Rope::from_str(&t))
+            crate::source_io::read_source_lossy(&path).map(|t| Rope::from_str(&t))
         });
 
     let mut md = base_markdown(sym, sym_url, rope.as_ref())?;
@@ -258,7 +258,7 @@ fn read_range_text(
 
     doc_rope.and_then(slice_from_rope).or_else(|| {
         let path = sym_url.to_file_path().ok()?;
-        let text = std::fs::read_to_string(&path).ok()?;
+        let text = crate::source_io::read_source_lossy(&path)?;
         let rope = Rope::from_str(&text);
         slice_from_rope(&rope)
     })
@@ -309,7 +309,15 @@ pub(crate) fn read_macro_body(sym: &Symbol, sym_url: &Url, doc_rope: Option<&Rop
     // body. We keep this conservative: skip the first source line up to
     // and including the closing paren of the params; if there's no `(`
     // skip past the name.
-    let after_name = raw.find(&sym.name).map(|i| i + sym.name.len()).unwrap_or(0);
+    //
+    // The search for the name starts *after* the `` `define `` keyword: a
+    // macro called `d`, `e`, `fin`, … would otherwise match inside the
+    // keyword itself and the "body" would begin mid-keyword.
+    let search_from = raw.find("`define").map(|i| i + "`define".len()).unwrap_or(0);
+    let after_name = raw[search_from..]
+        .find(&sym.name)
+        .map(|i| search_from + i + sym.name.len())
+        .unwrap_or(search_from);
     let after_params = if let Some(rest) = raw.get(after_name..) {
         if rest.trim_start().starts_with('(') {
             // Skip to the matching `)`.
@@ -602,7 +610,7 @@ pub(crate) fn read_line_trimmed(rope: &Rope, line: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mimir_core::{Range as MRange, TextDocument};
+    use mimir_core::Range as MRange;
     use crate::backend::DocumentState;
 
     fn url(s: &str) -> Url {
@@ -735,13 +743,7 @@ mod tests {
     /// Build a `DocumentState` for tests with the given text. The parsed
     /// `tree`/`index` are left empty — the hover helpers don't read them.
     fn doc_state(text: &str) -> DocumentState {
-        DocumentState {
-            document: TextDocument::new(text, 1),
-            language_id: "systemverilog".to_string(),
-            index: Vec::new(),
-            tree: None,
-            index_version: 0,
-        }
+        DocumentState::new(text, 1, "systemverilog".to_string())
     }
 
 
@@ -1333,6 +1335,35 @@ endmodule
         assert_eq!(body, "a + b");
     }
 
+
+    /// Regression: the header was skipped by searching the raw text for the
+    /// macro's *name* — which, for a macro called `d`, `e`, `fin`, `define`…
+    /// first matches inside the `` `define `` keyword itself. The "body"
+    /// then started mid-keyword (`` `define d 1 `` hovered as `efine d 1`).
+    #[test]
+    fn regression_macro_body_for_name_that_occurs_in_define_keyword() {
+        let url = url("file:///a.sv");
+        for (name, text, want) in [
+            ("d", "`define d 1\n", "1"),
+            ("e", "`define e(x) (x + 1)\n", "(x + 1)"),
+            ("fin", "`define   fin  done_flag\n", "done_flag"),
+        ] {
+            let rope = Rope::from_str(text);
+            let end = text.trim_end().len() as u32;
+            let s = Symbol {
+                name: name.to_string(),
+                kind: MSymbolKind::Macro,
+                name_range: MRange::new(MPosition::new(0, 8), MPosition::new(0, 9)),
+                full_range: MRange::new(MPosition::new(0, 0), MPosition::new(0, end)),
+                params: Some(vec![]),
+                parent_class_name: None,
+                return_type: None,
+                decl_type: None,
+            };
+            let body = read_macro_body(&s, &url, Some(&rope)).expect("body extracted");
+            assert_eq!(body, want, "macro `{name}` in {text:?}");
+        }
+    }
 
     // typedef_base_from_line
 

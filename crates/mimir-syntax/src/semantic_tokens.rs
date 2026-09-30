@@ -50,6 +50,7 @@ use tracing::trace;
 use tree_sitter::Node;
 
 use crate::keywords::KEYWORDS;
+use crate::walk::{Visit, Walk};
 use crate::SyntaxTree;
 
 /// Ordinal-stable list of semantic-token types we emit. The LSP wire
@@ -201,7 +202,7 @@ pub struct RawToken {
 #[must_use]
 pub fn semantic_tokens(tree: &SyntaxTree, rope: &Rope, format_specs: bool) -> Vec<RawToken> {
     let mut out = Vec::new();
-    walk(tree.tree.root_node(), rope, None, format_specs, &mut out);
+    collect(tree.tree.root_node(), rope, None, format_specs, &mut out);
     trace!(count = out.len(), "collected semantic tokens");
     out
 }
@@ -221,12 +222,13 @@ pub fn semantic_tokens_in_range(
     format_specs: bool,
 ) -> Vec<RawToken> {
     let mut out = Vec::new();
-    walk(tree.tree.root_node(), rope, Some(byte_range), format_specs, &mut out);
+    collect(tree.tree.root_node(), rope, Some(byte_range), format_specs, &mut out);
     trace!(count = out.len(), "collected semantic tokens (ranged)");
     out
 }
 
-/// Tree walker. Recursive DFS. For each node:
+/// Tree walker. Iterative pre-order DFS (see [`crate::walk`] — a recursive
+/// walk overflows the stack on deeply nested expressions). For each node:
 ///
 /// * If it's a "stop" kind (string literal, comment, number,
 ///   `system_tf_identifier`) — emit one token and don't descend
@@ -237,139 +239,184 @@ pub fn semantic_tokens_in_range(
 /// * If it's an anonymous keyword leaf — classify keyword-vs-type by
 ///   parent and emit.
 /// * Otherwise, descend.
-fn walk(
-    node: Node<'_>,
+///
+/// The walker keeps its own stack of open ancestors so classification can
+/// look at a node's parent and grandparent without calling
+/// [`Node::parent`], which re-descends from the tree root on every call.
+fn collect(
+    root: Node<'_>,
     rope: &Rope,
     range: Option<std::ops::Range<usize>>,
     format_specs: bool,
     out: &mut Vec<RawToken>,
 ) {
-    // Range filter: skip whole subtrees that don't overlap.
-    if let Some(r) = &range {
-        if node.end_byte() <= r.start || node.start_byte() >= r.end {
-            return;
-        }
-    }
-
-    let kind = node.kind();
-
-    // ── stop kinds: emit a single token covering the whole node and
-    //    don't descend (children would create overlaps).
-    match kind {
-        "one_line_comment" | "block_comment" => {
-            push(node, rope, TokenType::Comment, TokenModifier::NONE, out);
-            return;
-        }
-        "string_literal" => {
-            if format_specs {
-                emit_string_with_format_specs(node, rope, out);
-            } else {
-                push(node, rope, TokenType::String, TokenModifier::NONE, out);
+    // Byte window the caller asked for (`None` = whole document). Besides
+    // pruning subtrees below, it filters the per-line pieces of a token that
+    // straddles the window's edge.
+    let clip = range.as_ref();
+    // Ancestors of the node currently being entered, outermost first.
+    let mut ancestors: Vec<Node<'_>> = Vec::new();
+    crate::walk::walk(root, |event| {
+        let node = match event {
+            Visit::Enter(node) => node,
+            Visit::Leave(_) => {
+                ancestors.pop();
+                return Walk::Descend;
             }
-            return;
-        }
-        "integral_number" | "real_number" | "time_literal" => {
-            push(node, rope, TokenType::Number, TokenModifier::NONE, out);
-            return;
-        }
-        "system_tf_identifier" => {
-            push(node, rope, TokenType::Function, TokenModifier::NONE, out);
-            return;
-        }
-        _ => {}
-    }
-
-    // ── identifier classification by parent context.
-    if kind == "simple_identifier" {
-        let (ty, mods) = classify_identifier(node);
-        push(node, rope, ty, mods, out);
-        return;
-    }
-
-    // ── anonymous leaves whose `kind()` matches a reserved word are
-    //    either `keyword` or `type`, depending on parent context.
-    if !node.is_named() && node.child_count() == 0 && is_keyword_kind(kind) {
-        let ty = if parent_is_type_container(node) {
-            TokenType::Type
-        } else {
-            TokenType::Keyword
         };
-        push(node, rope, ty, TokenModifier::NONE, out);
-        return;
-    }
 
-    // ── otherwise descend.
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, rope, range.clone(), format_specs, out);
-    }
+        // Range filter: skip whole subtrees that don't overlap.
+        if let Some(r) = &range {
+            if node.end_byte() <= r.start || node.start_byte() >= r.end {
+                return Walk::Skip;
+            }
+        }
+
+        let kind = node.kind();
+
+        // ── stop kinds: emit a token covering the whole node and don't
+        //    descend (children would create overlaps).
+        match kind {
+            "one_line_comment" | "block_comment" => {
+                push(node, rope, clip, TokenType::Comment, TokenModifier::NONE, out);
+                return Walk::Skip;
+            }
+            "string_literal" => {
+                if format_specs {
+                    emit_string_with_format_specs(node, rope, clip, out);
+                } else {
+                    push(node, rope, clip, TokenType::String, TokenModifier::NONE, out);
+                }
+                return Walk::Skip;
+            }
+            "integral_number" | "real_number" | "time_literal" => {
+                push(node, rope, clip, TokenType::Number, TokenModifier::NONE, out);
+                return Walk::Skip;
+            }
+            "system_tf_identifier" => {
+                push(node, rope, clip, TokenType::Function, TokenModifier::NONE, out);
+                return Walk::Skip;
+            }
+            _ => {}
+        }
+
+        let parent = ancestors.last().copied();
+
+        // ── identifier classification by parent context.
+        if kind == "simple_identifier" {
+            let grandparent = ancestors.iter().rev().nth(1).copied();
+            let (ty, mods) = classify_identifier(node, parent, grandparent);
+            push(node, rope, clip, ty, mods, out);
+            return Walk::Skip;
+        }
+
+        // ── anonymous leaves whose `kind()` matches a reserved word are
+        //    either `keyword` or `type`, depending on parent context.
+        if !node.is_named() && node.child_count() == 0 && is_keyword_kind(kind) {
+            let ty = if parent_is_type_container(parent) {
+                TokenType::Type
+            } else {
+                TokenType::Keyword
+            };
+            push(node, rope, clip, ty, TokenModifier::NONE, out);
+            return Walk::Skip;
+        }
+
+        // ── otherwise descend. `Leave` pops this entry again.
+        ancestors.push(node);
+        Walk::Descend
+    });
 }
 
-/// Push one [`RawToken`] for `node`. Skips tokens whose byte span is
-/// empty (defensive — tree-sitter occasionally surfaces zero-width
-/// nodes around ERROR recovery).
+/// Push the token(s) for `node`.
+///
+/// A node confined to one line yields one [`RawToken`]. A node that spans
+/// several lines (a `/* … */` block comment, a string with a line
+/// continuation) yields one token *per line*: LSP semantic tokens may not
+/// cross a line break unless the client opts into `multilineTokenSupport`,
+/// which VS Code does not.
 fn push(
     node: Node<'_>,
     rope: &Rope,
+    clip: Option<&std::ops::Range<usize>>,
     token_type: TokenType,
     modifiers: TokenModifier,
     out: &mut Vec<RawToken>,
 ) {
-    let start_byte = node.start_byte();
-    let end_byte = node.end_byte();
-    if end_byte <= start_byte {
-        return;
-    }
-    // tree-sitter `Point::row` is a `\n`-separated line index, which
-    // matches LSP's `line` directly. For columns we go through the
-    // rope so we get UTF-16 code units, not bytes.
-    let start_point = node.start_position();
-    let line = start_point.row as u32;
-
-    let line_start_byte = rope.line_to_byte(line as usize);
-    let start_col = utf16_len_between(rope, line_start_byte, start_byte);
-    let length = utf16_len_between(rope, start_byte, end_byte);
-
-    if length == 0 {
-        return;
-    }
-
-    out.push(RawToken {
-        line,
-        start_col,
-        length,
-        token_type: token_type as u32,
-        modifiers: modifiers.0,
-    });
+    push_span(node.start_byte(), node.end_byte(), rope, clip, token_type, modifiers.0, out);
 }
 
-/// Push one [`RawToken`] directly from absolute byte offsets rather than a
-/// tree-sitter `Node`. Used for sub-tokens within a `string_literal` where
-/// we have no per-fragment node to hand to [`push`].
-fn push_bytes(
+/// Emit one [`RawToken`] per line covered by the byte span
+/// `[start_byte, end_byte)`.
+///
+/// Lines and columns come from `rope` (LSP line terminators, UTF-16
+/// columns) — never from tree-sitter's `Point`, whose rows only count `\n`.
+///
+/// `clip` is the byte window of a ranged request: a per-line piece is only
+/// emitted when it overlaps the window, so a multi-line token that straddles
+/// the window's edge contributes just its in-window lines. Pieces are kept
+/// or dropped whole — never shortened — so a ranged result is always a
+/// subset of the full one.
+///
+/// Defensive by construction: a span that doesn't fit `rope` (the caller
+/// paired a tree with the wrong text) is dropped instead of panicking, and
+/// empty segments are skipped (tree-sitter occasionally surfaces zero-width
+/// nodes around ERROR recovery).
+fn push_span(
     start_byte: usize,
     end_byte: usize,
-    line: u32,
-    line_start_byte: usize,
     rope: &Rope,
+    clip: Option<&std::ops::Range<usize>>,
     token_type: TokenType,
+    modifiers: u32,
     out: &mut Vec<RawToken>,
 ) {
-    if end_byte <= start_byte {
+    if end_byte <= start_byte || end_byte > rope.len_bytes() {
         return;
     }
-    let start_col = utf16_len_between(rope, line_start_byte, start_byte);
-    let length = utf16_len_between(rope, start_byte, end_byte);
-    if length == 0 {
-        return;
+    let first_line = rope.byte_to_line(start_byte);
+    // `end_byte` is exclusive; the last *covered* byte decides the last line.
+    let last_line = rope.byte_to_line(end_byte - 1);
+
+    for line in first_line..=last_line {
+        let line_start = rope.line_to_byte(line);
+        let seg_start = start_byte.max(line_start);
+        let seg_end = end_byte.min(line_start + line_content_len_bytes(rope, line));
+        if seg_end <= seg_start {
+            continue; // blank line inside the span, or only its terminator
+        }
+        if clip.is_some_and(|r| seg_end <= r.start || seg_start >= r.end) {
+            continue; // this line's piece lies outside the requested window
+        }
+        let start_col = utf16_len_between(rope, line_start, seg_start);
+        let length = utf16_len_between(rope, seg_start, seg_end);
+        if length == 0 {
+            continue;
+        }
+        out.push(RawToken {
+            line: line as u32,
+            start_col,
+            length,
+            token_type: token_type as u32,
+            modifiers,
+        });
     }
-    out.push(RawToken {
-        line,
-        start_col,
-        length,
-        token_type: token_type as u32,
-        modifiers: TokenModifier::NONE.0,
-    });
+}
+
+/// Byte length of line `line` *excluding* its terminator (`\n`, `\r\n`,
+/// or `\r`).
+fn line_content_len_bytes(rope: &Rope, line: usize) -> usize {
+    let slice = rope.line(line);
+    let mut len = slice.len_bytes();
+    let mut chars = slice.chars_at(slice.len_chars());
+    while let Some(ch) = chars.prev() {
+        if ch == '\n' || ch == '\r' {
+            len -= 1;
+        } else {
+            break;
+        }
+    }
+    len
 }
 
 /// Returns `true` for the ASCII bytes that legally terminate a SystemVerilog
@@ -406,18 +453,29 @@ fn is_sv_fmt_type(b: u8) -> bool {
 /// Falls through to a single whole-string token when no recognised specifiers
 /// are present, matching the pre-feature behaviour exactly.
 ///
-/// SV string literals are always single-line — `\n` inside a literal is the
-/// two-character escape sequence, not a real newline — so all sub-tokens share
-/// the node's line number.
-fn emit_string_with_format_specs(node: Node<'_>, rope: &Rope, out: &mut Vec<RawToken>) {
+/// SV string literals are normally single-line — `\n` inside a literal is the
+/// two-character escape sequence, not a real newline. A literal continued
+/// across lines with a trailing backslash is still handled: every segment
+/// goes through [`push_span`], which emits one token per line.
+fn emit_string_with_format_specs(
+    node: Node<'_>,
+    rope: &Rope,
+    clip: Option<&std::ops::Range<usize>>,
+    out: &mut Vec<RawToken>,
+) {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
-    let line = node.start_position().row as u32;
-    let line_start = rope.line_to_byte(line as usize);
+    let string_ty = TokenType::String;
+    let none = TokenModifier::NONE.0;
 
     // Collect bytes for ASCII scanning. Format specs are always ASCII so
     // multi-byte UTF-8 sequences in the surrounding text can't false-match.
-    let text: Vec<u8> = rope.byte_slice(start_byte..end_byte).bytes().collect();
+    // `get_byte_slice` (not `byte_slice`) so a span that doesn't fit the
+    // rope degrades to "no token" instead of a panic.
+    let Some(slice) = rope.get_byte_slice(start_byte..end_byte) else {
+        return;
+    };
+    let text: Vec<u8> = slice.bytes().collect();
 
     let mut seg_start = 0usize;
     let mut i = 0usize;
@@ -440,22 +498,22 @@ fn emit_string_with_format_specs(node: Node<'_>, rope: &Rope, out: &mut Vec<RawT
         // Must end with a recognised type character to be a valid spec.
         if i < text.len() && is_sv_fmt_type(text[i]) {
             i += 1;
-            push_bytes(
+            push_span(
                 start_byte + seg_start,
                 start_byte + spec_start,
-                line,
-                line_start,
                 rope,
-                TokenType::String,
+                clip,
+                string_ty,
+                none,
                 out,
             );
-            push_bytes(
+            push_span(
                 start_byte + spec_start,
                 start_byte + i,
-                line,
-                line_start,
                 rope,
+                clip,
                 TokenType::Regexp,
+                none,
                 out,
             );
             seg_start = i;
@@ -463,25 +521,12 @@ fn emit_string_with_format_specs(node: Node<'_>, rope: &Rope, out: &mut Vec<RawT
         // Otherwise not a recognised spec — continue scanning.
     }
     // Remaining text after the last spec (or the whole literal if none found).
-    push_bytes(
-        start_byte + seg_start,
-        end_byte,
-        line,
-        line_start,
-        rope,
-        TokenType::String,
-        out,
-    );
+    push_span(start_byte + seg_start, end_byte, rope, clip, string_ty, none, out);
 }
 
-/// UTF-16 code-unit count between two byte offsets in `rope`.
-/// Tokens that span newlines (multi-line strings, block comments)
-/// would underflow this — they're rare in SV and the editor handles
-/// them correctly so long as we report the lit length up to the next
-/// newline; in practice the affected token kinds (`string_literal`,
-/// `block_comment`) get one whole-node token here and the editor
-/// applies it. If the token spans multiple lines the editor's
-/// renderer trims to its own line-boundary semantics.
+/// UTF-16 code-unit count between two byte offsets in `rope`. Callers
+/// keep both offsets on the same line and within the rope (see
+/// [`push_span`]).
 fn utf16_len_between(rope: &Rope, start_byte: usize, end_byte: usize) -> u32 {
     let start_char = rope.byte_to_char(start_byte);
     let end_char = rope.byte_to_char(end_byte);
@@ -495,8 +540,12 @@ fn utf16_len_between(rope: &Rope, start_byte: usize, end_byte: usize) -> u32 {
 /// when the parent context makes the role unambiguous (declaration
 /// sites, type references, macro names). Anything else falls back to
 /// [`TokenType::Variable`].
-fn classify_identifier(node: Node<'_>) -> (TokenType, TokenModifier) {
-    let Some(parent) = node.parent() else {
+fn classify_identifier<'a>(
+    node: Node<'a>,
+    parent: Option<Node<'a>>,
+    grandparent: Option<Node<'a>>,
+) -> (TokenType, TokenModifier) {
+    let Some(parent) = parent else {
         return (TokenType::Variable, TokenModifier::NONE);
     };
     match parent.kind() {
@@ -589,7 +638,7 @@ fn classify_identifier(node: Node<'_>) -> (TokenType, TokenModifier) {
             // Non-call uses of `hierarchical_identifier` (e.g. signal
             // references in expressions) have a different grandparent and
             // also fall through to Variable.
-            let is_call = parent.parent().is_some_and(|gp| gp.kind() == "tf_call");
+            let is_call = grandparent.is_some_and(|gp| gp.kind() == "tf_call");
             if is_call && is_last_named_kind(parent, "simple_identifier", node) {
                 (TokenType::Function, TokenModifier::NONE)
             } else {
@@ -639,9 +688,9 @@ fn is_last_named_kind(parent: Node<'_>, kind: &str, target: Node<'_>) -> bool {
 /// Parent kinds that turn an inner anonymous keyword token into a
 /// type token rather than a generic keyword. E.g. `int` under
 /// `integer_atom_type` is the type name `int`, not the keyword `int`.
-fn parent_is_type_container(node: Node<'_>) -> bool {
+fn parent_is_type_container(parent: Option<Node<'_>>) -> bool {
     matches!(
-        node.parent().map(|p| p.kind()),
+        parent.map(|p| p.kind()),
         Some(
             "data_type"
                 | "data_type_or_void"

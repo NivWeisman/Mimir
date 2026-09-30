@@ -17,10 +17,13 @@
 //!
 //! Each call to [`ElaborateService::schedule`] does three things:
 //!
-//! 1. Cancels any in-flight task already waiting for the same trigger URI.
-//! 2. Spawns a new tokio task that sleeps `debounce_ms` before elaborating.
-//! 3. On wakeup: if the input hash matches the last successful run, skips the
-//!    round-trip to the sidecar entirely.
+//! 1. Cancels the task already *waiting* for the same trigger URI, if any.
+//!    A task whose compile request is already on the wire is left to finish
+//!    (the sidecar would finish it regardless) — see `PendingTask::committed`.
+//! 2. Spawns a new tokio task that sleeps `debounce_ms`, then waits its turn
+//!    at the compile gate (one round at a time).
+//! 3. Once through: if the input hash matches the last successful run, skips
+//!    the round-trip to the sidecar entirely.
 //!
 //! Call [`ElaborateService::invalidate_hash`] to force the next elaborate to
 //! run regardless of inputs — useful after a project reload where the file
@@ -48,8 +51,27 @@ use mimir_syntax::SymbolKind;
 // Internal types
 // --------------------------------------------------------------------------
 
-/// One debounce-map entry: the owning task's generation tag plus its handle.
-type PendingTask = (u64, JoinHandle<()>);
+/// One debounce-map entry for a trigger URI.
+struct PendingTask {
+    /// Generation tag of the owning task, so a finishing task only removes
+    /// *its own* entry (see [`remove_pending_generation`]).
+    generation: u64,
+    /// Handle used to cancel the task while it is still waiting.
+    handle: JoinHandle<()>,
+    /// Set once the task has stopped waiting (debounce + its turn at the
+    /// compile gate) and is about to talk to the sidecar. From then on it
+    /// must **not** be aborted.
+    ///
+    /// Aborting drops only our half of the exchange: the request is already
+    /// in the sidecar's stdin, the sidecar still elaborates it, and every
+    /// later request queues behind it. Cancelling a round per keystroke
+    /// therefore queued one full compile per keystroke and threw each
+    /// result away unpublished — diagnostics for the final text arrived
+    /// only after all the stale compiles had been ground through. A
+    /// committed round finishes and publishes; newer edits wait at the gate
+    /// and then compile the latest text once.
+    committed: Arc<AtomicBool>,
+}
 
 /// The debounce map: one tagged in-flight elaborate task per trigger URI.
 type PendingMap = HashMap<Url, PendingTask>;
@@ -62,6 +84,10 @@ struct SlangPublishPlan {
     /// URLs that ended up with non-empty slang diagnostics this cycle —
     /// stored in `published` so the *next* cycle can clear any that drop off.
     new_published: HashSet<Url>,
+    /// URLs the compile actually covered: every file in the request plus
+    /// every file slang reported on. The remaining entries of `publishes`
+    /// are clean-up clears for files slang no longer knows about.
+    covered: HashSet<Url>,
 }
 
 // --------------------------------------------------------------------------
@@ -92,6 +118,23 @@ pub(crate) struct ElaborateService {
     /// URLs we published non-empty slang diagnostics to last cycle.
     /// Diffed each cycle so stale squiggles are cleared when errors are fixed.
     published: Arc<RwLock<HashSet<Url>>>,
+    /// What the last successful compile said about each file it covered
+    /// (an empty list means "slang elaborated this file and it is clean").
+    ///
+    /// The tree-sitter path publishes on every `didOpen` / `didChange` /
+    /// `didClose`, and each of those publishes *replaces* whatever the
+    /// editor was showing for the file — including slang's diagnostics.
+    /// Normally the next compile puts them back, but when that compile is
+    /// skipped (inputs unchanged) nothing would: opening a file, or typing a
+    /// character and deleting it, silently erased its errors. Keeping the
+    /// last verdict lets us re-publish it instead.
+    last_result: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
+    /// Serialises the build-params → hash-check → compile → publish
+    /// sequence across trigger URIs. Debounce is per trigger, so edits to
+    /// two files used to start two whole-project compiles that both passed
+    /// the "inputs changed?" check before either had recorded its hash.
+    /// With the gate, the second one sees the first one's hash and skips.
+    compile_gate: Arc<tokio::sync::Mutex<()>>,
     /// Latched `true` after the first successful compile logs its per-file
     /// "indexed by startup slang elaborate" messages.
     startup_logged: Arc<AtomicBool>,
@@ -115,6 +158,8 @@ impl ElaborateService {
             next_generation: Arc::new(AtomicU64::new(0)),
             last_hash: Arc::new(RwLock::new(None)),
             published: Arc::new(RwLock::new(HashSet::new())),
+            last_result: Arc::new(RwLock::new(HashMap::new())),
+            compile_gate: Arc::new(tokio::sync::Mutex::new(())),
             startup_logged: Arc::new(AtomicBool::new(false)),
             workspace,
         }
@@ -141,6 +186,8 @@ impl ElaborateService {
         let adapter = self.adapter.clone();
         let pending = self.pending.clone();
         let published = self.published.clone();
+        let last_result = self.last_result.clone();
+        let compile_gate = self.compile_gate.clone();
         let last_hash = self.last_hash.clone();
         let startup_logged = self.startup_logged.clone();
         let lsp_client = self.client.clone();
@@ -154,11 +201,19 @@ impl ElaborateService {
         // task's own cleanup waits on this same lock, so it can't run before
         // its entry is inserted.
         let mut pending_guard = self.pending.write().await;
-        if let Some((_, prior)) = pending_guard.remove(&trigger_uri) {
-            prior.abort();
-            debug!(uri = %trigger_uri, "cancelled prior pending elaborate");
+        if let Some(prior) = pending_guard.remove(&trigger_uri) {
+            if prior.committed.load(Ordering::Acquire) {
+                // Its request is (about to be) on the wire — let it finish.
+                // The task we spawn below waits for it at the gate.
+                debug!(uri = %trigger_uri, "prior elaborate already in flight; queuing behind it");
+            } else {
+                prior.handle.abort();
+                debug!(uri = %trigger_uri, "cancelled prior pending elaborate");
+            }
         }
 
+        let committed = Arc::new(AtomicBool::new(false));
+        let committed_for_task = committed.clone();
         let handle = tokio::spawn(async move {
             mimir_core::time_scope!("elaborate.task_total");
             {
@@ -166,12 +221,31 @@ impl ElaborateService {
                 tokio::time::sleep(debounce).await;
             }
 
-            let Some((params, files_in_request)) =
-                adapter.slang().build_elaborate_params().await
-            else {
+            // One elaborate round at a time (see `compile_gate`). Taken
+            // *before* the inputs are snapshotted so a round that waited
+            // here compiles the latest text, not the text from when it
+            // started waiting. Released on abort like any other guard.
+            let _round = compile_gate.lock().await;
+
+            // Point of no return (see `PendingTask::committed`). Flipped
+            // under the `pending` lock: `schedule` decides abort-or-not
+            // under the same lock, so it either aborted us before this line
+            // (and the `await` here is where that lands) or will see the
+            // flag and leave us alone.
+            {
+                let _pending = pending.write().await;
+                committed_for_task.store(true, Ordering::Release);
+            }
+
+            let Some(inputs) = adapter.slang().build_elaborate_inputs().await else {
                 remove_pending_generation(&pending, &trigger_for_task, generation).await;
                 return;
             };
+            let crate::slang_service::ElaborateInputs {
+                params,
+                files_in_request,
+                open_revisions,
+            } = inputs;
 
             let input_hash = {
                 mimir_core::time_scope!("elaborate.hash_inputs");
@@ -183,6 +257,24 @@ impl ElaborateService {
                     files = params.files.len(),
                     "slang inputs unchanged since last compile; skipping",
                 );
+                // The cached AST is still exact for these buffers — say so,
+                // or position-based features stay on their fallback.
+                adapter.confirm_revisions(open_revisions).await;
+                // Whatever triggered this round (open, edit-and-revert,
+                // save) also made the tree-sitter path publish for the
+                // trigger file, wiping slang's diagnostics from the editor.
+                // No compile is coming to restore them, so do it here.
+                let restore = last_result.read().await.get(&trigger_for_task).cloned();
+                if let Some(diags) = restore {
+                    debug!(
+                        uri = %trigger_for_task,
+                        count = diags.len(),
+                        "re-publishing last slang diagnostics after skipped compile",
+                    );
+                    lsp_client
+                        .publish_diagnostics(trigger_for_task.clone(), diags, None)
+                        .await;
+                }
                 remove_pending_generation(&pending, &trigger_for_task, generation).await;
                 return;
             }
@@ -193,7 +285,7 @@ impl ElaborateService {
                 hash = input_hash,
                 "sending compile request",
             );
-            if let Some(outcome) = adapter.compile(&params, files_in_request).await {
+            if let Some(outcome) = adapter.compile(&params, files_in_request, open_revisions).await {
                 let known_macros: HashSet<String> = {
                     mimir_core::time_scope!("elaborate.collect_known_macros");
                     let ws = workspace.read().await;
@@ -211,6 +303,7 @@ impl ElaborateService {
                         &outcome.files_in_request,
                         outcome.diagnostics,
                         &published,
+                        &last_result,
                         &known_macros,
                         &policy,
                     )
@@ -233,7 +326,14 @@ impl ElaborateService {
             remove_pending_generation(&pending, &trigger_for_task, generation).await;
         });
 
-        pending_guard.insert(trigger_uri, (generation, handle));
+        pending_guard.insert(
+            trigger_uri,
+            PendingTask {
+                generation,
+                handle,
+                committed,
+            },
+        );
     }
 
     /// Reset the input hash so the next [`Self::schedule`] call always runs the
@@ -243,6 +343,19 @@ impl ElaborateService {
     /// may have changed without touching any open buffer.
     pub(crate) async fn invalidate_hash(&self) {
         *self.last_hash.write().await = None;
+    }
+
+    /// What the last successful slang compile reported for `uri`.
+    ///
+    /// `None` when slang has never covered that file (no sidecar, no
+    /// compile yet, file outside the compilation) — the caller's own
+    /// diagnostics are then all there is. `Some(vec![])` means slang
+    /// elaborated the file and found nothing.
+    ///
+    /// Used when something other than a compile must publish for a file
+    /// (e.g. `didClose`) and would otherwise erase slang's verdict.
+    pub(crate) async fn last_slang_diagnostics(&self, uri: &Url) -> Option<Vec<Diagnostic>> {
+        self.last_result.read().await.get(uri).cloned()
     }
 }
 
@@ -259,7 +372,7 @@ impl ElaborateService {
 /// next debounce-abort for the URI.
 async fn remove_pending_generation(pending: &RwLock<PendingMap>, uri: &Url, generation: u64) {
     let mut map = pending.write().await;
-    if map.get(uri).is_some_and(|(gen, _)| *gen == generation) {
+    if map.get(uri).is_some_and(|task| task.generation == generation) {
         map.remove(uri);
     }
 }
@@ -284,12 +397,17 @@ async fn publish_slang_result(
     files_in_request: &[Url],
     diagnostics: Vec<(String, MimirDiag)>,
     slang_published: &Arc<RwLock<HashSet<Url>>>,
+    last_result: &Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>,
     known_macros: &HashSet<String>,
     policy: &DiagnosticPolicy,
 ) {
     let prev_snapshot = slang_published.read().await.clone();
     let plan =
         plan_slang_publishes(files_in_request, diagnostics, &prev_snapshot, known_macros, policy);
+
+    // Record the verdict before sending it, so a concurrent `didClose` /
+    // skipped round that wants to restore it never sees an older one.
+    *last_result.write().await = result_by_url(&plan);
 
     for (url, diags) in &plan.publishes {
         lsp_client
@@ -304,6 +422,17 @@ async fn publish_slang_result(
     );
 
     *slang_published.write().await = plan.new_published;
+}
+
+/// Collapse a publish plan into "what slang says about each file": the
+/// diagnostics for every file the compile covered (possibly empty), minus
+/// the pure clean-up publishes for files it no longer mentions at all.
+fn result_by_url(plan: &SlangPublishPlan) -> HashMap<Url, Vec<Diagnostic>> {
+    plan.publishes
+        .iter()
+        .filter(|(url, diags)| !diags.is_empty() || plan.covered.contains(url))
+        .map(|(url, diags)| (url.clone(), diags.clone()))
+        .collect()
 }
 
 /// Pure decision logic: given the files we just sent slang, the result
@@ -382,9 +511,9 @@ fn plan_slang_publishes(
     // the in-progress `publishes` vec, so we clone the URLs out before
     // we start pushing — otherwise we'd be reading and writing the same
     // vec at once.
-    let already_publishing: HashSet<Url> = publishes.iter().map(|(u, _)| u.clone()).collect();
+    let covered: HashSet<Url> = publishes.iter().map(|(u, _)| u.clone()).collect();
     for stale in previous_published.difference(&new_published) {
-        if already_publishing.contains(stale) {
+        if covered.contains(stale) {
             continue;
         }
         publishes.push((stale.clone(), Vec::new()));
@@ -393,6 +522,7 @@ fn plan_slang_publishes(
     SlangPublishPlan {
         publishes,
         new_published,
+        covered,
     }
 }
 
@@ -591,7 +721,14 @@ mod tests {
 
         // Entry currently belongs to generation 2 (a newer schedule).
         let newer = tokio::spawn(async {});
-        pending.write().await.insert(uri.clone(), (2, newer));
+        pending.write().await.insert(
+            uri.clone(),
+            PendingTask {
+                generation: 2,
+                handle: newer,
+                committed: Arc::new(AtomicBool::new(false)),
+            },
+        );
 
         // The finishing generation-1 task must leave it alone…
         remove_pending_generation(&pending, &uri, 1).await;

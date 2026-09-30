@@ -90,20 +90,15 @@ const PRIMITIVE_TYPES: &[&str] = &[
 #[must_use]
 pub fn format_sv_signature(sig: &str) -> String {
     let mut result = String::with_capacity(sig.len() * 2);
-    let bytes = sig.as_bytes();
-    let mut i = 0;
+    let mut rest = sig;
 
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b.is_ascii_alphabetic() || b == b'_' {
-            // Collect one full identifier (letters, digits, underscores).
-            let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
-                i += 1;
-            }
-            let word = &sig[start..i];
+    while let Some(ch) = rest.chars().next() {
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            // Collect one full identifier (ASCII letters, digits, underscores).
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let (word, tail) = rest.split_at(end);
             if SIGNATURE_KEYWORDS.contains(&word) {
                 result.push_str("**");
                 result.push_str(word);
@@ -117,13 +112,14 @@ pub fn format_sv_signature(sig: &str) -> String {
                 result.push_str(word);
                 result.push('`');
             }
+            rest = tail;
         } else {
-            // Non-identifier byte: spaces, punctuation, digits that don't
-            // start a word, etc.  Pass through as-is.
-            // SAFETY: `sig` is valid UTF-8; we push one byte at a time only
-            // when it is ASCII (< 0x80), so the invariant holds.
-            result.push(b as char);
-            i += 1;
+            // Anything else — spaces, punctuation, digits that don't start a
+            // word, and every non-ASCII character — passes through verbatim.
+            // Advance by whole `char`s: copying byte-at-a-time would turn
+            // each multi-byte character into several Latin-1 code points.
+            result.push(ch);
+            rest = &rest[ch.len_utf8()..];
         }
     }
 

@@ -35,6 +35,7 @@ use std::collections::HashSet;
 use tracing::trace;
 use tree_sitter::Node;
 
+use crate::walk::{self, Visit, Walk};
 use crate::SyntaxTree;
 
 /// A formal parameter of a callable symbol (function, task, method, macro).
@@ -144,42 +145,42 @@ pub struct Symbol {
 /// `rope` must reflect the same source the tree was parsed from.
 #[must_use]
 pub fn index(tree: &SyntaxTree, rope: &Rope) -> Vec<Symbol> {
+    let source = tree.source();
     let mut out = Vec::new();
-    walk_for_symbols(
-        tree.tree.root_node(),
-        tree.source(),
-        rope,
-        /*inside_class=*/ false,
-        &mut out,
-    );
+    // How many `class_declaration`s enclose the node being visited. Once we
+    // are inside a class, every nested `function_body_declaration` /
+    // `task_body_declaration` is tagged [`SymbolKind::Method`] instead of
+    // `Function` / `Task` — tree-sitter doesn't otherwise distinguish them;
+    // class scope is the only thing that makes a `function` a method.
+    let mut class_depth: usize = 0;
+    // Iterative walk (see `crate::walk`): we always descend, even after
+    // emitting a symbol — a `class` contains methods, a `module` contains
+    // parameters and instances, etc.
+    walk::walk(tree.tree.root_node(), |event| {
+        match event {
+            Visit::Enter(node) => {
+                // Anonymous tokens are never declarations and have no
+                // children worth visiting.
+                if !node.is_named() {
+                    return Walk::Skip;
+                }
+                if let Some(symbol) = symbol_for(node, source, rope, class_depth > 0) {
+                    out.push(symbol);
+                }
+                if node.kind() == "class_declaration" {
+                    class_depth += 1;
+                }
+            }
+            Visit::Leave(node) => {
+                if node.kind() == "class_declaration" {
+                    class_depth -= 1;
+                }
+            }
+        }
+        Walk::Descend
+    });
     trace!(count = out.len(), "indexed symbols");
     out
-}
-
-/// Recursive walker. We always descend, even after emitting a symbol —
-/// a `class` contains methods, a `module` contains parameters and
-/// instances, etc.
-///
-/// `inside_class` is sticky-on-descent: once we enter a `class_declaration`
-/// every nested `function_body_declaration` / `task_body_declaration`
-/// gets tagged as [`SymbolKind::Method`] instead of `Function` / `Task`.
-/// Tree-sitter doesn't otherwise distinguish them — class scope is the
-/// only thing that makes a `function` a method in SystemVerilog.
-fn walk_for_symbols(
-    node: Node<'_>,
-    source: &str,
-    rope: &Rope,
-    inside_class: bool,
-    out: &mut Vec<Symbol>,
-) {
-    if let Some(symbol) = symbol_for(node, source, rope, inside_class) {
-        out.push(symbol);
-    }
-    let descend_inside_class = inside_class || node.kind() == "class_declaration";
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk_for_symbols(child, source, rope, descend_inside_class, out);
-    }
 }
 
 /// If `node` is a declaration we recognise, build a `Symbol` for it.
@@ -615,20 +616,11 @@ fn first_named_child_of_kinds<'a>(parent: Node<'a>, kinds: &[&str]) -> Option<No
     found
 }
 
-/// Pre-order DFS for the first descendant (or `node` itself) whose
+/// Pre-order search for the first descendant (or `node` itself) whose
 /// kind matches. Used when a declaration nests its identifier inside a
 /// header / wrapper subtree we don't want to enumerate every level of.
 fn first_descendant_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    if node.kind() == kind {
-        return Some(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = first_descendant_of_kind(child, kind) {
-            return Some(found);
-        }
-    }
-    None
+    walk::first_descendant_of_kind(node, kind)
 }
 
 /// Convert a tree-sitter node's byte span to an LSP range.
@@ -785,14 +777,16 @@ pub fn hover_receiver_at(
     pos: Position,
 ) -> Option<HoverReceiver> {
     let byte = pos.to_byte_offset(rope).ok()?;
-    let leaf = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte)?;
     if leaf.kind() != "simple_identifier" {
         return None;
     }
     let source = tree.source();
 
-    let mut node = leaf;
-    while let Some(parent) = node.parent() {
+    // Innermost-first ancestor chain, computed in one descent (see
+    // `walk::self_and_ancestors` for why we don't loop on `parent()`).
+    for parent in walk::self_and_ancestors(root, leaf).into_iter().skip(1) {
         match parent.kind() {
             // `obj.X` shape: hierarchical_identifier with two
             // simple_identifier children. The cursor must be on a
@@ -812,7 +806,6 @@ pub fn hover_receiver_at(
                     let recv = simple_ids[0].utf8_text(source.as_bytes()).ok()?.trim();
                     return Some(HoverReceiver::Object(recv.to_string()));
                 }
-                node = parent;
             }
             // `this.X` / `super.X` shape: variable_lvalue (field) or
             // method_call (call) with an implicit_class_handle as its
@@ -830,7 +823,6 @@ pub fn hover_receiver_at(
                         };
                     }
                 }
-                node = parent;
             }
             // Don't escape past these — the identifier isn't a member-
             // select receiver if its nearest "container" is a statement
@@ -842,7 +834,7 @@ pub fn hover_receiver_at(
             | "task_body_declaration"
             | "class_declaration"
             | "module_declaration" => return None,
-            _ => node = parent,
+            _ => {}
         }
     }
     None
@@ -923,32 +915,30 @@ pub fn parse_member_chain_at(
     pos: Position,
 ) -> Option<MemberChain> {
     let byte = pos.to_byte_offset(rope).ok()?;
-    let leaf = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte)?;
     if leaf.kind() != "simple_identifier" {
         return None;
     }
     let source = tree.source();
 
-    let mut node = leaf;
-    while let Some(parent) = node.parent() {
+    let chain = walk::self_and_ancestors(root, leaf);
+    for (idx, parent) in chain.iter().enumerate().skip(1) {
         match parent.kind() {
             // Flat chain: `a.b.c` in assignment/expression or `obj.method()`
             // inside a `tf_call`.
             "hierarchical_identifier" => {
-                return chain_from_hierarchical_identifier(parent, leaf, source);
+                return chain_from_hierarchical_identifier(*parent, leaf, source);
             }
             // Nested chain: `this.X`, `super.X`, `this.ap.write(tr)`.
             "method_call_body" => {
-                let mc = parent.parent()?;
+                let mc = *chain.get(idx + 1)?;
                 if mc.kind() == "method_call" {
                     let segments = collect_method_call_segments(mc, source)?;
                     if segments.len() < 2 {
                         return None;
                     }
                     let target_idx = segments.len() - 1;
-                    if target_idx == 0 {
-                        return None;
-                    }
                     return Some(MemberChain { segments, target_idx });
                 }
                 return None;
@@ -962,7 +952,7 @@ pub fn parse_member_chain_at(
             | "class_declaration"
             | "module_declaration"
             | "source_file" => return None,
-            _ => node = parent,
+            _ => {}
         }
     }
     None
@@ -1112,18 +1102,9 @@ fn collect_method_call_segments(mc: Node<'_>, source: &str) -> Option<Vec<ChainS
     }
 }
 
-/// First-match DFS for a descendant node of the given `kind`.
+/// First-match pre-order search for a descendant node of the given `kind`.
 fn find_descendant_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    if node.kind() == kind {
-        return Some(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_descendant_by_kind(child, kind) {
-            return Some(found);
-        }
-    }
-    None
+    walk::first_descendant_of_kind(node, kind)
 }
 
 // --------------------------------------------------------------------------
@@ -1156,42 +1137,37 @@ pub fn enclosing_class_info_at(
     pos: Position,
 ) -> Option<EnclosingClassInfo> {
     let byte = pos.to_byte_offset(rope).ok()?;
-    let mut node = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
-    loop {
-        if node.kind() == "class_declaration" {
-            let class_name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(tree.source().as_bytes()).ok())
-                .map(str::to_owned)?;
-            // `extends` target is the first `class_type` child, if present.
-            // Its leaf simple_identifier is the parent class name. Bind
-            // cursors to locals so the iterators (which borrow them) drop
-            // before the outer block returns — same idiom as `class_constructor_declaration`
-            // in `decl_name_node`.
-            let parent_class_name = {
-                let mut cursor = node.walk();
-                let class_type = node
-                    .named_children(&mut cursor)
-                    .find(|c| c.kind() == "class_type");
-                class_type.and_then(|ct| {
-                    let mut c2 = ct.walk();
-                    let id = ct
-                        .named_children(&mut c2)
-                        .find(|n| n.kind() == "simple_identifier");
-                    id.and_then(|n| n.utf8_text(tree.source().as_bytes()).ok())
-                        .map(str::to_owned)
-                })
-            };
-            return Some(EnclosingClassInfo {
-                class_name,
-                parent_class_name,
-            });
-        }
-        match node.parent() {
-            Some(p) => node = p,
-            None => return None,
-        }
-    }
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte)?;
+    let node = walk::self_and_ancestors(root, leaf)
+        .into_iter()
+        .find(|n| n.kind() == "class_declaration")?;
+    let class_name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(tree.source().as_bytes()).ok())
+        .map(str::to_owned)?;
+    // `extends` target is the first `class_type` child, if present. Its leaf
+    // simple_identifier is the parent class name. Bind cursors to locals so
+    // the iterators (which borrow them) drop before the outer block returns
+    // — same idiom as `class_constructor_declaration` in `name_node_of`.
+    let parent_class_name = {
+        let mut cursor = node.walk();
+        let class_type = node
+            .named_children(&mut cursor)
+            .find(|c| c.kind() == "class_type");
+        class_type.and_then(|ct| {
+            let mut c2 = ct.walk();
+            let id = ct
+                .named_children(&mut c2)
+                .find(|n| n.kind() == "simple_identifier");
+            id.and_then(|n| n.utf8_text(tree.source().as_bytes()).ok())
+                .map(str::to_owned)
+        })
+    };
+    Some(EnclosingClassInfo {
+        class_name,
+        parent_class_name,
+    })
 }
 
 // --------------------------------------------------------------------------
@@ -1293,17 +1269,21 @@ pub fn find_variable_type_info_at(
     name: &str,
 ) -> Option<TypeInfo> {
     let byte = pos.to_byte_offset(rope).ok()?;
-    let mut scope = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte)?;
     let source = tree.source();
-    loop {
-        if let Some(info) = search_scope_for_var_info(scope, name, source, true) {
+    // Search each enclosing node's subtree, innermost first. The subtree of
+    // the previous (inner) node was already searched on the prior iteration,
+    // so it is skipped — the whole climb then visits every node at most once
+    // instead of once per ancestor.
+    let mut already_searched: Option<usize> = None;
+    for scope in walk::self_and_ancestors(root, leaf) {
+        if let Some(info) = search_scope_for_var_info(scope, name, source, already_searched) {
             return Some(info);
         }
-        match scope.parent() {
-            Some(p) => scope = p,
-            None => return None,
-        }
+        already_searched = Some(scope.id());
     }
+    None
 }
 
 /// Find the declared type of a variable named `name` visible at `pos`.
@@ -1321,28 +1301,32 @@ pub fn find_variable_type_at(
     find_variable_type_info_at(tree, rope, pos, name).map(|i| i.base)
 }
 
-/// Recursively scan `node`'s descendants for a variable declaration named
-/// `name`. When `is_root` is `false` and we hit a scope boundary we stop
-/// descending.
+/// Scan `scope`'s subtree for a variable declaration named `name`, without
+/// descending into nested scope boundaries (their declarations belong to
+/// unrelated sibling functions or classes) or into the child subtree whose
+/// node id is `skip` (already searched by the caller).
 fn search_scope_for_var_info(
-    node: Node<'_>,
+    scope: Node<'_>,
     name: &str,
     source: &str,
-    is_root: bool,
+    skip: Option<usize>,
 ) -> Option<TypeInfo> {
-    if !is_root && is_scope_boundary(node.kind()) {
-        return None;
-    }
-    if let Some(info) = extract_var_type_info_if_match(node, name, source) {
-        return Some(info);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(info) = search_scope_for_var_info(child, name, source, false) {
-            return Some(info);
+    let scope_id = scope.id();
+    let mut found = None;
+    walk::preorder(scope, |node| {
+        if !node.is_named() || Some(node.id()) == skip {
+            return Walk::Skip;
         }
-    }
-    None
+        if node.id() != scope_id && is_scope_boundary(node.kind()) {
+            return Walk::Skip;
+        }
+        if let Some(info) = extract_var_type_info_if_match(node, name, source) {
+            found = Some(info);
+            return Walk::Stop;
+        }
+        Walk::Descend
+    });
+    found
 }
 
 /// True when `kind` introduces a new declaration scope. The upward walk in
@@ -1513,13 +1497,13 @@ pub fn class_new_lhs_at(
     pos: Position,
 ) -> Option<ClassNewLhs> {
     let byte = pos.to_byte_offset(rope).ok()?;
-    let mut node = tree.tree.root_node().descendant_for_byte_range(byte, byte)?;
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte)?;
     // Walk up to the class_new itself (cursor may have landed on an
     // arg expression inside it).
-    while node.kind() != "class_new" {
-        node = node.parent()?;
-    }
-    let parent = node.parent()?;
+    let chain = walk::self_and_ancestors(root, leaf);
+    let new_idx = chain.iter().position(|n| n.kind() == "class_new")?;
+    let parent = *chain.get(new_idx + 1)?;
     match parent.kind() {
         // `variable_decl_assignment` ── `T x = new(...);` ── type is on the
         // enclosing `data_declaration`.
@@ -1624,8 +1608,18 @@ pub fn occurrences_of(tree: &SyntaxTree, rope: &Rope, name: &str) -> Vec<Range> 
     if name.is_empty() {
         return Vec::new();
     }
+    let source = tree.source();
     let mut out = Vec::new();
-    walk_for_occurrences(tree.tree.root_node(), tree.source(), rope, name, &mut out);
+    walk::preorder(tree.tree.root_node(), |node| {
+        if is_identifier_kind(node.kind()) {
+            if source.get(node.byte_range()) == Some(name) {
+                out.push(node_range(node, rope));
+            }
+            // Identifier nodes are leaves — no point descending.
+            return Walk::Skip;
+        }
+        Walk::Descend
+    });
     trace!(
         name,
         count = out.len(),
@@ -1634,27 +1628,10 @@ pub fn occurrences_of(tree: &SyntaxTree, rope: &Rope, name: &str) -> Vec<Range> 
     out
 }
 
-/// Pre-order DFS collector for [`occurrences_of`]. Pushes a range when
-/// we hit an identifier-kind node whose source slice equals `name`.
-fn walk_for_occurrences(
-    node: Node<'_>,
-    source: &str,
-    rope: &Rope,
-    name: &str,
-    out: &mut Vec<Range>,
-) {
-    if matches!(node.kind(), "simple_identifier" | "system_tf_identifier") {
-        if source.get(node.byte_range()) == Some(name) {
-            out.push(node_range(node, rope));
-        }
-        // Identifier nodes are leaves — no point descending. Returning
-        // here is also a small perf win on long files.
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_for_occurrences(child, source, rope, name, out);
-    }
+/// The two node kinds that count as "an identifier token" for occurrence
+/// matching: ordinary names and `$system` task/function names.
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(kind, "simple_identifier" | "system_tf_identifier")
 }
 
 /// Find all occurrences of `name` in the file, pruning subtrees where
@@ -1676,7 +1653,7 @@ pub fn occurrences_of_scoped(tree: &SyntaxTree, rope: &Rope, name: &str) -> Vec<
         return Vec::new();
     }
     let mut out = Vec::new();
-    walk_for_occurrences_scoped(tree.tree.root_node(), tree.source(), rope, name, &mut out, true);
+    collect_occurrences_scoped(tree.tree.root_node(), tree.source(), rope, name, &mut out);
     trace!(
         name,
         count = out.len(),
@@ -1714,28 +1691,14 @@ pub fn occurrences_of_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> Vec<R
     let Some(name) = identifier_at(tree, rope, pos) else {
         return Vec::new();
     };
-    let name = name.to_owned();
-    let Ok(byte) = pos.to_byte_offset(rope) else {
-        return Vec::new();
-    };
     let root = tree.tree.root_node();
-    let leaf = root.descendant_for_byte_range(byte, byte).unwrap_or(root);
-
-    // Walk up: pick the narrowest scope ancestor that declares `name`
-    // locally. If none does, search the whole file (matches the legacy
-    // text-based behaviour for cross-scope references).
-    let mut scope = root;
-    let mut cur = Some(leaf);
-    while let Some(n) = cur {
-        if is_scope_kind(n.kind()) && declares_locally(n, tree.source(), &name) {
-            scope = n;
-            break;
-        }
-        cur = n.parent();
-    }
+    // Pick the narrowest scope ancestor that declares `name` locally. If
+    // none does, search the whole file (matches the legacy text-based
+    // behaviour for cross-scope references).
+    let scope = declaring_scope_at(tree, rope, pos, name).unwrap_or(root);
 
     let mut out = Vec::new();
-    walk_for_occurrences_scoped(scope, tree.source(), rope, &name, &mut out, true);
+    collect_occurrences_scoped(scope, tree.source(), rope, name, &mut out);
     trace!(
         name = %name,
         scope = scope.kind(),
@@ -1745,63 +1708,138 @@ pub fn occurrences_of_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> Vec<R
     out
 }
 
+/// True when the identifier under `pos` is bound by a declaration that no
+/// other file can see: a function/task formal argument or local, a
+/// `begin…end` block local, a loop variable, or a variable declared inside
+/// an `initial` / `always` procedure.
+///
+/// `textDocument/references` and `rename` fan out across the workspace by
+/// *name*. For such a binding that is simply wrong — renaming a function's
+/// local `i` must not touch an unrelated `i` declared in another file — so
+/// the server consults this to confine the operation to the cursor file.
+///
+/// Members of classes, modules, interfaces, programs and packages return
+/// `false` (they are reachable through `obj.x`, `pkg::x`, port connections,
+/// hierarchical paths…), as does any name whose declaration isn't visible
+/// in this file at all.
+#[must_use]
+pub fn is_local_binding_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> bool {
+    let Some(name) = identifier_at(tree, rope, pos) else {
+        return false;
+    };
+    declaring_scope_at(tree, rope, pos, name).is_some_and(|scope| is_local_scope_kind(scope.kind()))
+}
+
+/// The narrowest scope enclosing `pos` that declares `name` locally, or
+/// `None` when no enclosing scope in this file declares it.
+fn declaring_scope_at<'a>(
+    tree: &'a SyntaxTree,
+    rope: &Rope,
+    pos: Position,
+    name: &str,
+) -> Option<Node<'a>> {
+    let byte = pos.to_byte_offset(rope).ok()?;
+    let root = tree.tree.root_node();
+    let leaf = root.descendant_for_byte_range(byte, byte)?;
+    walk::self_and_ancestors(root, leaf)
+        .into_iter()
+        .find(|n| is_scope_kind(n.kind()) && declares_locally(*n, tree.source(), name))
+}
+
 /// Tree-sitter node kinds that introduce a new lexical scope in
 /// SystemVerilog. Used by [`occurrences_of_at`] both to find the search
 /// root and to prune nested scopes that re-declare the same name.
 ///
-/// Both `function_declaration` and `function_body_declaration` are listed:
-/// the former wraps the latter in tree-sitter-verilog, and walking up
-/// from a leaf inside the body hits the (narrower) body first. Listing
-/// both keeps the shadowing-prune step consistent regardless of which
-/// the search root happens to be.
+/// Only the *body* forms of functions and tasks are listed — their
+/// `function_declaration` / `task_declaration` wrappers hold nothing but
+/// the body, and treating the wrapper as a second scope made the function's
+/// own name look like a declaration *inside* the function. Constructors and
+/// `extern` / `pure virtual` prototypes are scopes too: their formal
+/// arguments must not leak into the enclosing class.
 fn is_scope_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "function_body_declaration"
-            | "task_body_declaration"
-            | "function_declaration"
-            | "task_declaration"
-            | "class_declaration"
+        "class_declaration"
             | "module_declaration"
             | "interface_declaration"
             | "program_declaration"
             | "package_declaration"
+            | "generate_block"
+    ) || is_local_scope_kind(kind)
+}
+
+/// The subset of [`is_scope_kind`] whose declarations are invisible outside
+/// the file (indeed outside the construct): procedural scopes. See
+/// [`is_local_binding_at`].
+fn is_local_scope_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_body_declaration"
+            | "task_body_declaration"
+            | "class_constructor_declaration"
+            | "function_prototype"
+            | "task_prototype"
             | "seq_block"
+            | "loop_statement"
             | "initial_construct"
             | "always_construct"
-            | "generate_block"
     )
 }
 
 /// Does `scope` directly declare an identifier named `name`?
 ///
 /// "Directly" means not via a *nested* scope — a `phase` parameter in an
-/// inner function does not count as a declaration inside the outer
-/// class. We DFS through `scope`, but stop descending whenever we cross
-/// another scope boundary.
+/// inner function does not count as a declaration inside the outer class.
+/// We walk `scope`'s subtree but never descend across another scope
+/// boundary.
+///
+/// Two asymmetries make shadowing come out right:
+///
+/// * `scope`'s **own** name is not one of its declarations. `class foo`
+///   introduces `foo` into the scope that *contains* the class, so the
+///   class body doesn't "declare" it — otherwise a search started on the
+///   class name would be confined to the class and miss every use.
+/// * A **nested** scope's own name *is* a declaration of `scope`: a method
+///   `f` declared in a class is a member of that class, even though we
+///   don't look inside `f`.
 fn declares_locally(scope: Node<'_>, source: &str, name: &str) -> bool {
-    declares_locally_inner(scope, source, name, true)
+    let scope_id = scope.id();
+    let mut found = false;
+    walk::preorder(scope, |node| {
+        if !node.is_named() {
+            return Walk::Skip;
+        }
+        if node.id() == scope_id {
+            return Walk::Descend;
+        }
+        if node_declares(node, source, name) {
+            found = true;
+            return Walk::Stop;
+        }
+        if is_scope_kind(node.kind()) {
+            return Walk::Skip;
+        }
+        Walk::Descend
+    });
+    found
 }
 
-fn declares_locally_inner(
-    node: Node<'_>,
-    source: &str,
-    name: &str,
-    is_root: bool,
-) -> bool {
-    if !is_root && is_scope_kind(node.kind()) {
-        return false;
-    }
-    if declaration_name_text(node, source) == Some(name) {
-        return true;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if declares_locally_inner(child, source, name, false) {
-            return true;
+/// Is `node` itself a declaration that binds `name`?
+///
+/// Covers everything [`declaration_name_text`] recognises plus the two loop
+/// binders, which can introduce several names from one node:
+/// `for (int i = 0, j = 0; …)` and `foreach (arr[i, j])`.
+fn node_declares(node: Node<'_>, source: &str, name: &str) -> bool {
+    match node.kind() {
+        "for_variable_declaration" | "loop_variables" => {
+            let mut cursor = node.walk();
+            let hit = node.named_children(&mut cursor).any(|c| {
+                c.kind() == "simple_identifier" && source.get(c.byte_range()) == Some(name)
+            });
+            hit
         }
+        _ => declaration_name_text(node, source) == Some(name),
     }
-    false
 }
 
 /// If `node` is a declaration that introduces an identifier into the
@@ -1819,38 +1857,52 @@ fn declaration_name_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str>
         }
         _ => name_node_of(node)?,
     };
-    name_node.utf8_text(source.as_bytes()).ok()
+    source.get(name_node.byte_range())
 }
 
-/// Like [`walk_for_occurrences`] but prunes nested scopes that
-/// re-declare `name` (proper shadowing). The root invocation must pass
-/// `is_root = true` so the search root itself isn't pruned even when
-/// it's the very scope that declares `name`.
-fn walk_for_occurrences_scoped(
-    node: Node<'_>,
+/// Collect every occurrence of `name` under `root`, pruning nested scopes
+/// that re-declare `name` (proper shadowing).
+///
+/// `root` itself and everything down to (and including) the first scope
+/// boundary on each path is never pruned — the search root is, by
+/// construction, the scope whose binding we are collecting, and when the
+/// root is the whole file each top-level scope is "the file's" rather than
+/// a shadowing inner one. Below that, a scope that declares `name` locally
+/// binds a different variable and is skipped wholesale.
+fn collect_occurrences_scoped(
+    root: Node<'_>,
     source: &str,
     rope: &Rope,
     name: &str,
     out: &mut Vec<Range>,
-    is_root: bool,
 ) {
-    if !is_root && is_scope_kind(node.kind()) && declares_locally(node, source, name) {
-        return;
-    }
-    if matches!(node.kind(), "simple_identifier" | "system_tf_identifier") {
-        if source.get(node.byte_range()) == Some(name) {
-            out.push(node_range(node, rope));
+    // Number of scope nodes open on the current path (root included when it
+    // is itself a scope). Zero means "still above the first scope boundary".
+    let mut scope_depth: usize = 0;
+    walk::walk(root, |event| match event {
+        Visit::Enter(node) => {
+            let kind = node.kind();
+            if is_identifier_kind(kind) {
+                if source.get(node.byte_range()) == Some(name) {
+                    out.push(node_range(node, rope));
+                }
+                return Walk::Skip;
+            }
+            if is_scope_kind(kind) {
+                if scope_depth > 0 && declares_locally(node, source, name) {
+                    return Walk::Skip;
+                }
+                scope_depth += 1;
+            }
+            Walk::Descend
         }
-        return;
-    }
-    // Propagate `is_root` through non-scope intermediate nodes (e.g. `source_file`)
-    // so the guard reaches the first scope boundary. Once inside a scope
-    // (is_root consumed), children are always `false`.
-    let child_is_root = is_root && !is_scope_kind(node.kind());
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_for_occurrences_scoped(child, source, rope, name, out, child_is_root);
-    }
+        Visit::Leave(node) => {
+            if is_scope_kind(node.kind()) {
+                scope_depth -= 1;
+            }
+            Walk::Descend
+        }
+    });
 }
 
 // --------------------------------------------------------------------------

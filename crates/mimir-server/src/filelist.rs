@@ -10,13 +10,16 @@
 //! | `+define+NAME[=VALUE]`   | Predefine a macro (multiple `+`-separated allowed).|
 //! | `-f nested.f`            | Recursively read another filelist.                 |
 //! | other `-flag`/`+plusarg` | Simulator option we don't consume — skipped with a warning. |
-//! | `// rest of line`        | Comment.                                           |
-//! | `# rest of line`         | Comment (alternate).                               |
+//! | `// rest of line`        | Comment — only when it *starts* a token (`a//b.sv` is a path). |
+//! | `# rest of line`         | Comment (alternate); same token-start rule.        |
 //! | trailing `\` + newline   | Line continuation.                                 |
 //! | `${VAR}` anywhere        | Expanded from config `[env]`, then the process environment. |
 //!
 //! Recursion is bounded ([`FILELIST_MAX_DEPTH`]) and cycles are detected
 //! by canonical path, so a malformed `-f a.f -f a.f` doesn't loop forever.
+//!
+//! Every resolved path is lexically normalised ([`normalize_lexically`]) so
+//! it compares equal to the path an editor reports for the same file.
 //!
 //! The public entry point is [`expand_filelist_to_parts`]. Lower-level
 //! primitives ([`expand_env_vars`], [`absolutise`], [`parse_define`]) are
@@ -70,8 +73,9 @@ pub(crate) fn tokenise_filelist(text: &str) -> Vec<String> {
 
     while let Some(c) = chars.next() {
         match c {
-            // `//` comment to EOL.
-            '/' if chars.peek() == Some(&'/') => {
+            // `//` comment to EOL — only at a token boundary. A `//` in the
+            // middle of a token is part of a path (`$ROOT//rtl/top.sv`).
+            '/' if current.is_empty() && chars.peek() == Some(&'/') => {
                 while let Some(&n) = chars.peek() {
                     if n == '\n' {
                         break;
@@ -79,8 +83,9 @@ pub(crate) fn tokenise_filelist(text: &str) -> Vec<String> {
                     chars.next();
                 }
             }
-            // `#` comment to EOL. Common in hand-written filelists.
-            '#' => {
+            // `#` comment to EOL. Common in hand-written filelists. Same
+            // token-boundary rule as `//`.
+            '#' if current.is_empty() => {
                 while let Some(&n) = chars.peek() {
                     if n == '\n' {
                         break;
@@ -165,15 +170,69 @@ pub(crate) fn parse_define(s: &str) -> MacroDefine {
     }
 }
 
-/// Absolutise `p` against `base`. Already-absolute paths are returned
-/// unchanged. For relative paths, tries `base.join(p)` first; if that path
-/// does not exist on disk but `p` itself does (e.g. the raw string is
-/// reachable from the current working directory or becomes absolute after
-/// env-var expansion), the raw path is returned so callers don't silently
-/// swallow a misconfigured TOML-relative prefix.
+/// Remove `.` components and resolve `..` against the preceding component,
+/// purely textually (no filesystem access, symlinks not followed).
+///
+/// Project paths come out of `.mimir.toml` and filelists as written —
+/// `../../src/uvm.sv` joined onto a base directory. Editors identify the
+/// same file by its normalised path, and everything in the server that
+/// pairs "a project file" with "an open buffer" does so by comparing paths:
+/// the open-buffer override in the elaborate request, the AST lookup by
+/// file, the URL diagnostics are published under. An un-normalised path
+/// makes all of those miss.
+pub(crate) fn normalize_lexically(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                match out.components().next_back() {
+                    // `a/b/..` → `a`
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    // `/..` → `/` (can't climb above the root)
+                    Some(Component::RootDir | Component::Prefix(_)) => {}
+                    // Relative path that starts with (or has run out of
+                    // components to cancel against) `..`: keep it.
+                    Some(Component::ParentDir | Component::CurDir) | None => out.push(".."),
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Normalise a resolved project path, unless doing so would change which
+/// file it names.
+///
+/// Lexical `..` removal and the OS disagree when a symlink sits in front of
+/// the `..` (`/a/link/../b` is `/<link target's parent>/b` on disk but
+/// `/a/b` lexically). In that one case we keep the path as written — a
+/// working-but-unnormalised path beats a normalised one pointing nowhere.
+fn normalized_if_equivalent(p: PathBuf) -> PathBuf {
+    let norm = normalize_lexically(&p);
+    if norm.exists() || !p.exists() {
+        norm
+    } else {
+        debug!(
+            path = %p.display(),
+            "keeping un-normalised path: lexical normalisation would miss the file (symlink + `..`?)",
+        );
+        p
+    }
+}
+
+/// Make `p` absolute relative to `base` (the `.mimir.toml` directory) and
+/// normalise it (see [`normalize_lexically`] for why that matters).
+///
+/// Falls back to the path as written (relative to the server's CWD) when the
+/// joined path doesn't exist but the raw one does.
 pub(crate) fn absolutise(base: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
-        return p.to_path_buf();
+        return normalized_if_equivalent(p.to_path_buf());
     }
     let joined = base.join(p);
     if !joined.exists() && p.exists() {
@@ -184,24 +243,20 @@ pub(crate) fn absolutise(base: &Path, p: &Path) -> PathBuf {
         );
         p.to_path_buf()
     } else {
-        joined
+        normalized_if_equivalent(joined)
     }
 }
 
-/// Absolutise `p` inside a filelist, with a three-level fallback chain:
-///
-/// 1. Already absolute → return as-is.
-/// 2. `filelist_base.join(p)` exists → use it (normal case: path relative to the `.f`).
-/// 3. `toml_root.join(p)` exists → use it (filelist written relative to the project root).
-/// 4. `p` exists as written (CWD-relative or absolute after env expansion) → use it.
-/// 5. Default: `filelist_base.join(p)` (path doesn't exist yet; forward-reference is OK).
+/// Resolve a path found inside a filelist: relative to the filelist's own
+/// directory first, then the `.mimir.toml` root, then as written. The result
+/// is normalised like [`absolutise`]'s.
 pub(crate) fn absolutise_filelist(filelist_base: &Path, toml_root: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
-        return p.to_path_buf();
+        return normalized_if_equivalent(p.to_path_buf());
     }
     let joined = filelist_base.join(p);
     if joined.exists() {
-        return joined;
+        return normalized_if_equivalent(joined);
     }
     if filelist_base != toml_root {
         let via_root = toml_root.join(p);
@@ -211,7 +266,7 @@ pub(crate) fn absolutise_filelist(filelist_base: &Path, toml_root: &Path, p: &Pa
                 via = %via_root.display(),
                 "path not found relative to filelist dir; resolved via TOML root"
             );
-            return via_root;
+            return normalized_if_equivalent(via_root);
         }
     }
     if p.exists() {
@@ -222,7 +277,7 @@ pub(crate) fn absolutise_filelist(filelist_base: &Path, toml_root: &Path, p: &Pa
         );
         return p.to_path_buf();
     }
-    joined
+    normalized_if_equivalent(joined)
 }
 
 /// Expanded results from a `.f` filelist tree.
@@ -450,6 +505,69 @@ mod tests {
         let d = parse_define("EXPR=A=B");
         assert_eq!(d.name, "EXPR");
         assert_eq!(d.value.as_deref(), Some("A=B"));
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// Regression: project paths were kept exactly as written, `..` and all
+    /// (`/proj/tb/../rtl/a.sv`). The editor identifies the same file by its
+    /// normalised path (`/proj/rtl/a.sv`), so the two never compared equal:
+    /// the open buffer wasn't recognised as a project file (slang compiled
+    /// the stale on-disk text *and* got the buffer as a second, duplicate
+    /// file), the AST entry couldn't be found by the editor's path, and
+    /// diagnostics went out under a URL containing `..`.
+    #[test]
+    fn regression_project_paths_are_lexically_normalised() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("proj").join("tb");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(tmp.path().join("proj").join("rtl")).unwrap();
+        fs::write(tmp.path().join("proj").join("rtl").join("a.sv"), "").unwrap();
+        let want = tmp.path().join("proj").join("rtl").join("a.sv");
+
+        let via_toml = absolutise(&root, Path::new("../rtl/./a.sv"));
+        assert_eq!(via_toml.to_str(), want.to_str(), "absolutise must resolve `..` and `.`");
+
+        let via_filelist = absolutise_filelist(&root, &root, Path::new("./../rtl/a.sv"));
+        assert_eq!(via_filelist.to_str(), want.to_str());
+
+        // Already-absolute paths are normalised too.
+        let abs = root.join("..").join("rtl").join("a.sv");
+        assert_eq!(absolutise(&root, &abs).to_str(), want.to_str());
+
+        // `..` can't climb above the filesystem root.
+        assert_eq!(normalize_lexically(Path::new("/../../x.sv")), PathBuf::from("/x.sv"));
+    }
+
+    /// End to end through a real filelist: `+incdir+` and source entries
+    /// written with `..` come out normalised.
+    #[test]
+    fn regression_filelist_entries_with_dotdot_are_normalised() {
+        let tmp = tempdir().unwrap();
+        let tb = tmp.path().join("tb");
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&tb).unwrap();
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("uvm.sv"), "").unwrap();
+        let f = tb.join("files.f");
+        fs::write(&f, "+incdir+../src\n../src/uvm.sv\n").unwrap();
+
+        let parts = expand_filelist_to_parts(&f, &tb, &HashMap::new()).unwrap();
+        assert_eq!(parts.files, vec![src.join("uvm.sv")]);
+        assert_eq!(parts.files[0].to_str(), src.join("uvm.sv").to_str(), "no `..` left in the text");
+        assert_eq!(parts.include_dirs[0].to_str(), src.to_str());
+    }
+
+    /// Regression: a `//` *inside* a token (`$ROOT//rtl/top.sv`, a doubled
+    /// slash from joining path pieces) was taken as the start of a comment
+    /// and truncated the path; likewise `#` inside a token. Comments start
+    /// only at a token boundary.
+    #[test]
+    fn regression_tokeniser_keeps_double_slash_inside_a_path() {
+        let tokens = tokenise_filelist("rtl//core/top.sv // real comment\nlib#1/a.sv # note\n");
+        assert_eq!(tokens, vec!["rtl//core/top.sv".to_string(), "lib#1/a.sv".to_string()]);
     }
 
     /// Tokeniser recognises whitespace, both comment styles, and

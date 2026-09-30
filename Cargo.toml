@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.7.48"
+version      = "0.7.49"
 edition      = "2021"
 rust-version = "1.75"
 license      = "MIT OR Apache-2.0"
@@ -43,7 +43,14 @@ tokio     = { version = "1", features = ["macros", "rt-multi-thread", "io-std", 
 # `ropey` is a UTF-8 rope. Critical for incremental edits: applying an LSP
 # `didChange` range edit to a `String` is O(n) per keystroke, while a rope
 # is O(log n). Also gives us cheap line-index <-> byte-offset conversion.
-ropey = "1.6"
+#
+# `default-features = false` drops ropey's `unicode_lines` feature on purpose:
+# with it, VT / FF / NEL / U+2028 / U+2029 all count as line breaks, but LSP
+# clients only recognise `\n`, `\r\n` and `\r`. A single form feed (the `^L`
+# page break legacy Verilog files are full of) would then shift every later
+# line by one and send incremental edits to the wrong place. `cr_lines` keeps
+# exactly the three LSP terminators.
+ropey = { version = "1.6", default-features = false, features = ["simd", "cr_lines"] }
 
 # --- Parser ----------------------------------------------------------------
 # tree-sitter gives us incremental reparsing and error recovery. The grammar

@@ -14,6 +14,7 @@ use ropey::Rope;
 use tracing::trace;
 use tree_sitter::Node;
 
+use crate::walk::{Visit, Walk};
 use crate::SyntaxTree;
 
 /// LSP-compatible diagnostic severity. We mirror the LSP enum locally so
@@ -64,43 +65,49 @@ pub fn collect(tree: &SyntaxTree, rope: &Rope) -> Vec<Diagnostic> {
     diagnostics
 }
 
-/// Recursive walk. Pre-order: visit the node, then descend into children.
+/// Collect diagnostics from the subtree rooted at `root`.
 ///
-/// Iteration uses `walk()` cursors instead of `node.child(i)` because
-/// cursors are a single allocation amortized over the whole walk.
-fn walk(node: Node<'_>, rope: &Rope, source: &str, out: &mut Vec<Diagnostic>) {
-    if node.is_missing() {
-        out.push(make_missing_diagnostic(node, rope));
-        return;
-    }
-
-    if node.is_error() {
-        // Prefer narrower nested ERROR/MISSING descendants when they exist:
-        // a parser unwind can produce one ERROR that swallows an entire
-        // class or module, but the inner ERRORs sit much closer to where
-        // parsing actually went off the rails. Fall back to the outer span
-        // (capped) only if there's nothing narrower to point at.
-        let before = out.len();
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.is_error() || child.is_missing() || child.has_error() {
-                walk(child, rope, source, out);
+/// Iterative (see [`crate::walk`]) — error recovery can nest `ERROR` nodes
+/// arbitrarily deep, and a recursive walk here would overflow the stack on
+/// exactly the broken input this function exists to report.
+///
+/// Policy for `ERROR` nodes: prefer narrower nested ERROR/MISSING
+/// descendants when they exist. A parser unwind can produce one ERROR that
+/// swallows an entire class or module, but the inner ERRORs sit much closer
+/// to where parsing actually went off the rails. We fall back to the outer
+/// span (capped) only when nothing narrower was reported inside it.
+fn walk(root: Node<'_>, rope: &Rope, source: &str, out: &mut Vec<Diagnostic>) {
+    // One entry per ERROR node currently open on the walk: how many
+    // diagnostics existed when we entered it. If that count is unchanged
+    // when we leave, nothing narrower was found inside.
+    let mut open_errors: Vec<usize> = Vec::new();
+    crate::walk::walk(root, |event| match event {
+        Visit::Enter(node) => {
+            if node.is_missing() {
+                out.push(make_missing_diagnostic(node, rope));
+                return Walk::Skip;
             }
+            // Optimization: skip subtrees with no errors anywhere underneath.
+            // `has_error()` is O(1) (it's a precomputed bit on the node).
+            if !(node.has_error() || node.is_error()) {
+                return Walk::Skip;
+            }
+            if node.is_error() {
+                open_errors.push(out.len());
+            }
+            Walk::Descend
         }
-        if out.len() == before {
-            out.push(make_error_diagnostic(node, rope, source));
+        Visit::Leave(node) => {
+            if node.is_error() {
+                if let Some(before) = open_errors.pop() {
+                    if out.len() == before {
+                        out.push(make_error_diagnostic(node, rope, source));
+                    }
+                }
+            }
+            Walk::Descend
         }
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        // Optimization: skip subtrees with no errors anywhere underneath.
-        // `has_error()` is O(1) (it's a precomputed bit on the node).
-        if child.has_error() || child.is_error() || child.is_missing() {
-            walk(child, rope, source, out);
-        }
-    }
+    });
 }
 
 /// Build a diagnostic for an `ERROR` node. We include a snippet of the
@@ -166,14 +173,19 @@ fn node_range(node: Node<'_>, rope: &Rope) -> Range {
 
 /// Trim a snippet to keep diagnostic messages short. tree-sitter ERROR
 /// spans can be huge if the parser unwinds a long subtree — we only want
-/// the first ~40 chars, single-line.
+/// the first ~40 characters, single-line.
+///
+/// The cap is counted in *characters* and the cut is made on a character
+/// boundary. Slicing at a fixed byte offset (`&line[..40]`) panics whenever
+/// that byte falls inside a multi-byte UTF-8 sequence, which took the whole
+/// server down on a syntax error next to non-ASCII text.
 fn truncate_for_message(snippet: &str) -> String {
-    const MAX: usize = 40;
+    const MAX_CHARS: usize = 40;
     let first_line = snippet.lines().next().unwrap_or("");
-    if first_line.len() <= MAX {
-        first_line.to_string()
-    } else {
-        format!("{}…", &first_line[..MAX])
+    match first_line.char_indices().nth(MAX_CHARS) {
+        // `cut` is the byte offset of the 41st character — a valid boundary.
+        Some((cut, _)) => format!("{}…", &first_line[..cut]),
+        None => first_line.to_string(),
     }
 }
 

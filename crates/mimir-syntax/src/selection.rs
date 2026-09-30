@@ -45,15 +45,23 @@ pub fn selection_ranges_at(tree: &SyntaxTree, rope: &Rope, pos: Position) -> Vec
     };
 
     let mut ranges: Vec<Range> = Vec::new();
-    let mut cur = Some(leaf);
-    while let Some(node) = cur {
-        let r = node_range(node, rope);
+    let mut last_bytes: Option<std::ops::Range<usize>> = None;
+    // One descent for the whole ancestor chain (`parent()` re-walks from the
+    // root on every call — quadratic on a deep tree).
+    for node in crate::walk::self_and_ancestors(root, leaf) {
         // Collapse zero-width steps: a parent that spans exactly the same
         // bytes as its child would make "expand selection" a no-op keypress.
+        // Compare byte spans first so the (costlier) position conversion
+        // only runs for ancestors that actually grow the selection.
+        let bytes = node.byte_range();
+        if last_bytes.as_ref() == Some(&bytes) {
+            continue;
+        }
+        last_bytes = Some(bytes);
+        let r = node_range(node, rope);
         if ranges.last() != Some(&r) {
             ranges.push(r);
         }
-        cur = node.parent();
     }
     ranges
 }

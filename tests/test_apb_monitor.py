@@ -66,6 +66,9 @@ class ApbMonitorTest(unittest.TestCase):
         cls.text = read_text(APB_MONITOR)
         cls.lsp.did_open(cls.uri, cls.text)
         _wait_for_first_parse(cls.lsp)
+        # The workspace-symbol tests need the whole filelist (UVM included)
+        # indexed; the server answers requests while that pass is running.
+        cls.lsp.wait_for_index()
         # Block until slang's first elaborate has cached the AST / reference
         # map, so slang-dependent tests don't race it. Records readiness so
         # those tests skip cleanly on a slang-less checkout instead of
